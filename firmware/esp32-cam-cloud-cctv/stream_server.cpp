@@ -111,10 +111,56 @@ static esp_err_t health_handler(httpd_req_t *req) {
     return httpd_resp_send(req, buf, HTTPD_RESP_USE_STRLEN);
 }
 
+static esp_err_t view_handler(httpd_req_t *req) {
+    if (!httpCheckBasicAuth(req, CONFIG_HTTP_USER, CONFIG_HTTP_PASS)) {
+        return httpSendUnauthorized(req);
+    }
+
+    // Inline viewer: JS polls /capture every 200ms and updates an <img> tag.
+    // Works through BORE tunnel which cannot relay long-lived MJPEG responses.
+    static const char html[] =
+        "<!DOCTYPE html><html>"
+        "<head><meta charset='utf-8'>"
+        "<meta name='viewport' content='width=device-width,initial-scale=1'>"
+        "<title>ESP32-CAM Live</title>"
+        "<style>"
+        "body{margin:0;background:#111;display:flex;flex-direction:column;"
+        "align-items:center;justify-content:center;min-height:100vh;font-family:sans-serif;color:#eee}"
+        "img{max-width:100%;border:2px solid #444;border-radius:6px}"
+        "#status{margin-top:10px;font-size:13px;color:#aaa}"
+        "</style></head><body>"
+        "<img id='cam' src='/capture' alt='Loading...'>"
+        "<div id='status'>Connecting...</div>"
+        "<script>"
+        "var img=document.getElementById('cam');"
+        "var status=document.getElementById('status');"
+        "var frames=0,errors=0;"
+        "function fetchFrame(){"
+        "  var t=Date.now();"
+        "  var next=new Image();"
+        "  next.onload=function(){"
+        "    img.src=next.src;frames++;"
+        "    var fps=Math.round(1000/(Date.now()-t+1));"
+        "    status.textContent='Live ● '+frames+' frames | ~'+fps+' fps';"
+        "    setTimeout(fetchFrame,200);"
+        "  };"
+        "  next.onerror=function(){"
+        "    errors++;status.textContent='Error '+errors+' — retrying...';"
+        "    setTimeout(fetchFrame,1000);"
+        "  };"
+        "  next.src='/capture?t='+t;"
+        "}"
+        "fetchFrame();"
+        "</script></body></html>";
+
+    httpd_resp_set_type(req, "text/html");
+    return httpd_resp_send(req, html, HTTPD_RESP_USE_STRLEN);
+}
+
 void startCameraServer() {
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.server_port = 80;
-    config.max_uri_handlers = 4;
+    config.max_uri_handlers = 5;
     config.recv_wait_timeout = 5;
     config.send_wait_timeout = 5;
     
@@ -136,6 +182,13 @@ void startCameraServer() {
         .handler   = capture_handler,
         .user_ctx  = NULL
     };
+
+    httpd_uri_t view_uri = {
+        .uri       = "/view",
+        .method    = HTTP_GET,
+        .handler   = view_handler,
+        .user_ctx  = NULL
+    };
     
     httpd_uri_t health_uri = {
         .uri       = "/health",
@@ -148,6 +201,7 @@ void startCameraServer() {
     if (httpd_start(&camera_httpd, &config) == ESP_OK) {
         httpd_register_uri_handler(camera_httpd, &stream_uri);
         httpd_register_uri_handler(camera_httpd, &capture_uri);
+        httpd_register_uri_handler(camera_httpd, &view_uri);
         httpd_register_uri_handler(camera_httpd, &health_uri);
     }
 }
