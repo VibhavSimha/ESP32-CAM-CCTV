@@ -1,0 +1,5 @@
+firmware/esp32-cam-cloud-cctv/config.h
+.vscode/
+build/
+*.bin
+.DS_Store
