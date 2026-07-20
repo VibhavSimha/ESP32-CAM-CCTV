@@ -1,5 +1,5 @@
 #include "camera_init.h"
-
+#include <Arduino.h>
 #include "camera_pins.h"
 
 #include "esp32-hal-ledc.h"
