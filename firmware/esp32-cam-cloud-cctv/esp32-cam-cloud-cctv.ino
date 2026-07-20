@@ -38,8 +38,14 @@ void setup() {
 }
 
 void loop() {
+    static unsigned long lastHeartbeat = 0;
+    if (millis() - lastHeartbeat > 10000) {
+        lastHeartbeat = millis();
+        Serial.printf("[Heartbeat] Uptime: %lu ms. Free Heap: %u\n", millis(), ESP.getFreeHeap());
+    }
+
     // Keep localtunnel alive
-    tunnelLoop();
+    handleTunnel();
     
     // Handle PIR motion detection and cloud upload
     loopPIR();
