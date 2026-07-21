@@ -103,12 +103,19 @@ static esp_err_t stream_handler(httpd_req_t *req) {
 
 static esp_err_t ws_handler(httpd_req_t *req) {
     if (req->method == HTTP_GET) {
-        // Browsers do NOT send Basic Auth headers on WebSocket upgrades.
-        // Instead, we check for the session cookie set by view_handler.
-        char cookie[64];
-        if (httpd_req_get_hdr_value_str(req, "Cookie", cookie, sizeof(cookie)) != ESP_OK || 
-            !strstr(cookie, "ESP32Session=valid")) {
-            Serial.println("[WS] Handshake failed: No valid session cookie");
+        // Browsers cannot send Basic Auth on WebSocket upgrades, and cookies
+        // break across port changes (bore.pub assigns a new port every reboot).
+        // Solution: embed the password as ?token= in the WS URL at compile time.
+        // The browser sends the full URI including query string, so this always works.
+        char token[128];
+        if (httpd_req_get_url_query_str(req, token, sizeof(token)) != ESP_OK) {
+            Serial.println("[WS] Handshake rejected: no query string");
+            return httpSendUnauthorized(req);
+        }
+        char val[64];
+        if (httpd_query_key_value(token, "token", val, sizeof(val)) != ESP_OK ||
+            strcmp(val, CONFIG_HTTP_PASS) != 0) {
+            Serial.println("[WS] Handshake rejected: bad token");
             return httpSendUnauthorized(req);
         }
         Serial.println("[WS] Handshake successful");
@@ -122,7 +129,7 @@ static esp_err_t ws_handler(httpd_req_t *req) {
         return ret;
     }
 
-    // Client sent request frame ('N') -> send back latest camera frame
+    // Client sent request frame ('N') -> send back latest camera frame as binary WS frame
     camera_fb_t * fb = esp_camera_fb_get();
     if (!fb) {
         Serial.println("[WS] Camera capture failed");
@@ -184,7 +191,8 @@ static esp_err_t view_handler(httpd_req_t *req) {
         "ws=null,frameCount=0,fpsCount=0,lastSec=Date.now(),fps=0,prevUrl=null;"
         "function connectWS(){"
         "var proto=location.protocol==='https:'?'wss:':'ws:';"
-        "var wsUrl=proto+'//'+location.host+'/ws';"
+        // Token is embedded at compile time — avoids cookie/auth cross-port issues on BORE tunnel
+        "var wsUrl=proto+'//'+location.host+'/ws?token=" CONFIG_HTTP_PASS "';"
         "st.className='info';"
         "st.textContent='Connecting WebSocket...';"
         "ws=new WebSocket(wsUrl);"
@@ -216,7 +224,6 @@ static esp_err_t view_handler(httpd_req_t *req) {
         "</script></body></html>";
 
     httpd_resp_set_type(req, "text/html");
-    httpd_resp_set_hdr(req, "Set-Cookie", "ESP32Session=valid; Path=/; Max-Age=86400");
     httpd_resp_set_hdr(req, "Cache-Control", "no-store, no-cache, must-revalidate, max-age=0");
     httpd_resp_set_hdr(req, "Pragma", "no-cache");
     return httpd_resp_send(req, html, HTTPD_RESP_USE_STRLEN);
