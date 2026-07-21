@@ -13,50 +13,44 @@ void setupCloudStorage() {
     preferences.begin("cctv", false);
     frame_index = preferences.getInt("frame_index", 0);
     supabase.begin(SUPABASE_URL, SUPABASE_ANON_KEY);
-    Serial.println("Supabase configured");
+    Serial.printf("[Supabase] Configured. URL: %s | Circular frame index: %d\n", SUPABASE_URL, frame_index);
 }
 
 void uploadFrameToCloud() {
+    Serial.printf("[Supabase] Capturing frame for cloud upload... heap: %u\n", ESP.getFreeHeap());
     camera_fb_t * fb = esp_camera_fb_get();
     if (!fb) {
-        Serial.println("Camera capture failed for cloud upload");
+        Serial.println("[Supabase] ERROR: Camera capture failed for cloud upload");
         return;
     }
 
     String filename = "events/frame_" + String(frame_index) + ".jpg";
-    Serial.print("Uploading ");
-    Serial.print(filename);
-    Serial.print(" (Size: ");
-    Serial.print(fb->len);
-    Serial.println(" bytes)...");
+    Serial.printf("[Supabase] Uploading %s (%u bytes)...\n", filename.c_str(), fb->len);
 
+    unsigned long t0 = millis();
     int code = supabase.upload(SUPABASE_BUCKET, filename, "image/jpeg", fb->buf, fb->len);
+    unsigned long elapsed = millis() - t0;
     
-    if (code == 200) {
-        Serial.println("Upload successful!");
-        
-        // Optionally insert metadata here if motion_events table exists
-        /*
-        String json = "{\"frame_index\":" + String(frame_index) + ",\"file_path\":\"" + filename + "\"}";
-        supabase.insert("motion_events", json, false);
-        */
-
+    if (code == 200 || code == 201) {
+        Serial.printf("[Supabase] Upload OK in %lums. Frame index -> %d\n", elapsed, (frame_index + 1) % STORAGE_FRAME_LIMIT);
         frame_index = (frame_index + 1) % STORAGE_FRAME_LIMIT;
         preferences.putInt("frame_index", frame_index);
     } else {
-        Serial.print("Upload failed, HTTP code: ");
-        Serial.println(code);
+        Serial.printf("[Supabase] Upload FAILED. HTTP code: %d (took %lums)\n", code, elapsed);
     }
 
     esp_camera_fb_return(fb);
 }
 
 void publishTunnelUrl(String url) {
+    Serial.printf("[Supabase] Publishing tunnel URL: %s | heap: %u\n", url.c_str(), ESP.getFreeHeap());
     String json = "{\"url\":\"" + url + "\"}";
+    unsigned long t0 = millis();
     int code = supabase.insert("camera_status", json, false);
+    unsigned long elapsed = millis() - t0;
     if (code == 201 || code == 200 || code == 204) {
-        Serial.println("[Supabase] Successfully published tunnel URL!");
+        Serial.printf("[Supabase] Tunnel URL published OK (HTTP %d) in %lums\n", code, elapsed);
     } else {
-        Serial.printf("[Supabase] Failed to publish tunnel URL. HTTP code: %d\n", code);
+        Serial.printf("[Supabase] ERROR: Failed to publish tunnel URL. HTTP code: %d (took %lums)\n", code, elapsed);
     }
 }

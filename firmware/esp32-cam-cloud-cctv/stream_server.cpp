@@ -15,7 +15,9 @@ static const char* _STREAM_PART = "Content-Type: image/jpeg\r\nContent-Length: %
 httpd_handle_t camera_httpd = NULL;
 
 static esp_err_t capture_handler(httpd_req_t *req) {
+    Serial.printf("[/capture] Request from client. Heap: %u\n", ESP.getFreeHeap());
     if (!httpCheckBasicAuth(req, CONFIG_HTTP_USER, CONFIG_HTTP_PASS)) {
+        Serial.println("[/capture] Auth FAILED");
         return httpSendUnauthorized(req);
     }
     
@@ -24,10 +26,11 @@ static esp_err_t capture_handler(httpd_req_t *req) {
 
     fb = esp_camera_fb_get();
     if (!fb) {
-        Serial.println("Camera capture failed");
+        Serial.println("[/capture] ERROR: esp_camera_fb_get() returned NULL");
         httpd_resp_send_500(req);
         return ESP_FAIL;
     }
+    Serial.printf("[/capture] Frame captured: %u bytes\n", fb->len);
 
     httpd_resp_set_type(req, "image/jpeg");
     httpd_resp_set_hdr(req, "Content-Disposition", "inline; filename=capture.jpg");
@@ -37,75 +40,102 @@ static esp_err_t capture_handler(httpd_req_t *req) {
 
     size_t out_len = fb->len;
     res = httpd_resp_send(req, (const char *)fb->buf, out_len);
-    
+    if (res != ESP_OK) {
+        Serial.printf("[/capture] ERROR: httpd_resp_send failed: %d\n", res);
+    }
     esp_camera_fb_return(fb);
     return res;
 }
 
 static esp_err_t stream_handler(httpd_req_t *req) {
+    Serial.printf("[/stream] Client connected. Heap: %u\n", ESP.getFreeHeap());
     if (!httpCheckBasicAuth(req, CONFIG_HTTP_USER, CONFIG_HTTP_PASS)) {
+        Serial.println("[/stream] Auth FAILED — rejecting");
         return httpSendUnauthorized(req);
     }
+    Serial.println("[/stream] Auth OK — starting MJPEG stream loop");
 
     camera_fb_t * fb = NULL;
     esp_err_t res = ESP_OK;
     size_t _jpg_buf_len = 0;
     uint8_t * _jpg_buf = NULL;
     char part_buf[64];
+    uint32_t frame_num = 0;
 
     res = httpd_resp_set_type(req, _STREAM_CONTENT_TYPE);
-    if(res != ESP_OK){
+    if (res != ESP_OK) {
+        Serial.printf("[/stream] ERROR: Failed to set content type: %d\n", res);
         return res;
     }
 
-    while(true){
+    while (true) {
         fb = esp_camera_fb_get();
         if (!fb) {
-            Serial.println("Camera capture failed");
+            Serial.println("[/stream] ERROR: esp_camera_fb_get() returned NULL");
+            res = ESP_FAIL;
+        } else if (fb->format != PIXFORMAT_JPEG) {
+            Serial.printf("[/stream] ERROR: unexpected pixel format %d (expected JPEG)\n", fb->format);
             res = ESP_FAIL;
         } else {
-            if(fb->format != PIXFORMAT_JPEG){
-                // In our setup, it should always be JPEG.
-                res = ESP_FAIL;
-            } else {
-                _jpg_buf_len = fb->len;
-                _jpg_buf = fb->buf;
-            }
+            _jpg_buf_len = fb->len;
+            _jpg_buf = fb->buf;
         }
-        
-        if(res == ESP_OK){
+
+        if (res == ESP_OK) {
             size_t hlen = snprintf((char *)part_buf, 64, _STREAM_PART, _jpg_buf_len);
             res = httpd_resp_send_chunk(req, (const char *)part_buf, hlen);
+            if (res != ESP_OK) {
+                Serial.printf("[/stream] ERROR: send_chunk(header) failed on frame %u: %d\n", frame_num, res);
+            }
         }
-        if(res == ESP_OK){
+        if (res == ESP_OK) {
             res = httpd_resp_send_chunk(req, (const char *)_jpg_buf, _jpg_buf_len);
+            if (res != ESP_OK) {
+                Serial.printf("[/stream] ERROR: send_chunk(jpeg %u bytes) failed on frame %u: %d\n", _jpg_buf_len, frame_num, res);
+            }
         }
-        if(res == ESP_OK){
+        if (res == ESP_OK) {
             res = httpd_resp_send_chunk(req, _STREAM_BOUNDARY, strlen(_STREAM_BOUNDARY));
+            if (res != ESP_OK) {
+                Serial.printf("[/stream] ERROR: send_chunk(boundary) failed on frame %u: %d\n", frame_num, res);
+            }
         }
-        
-        if(fb){
+
+        if (fb) {
             esp_camera_fb_return(fb);
             fb = NULL;
             _jpg_buf = NULL;
-        } else if(_jpg_buf){
+        } else if (_jpg_buf) {
             free(_jpg_buf);
             _jpg_buf = NULL;
         }
-        if(res != ESP_OK){
+
+        if (res != ESP_OK) {
+            Serial.printf("[/stream] Stream ended after %u frames. Heap: %u\n", frame_num, ESP.getFreeHeap());
             break;
         }
-        // Small delay to allow yielding
+
+        frame_num++;
+        // Log every 30 frames (~3s at 10fps) to show stream is alive without flooding serial
+        if (frame_num % 30 == 0) {
+            Serial.printf("[/stream] Streaming... frame %u, last=%u bytes, heap=%u\n",
+                frame_num, _jpg_buf_len, ESP.getFreeHeap());
+        }
+
         vTaskDelay(10 / portTICK_PERIOD_MS);
     }
     return res;
 }
 
 static esp_err_t health_handler(httpd_req_t *req) {
+    uint32_t heap = ESP.getFreeHeap();
+    uint32_t uptime = millis() / 1000;
+    Serial.printf("[/health] Responding — heap: %u, uptime: %us\n", heap, uptime);
+
     StaticJsonDocument<128> doc;
     doc["ok"] = true;
-    doc["heap"] = ESP.getFreeHeap();
-    doc["uptime"] = millis() / 1000;
+    doc["heap"] = heap;
+    doc["uptime"] = uptime;
     
     char buf[128];
     serializeJson(doc, buf);

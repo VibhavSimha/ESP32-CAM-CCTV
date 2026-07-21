@@ -19,6 +19,7 @@ static void enableLed(bool on) {
 }
 
 esp_err_t initCamera() {
+  Serial.println("[Camera] Initializing...");
   camera_config_t config = {};
   config.ledc_channel = LEDC_CHANNEL_0;
   config.ledc_timer = LEDC_TIMER_0;
@@ -47,28 +48,35 @@ esp_err_t initCamera() {
   config.fb_count = 1;
 
   if (psramFound()) {
+    Serial.println("[Camera] PSRAM found — using GRAB_LATEST, 2 frame buffers, quality 10");
     config.jpeg_quality = 10;
     config.fb_count = 2;
     config.grab_mode = CAMERA_GRAB_LATEST;
   } else {
+    Serial.println("[Camera] WARNING: No PSRAM — falling back to SVGA, DRAM, 1 buffer");
     config.frame_size = FRAMESIZE_SVGA;
     config.fb_location = CAMERA_FB_IN_DRAM;
   }
 
   esp_err_t err = esp_camera_init(&config);
   if (err != ESP_OK) {
+    Serial.printf("[Camera] ERROR: esp_camera_init failed: 0x%x\n", err);
     return err;
   }
+  Serial.println("[Camera] esp_camera_init OK");
 
   sensor_t *sensor = esp_camera_sensor_get();
   if (sensor && config.pixel_format == PIXFORMAT_JPEG) {
     sensor->set_framesize(sensor, FRAMESIZE_QVGA);
+    Serial.printf("[Camera] Sensor PID: 0x%02X | Frame size set to QVGA (320x240)\n", sensor->id.PID);
   }
 
 #if defined(LED_GPIO_NUM)
   setupLedFlash(LED_GPIO_NUM);
+  Serial.printf("[Camera] LED flash configured on GPIO %d\n", LED_GPIO_NUM);
 #endif
 
+  Serial.printf("[Camera] Init complete. Free heap: %u\n", ESP.getFreeHeap());
   return ESP_OK;
 }
 
