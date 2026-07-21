@@ -128,6 +128,9 @@ static esp_err_t view_handler(httpd_req_t *req) {
         "<!DOCTYPE html><html>"
         "<head><meta charset='utf-8'>"
         "<meta name='viewport' content='width=device-width,initial-scale=1'>"
+        // Suppress /favicon.ico request — browser would open a 2nd BORE proxy connection
+        // which blocks the tunnel task and kills the active /stream connection
+        "<link rel='icon' href='data:,'>"
         "<title>ESP32-CAM Live</title>"
         "<style>"
         "body{margin:0;background:#0d1117;display:flex;flex-direction:column;"
