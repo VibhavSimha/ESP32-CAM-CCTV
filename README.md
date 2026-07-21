@@ -115,24 +115,26 @@ The minimum you must change before going live:
    - **Password**: `CONFIG_HTTP_PASS` from `config.h`
 6. The live camera feed will load at ~3-5 fps.
 
-### Stable URL Option
+### Stable URL Option (Supabase Sync)
 
-Public `bore.pub` is convenient, but the current `esp32-tunnel` BORE API does not support reserving or hardcoding the remote port. The underlying bore CLI has a fixed-port option, but this Arduino library exposes only random-port BORE URLs or a custom bore server host.
+Public `bore.pub` is highly stable on the ESP32-CAM because it uses raw TCP (no TLS overhead). However, the port changes every reboot. We cannot use `CONFIG_TUNNEL_MODE_SELFHOST` on the ESP32-CAM because the HTTPS handshake required by most tunnel servers (like Render/Localtunnel) exceeds the ESP32-CAM's available PSRAM when the camera is running, leading to brownouts and connection hangs.
 
-For a stable URL after power loss, set this in `firmware/esp32-cam-cloud-cctv/config.h`:
+To solve this, the firmware now automatically syncs the latest BORE URL to your Supabase project.
 
-```cpp
-#define CONFIG_TUNNEL_MODE CONFIG_TUNNEL_MODE_SELFHOST
-#define CONFIG_SELFHOST_TUNNEL_ID "00000000-0000-4000-8000-000000000000"
-```
-
-Then open:
-
-```text
-http://esp32-tunnel.onrender.com/00000000-0000-4000-8000-000000000000/view
-```
-
-This is still public internet access, so keep `CONFIG_HTTP_PASS` strong and non-default.
+1. In Supabase, run this SQL query to create the tracking table:
+   ```sql
+   CREATE TABLE camera_status (
+       id SERIAL PRIMARY KEY,
+       url TEXT NOT NULL,
+       created_at TIMESTAMP WITH TIME ZONE DEFAULT timezone('utc'::text, now()) NOT NULL
+   );
+   ALTER TABLE camera_status ENABLE ROW LEVEL SECURITY;
+   CREATE POLICY "Allow public read" ON camera_status FOR SELECT USING (true);
+   CREATE POLICY "Allow public insert" ON camera_status FOR INSERT WITH CHECK (true);
+   ```
+2. Now, instead of checking the Serial Monitor, just bookmark this REST API URL:
+   `https://<YOUR_SUPABASE_ID>.supabase.co/rest/v1/camera_status?select=url,created_at&order=id.desc&limit=1&apikey=<YOUR_ANON_KEY>`
+3. Whenever you click it, you will see the latest URL in JSON format. Just copy and paste it into your browser!
 
 ### Endpoints
 | URL | Auth | Description |
