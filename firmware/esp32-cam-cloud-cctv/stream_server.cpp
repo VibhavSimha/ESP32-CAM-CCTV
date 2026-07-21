@@ -103,7 +103,12 @@ static esp_err_t stream_handler(httpd_req_t *req) {
 
 static esp_err_t ws_handler(httpd_req_t *req) {
     if (req->method == HTTP_GET) {
-        if (!httpCheckBasicAuth(req, CONFIG_HTTP_USER, CONFIG_HTTP_PASS)) {
+        // Browsers do NOT send Basic Auth headers on WebSocket upgrades.
+        // Instead, we check for the session cookie set by view_handler.
+        char cookie[64];
+        if (httpd_req_get_hdr_value_str(req, "Cookie", cookie, sizeof(cookie)) != ESP_OK || 
+            !strstr(cookie, "ESP32Session=valid")) {
+            Serial.println("[WS] Handshake failed: No valid session cookie");
             return httpSendUnauthorized(req);
         }
         Serial.println("[WS] Handshake successful");
@@ -211,6 +216,7 @@ static esp_err_t view_handler(httpd_req_t *req) {
         "</script></body></html>";
 
     httpd_resp_set_type(req, "text/html");
+    httpd_resp_set_hdr(req, "Set-Cookie", "ESP32Session=valid; Path=/; Max-Age=86400");
     httpd_resp_set_hdr(req, "Cache-Control", "no-store, no-cache, must-revalidate, max-age=0");
     httpd_resp_set_hdr(req, "Pragma", "no-cache");
     return httpd_resp_send(req, html, HTTPD_RESP_USE_STRLEN);
