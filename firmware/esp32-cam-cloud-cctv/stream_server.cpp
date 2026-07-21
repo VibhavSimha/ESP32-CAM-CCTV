@@ -31,6 +31,8 @@ static esp_err_t capture_handler(httpd_req_t *req) {
 
     httpd_resp_set_type(req, "image/jpeg");
     httpd_resp_set_hdr(req, "Content-Disposition", "inline; filename=capture.jpg");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store, no-cache, must-revalidate, max-age=0");
+    httpd_resp_set_hdr(req, "Pragma", "no-cache");
 
     size_t out_len = fb->len;
     res = httpd_resp_send(req, (const char *)fb->buf, out_len);
@@ -116,8 +118,10 @@ static esp_err_t view_handler(httpd_req_t *req) {
         return httpSendUnauthorized(req);
     }
 
-    // Inline viewer: JS polls /capture every 200ms and updates an <img> tag.
-    // Works through BORE tunnel which cannot relay long-lived MJPEG responses.
+    // Inline viewer using fetch()+AbortController.
+    // new Image() has no timeout — if the BORE tunnel takes too long to relay
+    // the /capture response, the load hangs forever with no onerror fired.
+    // fetch() lets us abort after a deadline and always resolve the promise.
     static const char html[] =
         "<!DOCTYPE html><html>"
         "<head><meta charset='utf-8'>"
@@ -125,35 +129,43 @@ static esp_err_t view_handler(httpd_req_t *req) {
         "<title>ESP32-CAM Live</title>"
         "<style>"
         "body{margin:0;background:#111;display:flex;flex-direction:column;"
-        "align-items:center;justify-content:center;min-height:100vh;font-family:sans-serif;color:#eee}"
-        "img{max-width:100%;border:2px solid #444;border-radius:6px}"
-        "#status{margin-top:10px;font-size:13px;color:#aaa}"
+        "align-items:center;justify-content:center;min-height:100vh;"
+        "font-family:sans-serif;color:#eee}"
+        "img{max-width:100%;border:2px solid #333;border-radius:6px}"
+        "#st{margin-top:10px;font-size:13px;color:#888}"
+        ".ok{color:#4caf50}.er{color:#f44336}"
         "</style></head><body>"
-        "<img id='cam' src='/capture' alt='Loading...'>"
-        "<div id='status'>Connecting...</div>"
+        "<img id='cam' alt='Waiting for first frame...' width='640' height='480'>"
+        "<div id='st'>Connecting to camera...</div>"
         "<script>"
-        "var img=document.getElementById('cam');"
-        "var status=document.getElementById('status');"
-        "var frames=0,errors=0;"
-        "function fetchFrame(){"
-        "  var t=Date.now();"
-        "  var next=new Image();"
-        "  next.onload=function(){"
-        "    img.src=next.src;frames++;"
-        "    var fps=Math.round(1000/(Date.now()-t+1));"
-        "    status.textContent='Live ● '+frames+' frames | ~'+fps+' fps';"
-        "    setTimeout(fetchFrame,200);"
-        "  };"
-        "  next.onerror=function(){"
-        "    errors++;status.textContent='Error '+errors+' — retrying...';"
-        "    setTimeout(fetchFrame,1000);"
-        "  };"
-        "  next.src='/capture?t='+t;"
-        "}"
-        "fetchFrame();"
+        "var img=document.getElementById('cam'),"
+        "st=document.getElementById('st'),"
+        "n=0,e=0,prev=null;"
+        "function go(){"
+        "var ac=new AbortController();"
+        "var t=setTimeout(function(){ac.abort();},12000);"
+        "fetch('/capture?_='+Date.now(),{signal:ac.signal,cache:'no-store'})"
+        ".then(function(r){clearTimeout(t);"
+        "if(!r.ok)throw new Error(r.status);"
+        "return r.blob();})"
+        ".then(function(b){"
+        "var u=URL.createObjectURL(b);"
+        "img.onload=function(){if(prev)URL.revokeObjectURL(prev);prev=u;};"
+        "img.src=u;n++;"
+        "st.className='ok';"
+        "st.textContent='Live \\u25cf frame '+n;"
+        "setTimeout(go,750);})"
+        ".catch(function(){"
+        "clearTimeout(t);e++;"
+        "st.className='er';"
+        "st.textContent='Retry #'+e+'\\u2026';"
+        "setTimeout(go,2000);});}"
+        "go();"
         "</script></body></html>";
 
     httpd_resp_set_type(req, "text/html");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store, no-cache, must-revalidate, max-age=0");
+    httpd_resp_set_hdr(req, "Pragma", "no-cache");
     return httpd_resp_send(req, html, HTTPD_RESP_USE_STRLEN);
 }
 
@@ -161,8 +173,8 @@ void startCameraServer() {
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.server_port = 80;
     config.max_uri_handlers = 5;
-    config.recv_wait_timeout = 5;
-    config.send_wait_timeout = 5;
+    config.recv_wait_timeout = 15;
+    config.send_wait_timeout = 15;
     
     httpd_uri_t stream_uri = {
         .uri       = "/stream",
