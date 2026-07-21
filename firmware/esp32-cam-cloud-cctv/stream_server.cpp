@@ -69,6 +69,8 @@ static esp_err_t stream_handler(httpd_req_t *req) {
     }
 
     while (true) {
+        int64_t fr_start = esp_timer_get_time();
+
         fb = esp_camera_fb_get();
         if (!fb) {
             Serial.println("[/stream] ERROR: esp_camera_fb_get() returned NULL");
@@ -116,13 +118,21 @@ static esp_err_t stream_handler(httpd_req_t *req) {
         }
 
         frame_num++;
-        // Log every 30 frames (~3s at 10fps) to show stream is alive without flooding serial
-        if (frame_num % 30 == 0) {
+        // Log every 20 frames (~3s at 6.5fps)
+        if (frame_num % 20 == 0) {
             Serial.printf("[/stream] Streaming... frame %u, last=%u bytes, heap=%u\n",
                 frame_num, _jpg_buf_len, ESP.getFreeHeap());
         }
 
-        vTaskDelay(10 / portTICK_PERIOD_MS);
+        // Target ~6.5 FPS (150ms total frame period).
+        // Prevents flooding the BORE WAN TCP window and socket buffer overflow.
+        int64_t fr_end = esp_timer_get_time();
+        int64_t frame_time = (fr_end - fr_start) / 1000;
+        if (frame_time < 150) {
+            vTaskDelay((150 - frame_time) / portTICK_PERIOD_MS);
+        } else {
+            vTaskDelay(10 / portTICK_PERIOD_MS);
+        }
     }
     return res;
 }
