@@ -39,14 +39,26 @@
 // -----------------------------------------------------------------------------
 
 // -----------------------------------------------------------------------------
-// LOCALTUNNEL SUBDOMAIN (only used if switching back to LOCALTUNNEL provider)
+// PUBLIC TUNNEL
 // -----------------------------------------------------------------------------
-// If you switch from BORE back to LOCALTUNNEL, this becomes your public URL:
-//   https://<CONFIG_TUNNEL_SUBDOMAIN>.loca.lt/view
-// Pick a random, non-guessable name — the URL is semi-public.
-// Currently unused because LOCALTUNNEL requires TLS which exceeds ESP32 RAM.
+// Default BORE URL:
+//   http://bore.pub:<server-assigned-port>/view
+// The BORE port is assigned by the public server and can change on reboot.
+// For a stable URL, use CONFIG_TUNNEL_MODE_SELFHOST and choose a random UUID
+// for CONFIG_SELFHOST_TUNNEL_ID.
 // -----------------------------------------------------------------------------
-#define CONFIG_TUNNEL_SUBDOMAIN "cctv-dev-local"
+#define CONFIG_TUNNEL_MODE_BORE      1
+#define CONFIG_TUNNEL_MODE_SELFHOST  2
+#define CONFIG_TUNNEL_MODE           CONFIG_TUNNEL_MODE_BORE
+
+#define CONFIG_BORE_SERVER           "bore.pub"
+#define CONFIG_BORE_REMOTE_PORT      0
+#define CONFIG_SELFHOST_TUNNEL_ID    "00000000-0000-4000-8000-000000000000"
+
+// BORE mode: public URL is http://bore.pub:<server-assigned-port>/view.
+// The esp32-tunnel BORE API currently has no fixed remote-port parameter.
+// SELFHOST mode: public URL is stable at:
+// http://esp32-tunnel.onrender.com/<CONFIG_SELFHOST_TUNNEL_ID>/view
 
 // -----------------------------------------------------------------------------
 // SUPABASE — Cloud Motion Storage

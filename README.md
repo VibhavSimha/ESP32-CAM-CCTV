@@ -29,7 +29,7 @@ WiFi is **never hardcoded**. Instead, on first boot the ESP32 sets up its own te
 
 ## Features
 - **JPEG-polling viewer** (`/view`) — works through any HTTP tunnel
-- **Outbound TCP tunnel** — BORE (`bore.pub`), no port-forwarding needed
+- **Outbound tunnel** — BORE (`bore.pub`) by default, no port-forwarding needed
 - **HTTP Basic Auth** — secures all camera endpoints
 - **WiFiManager** — captive portal WiFi provisioning, no hardcoded credentials
 - **Supabase cloud storage** — 200-frame circular motion buffer
@@ -100,11 +100,11 @@ The minimum you must change before going live:
 ## Viewing the Live Feed
 
 1. Open the **Serial Monitor** in Arduino IDE (baud rate: `115200`).
-2. After boot, wait ~5 seconds. You will see:
+2. After boot, wait ~5 seconds. In default BORE mode you will see:
    ```
    >>> TUNNEL CONNECTED! URL: http://bore.pub:XXXXX
    ```
-3. Note the port number — it changes every reboot.
+3. Note the port number. With public `bore.pub`, it is assigned by the server and can change every reboot.
 4. Open a browser and go to:
    ```
    http://bore.pub:XXXXX/view
@@ -114,6 +114,25 @@ The minimum you must change before going live:
    - **Username**: `CONFIG_HTTP_USER` from `config.h`
    - **Password**: `CONFIG_HTTP_PASS` from `config.h`
 6. The live camera feed will load at ~3-5 fps.
+
+### Stable URL Option
+
+Public `bore.pub` is convenient, but the current `esp32-tunnel` BORE API does not support reserving or hardcoding the remote port. The underlying bore CLI has a fixed-port option, but this Arduino library exposes only random-port BORE URLs or a custom bore server host.
+
+For a stable URL after power loss, set this in `firmware/esp32-cam-cloud-cctv/config.h`:
+
+```cpp
+#define CONFIG_TUNNEL_MODE CONFIG_TUNNEL_MODE_SELFHOST
+#define CONFIG_SELFHOST_TUNNEL_ID "00000000-0000-4000-8000-000000000000"
+```
+
+Then open:
+
+```text
+http://esp32-tunnel.onrender.com/00000000-0000-4000-8000-000000000000/view
+```
+
+This is still public internet access, so keep `CONFIG_HTTP_PASS` strong and non-default.
 
 ### Endpoints
 | URL | Auth | Description |
@@ -145,7 +164,9 @@ The minimum you must change before going live:
 
 | Behaviour | Explanation |
 |---|---|
-| Port changes every reboot | BORE assigns a random port. Note the new port from Serial Monitor after each restart. |
+| Port changes every reboot | Expected in default BORE mode. `bore.pub` assigns a random public port; use `CONFIG_TUNNEL_MODE_SELFHOST` for a stable URL. |
+| Is BORE public facing? | Yes. `http://bore.pub:XXXXX/view` is reachable from the internet while the tunnel is connected. HTTP Basic Auth is your protection. |
+| LAN vs remote access | The bore URL is for access from anywhere. On the same WiFi/LAN, use the ESP32's local IP for lower latency and fewer relay resets. |
 | `No core dump partition found` on boot | Normal — we removed the unused core dump partition to save flash space. |
 | `gpio_install_isr_service already installed` | Normal — the camera driver installs the ISR first; Arduino re-installs it for PIR. Harmless. |
 | Camera not found on reboot | Check the camera ribbon cable — the latch is fragile. Reseat it firmly. |
