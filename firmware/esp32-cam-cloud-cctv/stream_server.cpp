@@ -101,6 +101,41 @@ static esp_err_t stream_handler(httpd_req_t *req) {
     return res;
 }
 
+static esp_err_t ws_handler(httpd_req_t *req) {
+    if (req->method == HTTP_GET) {
+        if (!httpCheckBasicAuth(req, CONFIG_HTTP_USER, CONFIG_HTTP_PASS)) {
+            return httpSendUnauthorized(req);
+        }
+        Serial.println("[WS] Handshake successful");
+        return ESP_OK;
+    }
+
+    httpd_ws_frame_t ws_pkt;
+    memset(&ws_pkt, 0, sizeof(httpd_ws_frame_t));
+    esp_err_t ret = httpd_ws_recv_frame(req, &ws_pkt, 0);
+    if (ret != ESP_OK) {
+        return ret;
+    }
+
+    // Client sent request frame ('N') -> send back latest camera frame
+    camera_fb_t * fb = esp_camera_fb_get();
+    if (!fb) {
+        Serial.println("[WS] Camera capture failed");
+        return ESP_FAIL;
+    }
+
+    httpd_ws_frame_t ws_frame;
+    memset(&ws_frame, 0, sizeof(httpd_ws_frame_t));
+    ws_frame.payload = fb->buf;
+    ws_frame.len = fb->len;
+    ws_frame.type = HTTPD_WS_TYPE_BINARY;
+
+    ret = httpd_ws_send_frame(req, &ws_frame);
+    esp_camera_fb_return(fb);
+
+    return ret;
+}
+
 static esp_err_t health_handler(httpd_req_t *req) {
     StaticJsonDocument<128> doc;
     doc["ok"] = true;
@@ -119,53 +154,60 @@ static esp_err_t view_handler(httpd_req_t *req) {
         return httpSendUnauthorized(req);
     }
 
-    // Inline viewer using fetch()+AbortController.
-    // BORE tunnel creates a NEW TCP connection per request to the ESP32.
-    // The ESP32 only has ~7 LwIP sockets total. We MUST:
-    //  1. Serialize requests (only 1 in-flight at a time via 'busy' guard)
-    //  2. Poll slowly (2s gap) so sockets fully close between requests
-    //  3. Abort after 8s to prevent socket leaks from stalled relays
+    // High-FPS WebSocket Viewer:
+    // Opens a SINGLE persistent WebSocket connection (/ws).
+    // Eliminates per-frame HTTP headers, TCP handshakes, and LwIP socket exhaustion.
     static const char html[] =
         "<!DOCTYPE html><html>"
         "<head><meta charset='utf-8'>"
         "<meta name='viewport' content='width=device-width,initial-scale=1'>"
-        "<title>ESP32-CAM Live</title>"
+        "<title>ESP32-CAM Ultra FPS</title>"
         "<style>"
-        "body{margin:0;background:#111;display:flex;flex-direction:column;"
+        "body{margin:0;background:#0d1117;display:flex;flex-direction:column;"
         "align-items:center;justify-content:center;min-height:100vh;"
-        "font-family:sans-serif;color:#eee}"
-        "img{max-width:100%;border:2px solid #333;border-radius:6px}"
-        "#st{margin-top:10px;font-size:13px;color:#888}"
-        ".ok{color:#4caf50}.er{color:#f44336}"
+        "font-family:-apple-system,sans-serif;color:#c9d1d9}"
+        "img{max-width:100%;border:2px solid #30363d;border-radius:8px;"
+        "box-shadow:0 8px 24px rgba(0,0,0,0.5)}"
+        "#st{margin-top:12px;font-size:14px;font-weight:600;font-family:monospace}"
+        ".ok{color:#3fb950}.er{color:#f85149}.info{color:#58a6ff}"
         "</style></head><body>"
-        "<img id='cam' alt='Waiting for first frame...' width='640' height='480'>"
-        "<div id='st'>Connecting to camera...</div>"
+        "<img id='cam' alt='Connecting WebSocket...' width='640' height='480'>"
+        "<div id='st' class='info'>Connecting WebSocket...</div>"
         "<script>"
         "var img=document.getElementById('cam'),"
         "st=document.getElementById('st'),"
-        "n=0,e=0,prev=null,busy=false;"
-        "function go(){"
-        "if(busy){setTimeout(go,1000);return;}"
-        "busy=true;"
-        "var ac=new AbortController();"
-        "var t=setTimeout(function(){ac.abort();},8000);"
-        "fetch('/capture?_='+Date.now(),{signal:ac.signal,cache:'no-store'})"
-        ".then(function(r){clearTimeout(t);"
-        "if(!r.ok)throw new Error(r.status);"
-        "return r.blob();})"
-        ".then(function(b){"
-        "var u=URL.createObjectURL(b);"
-        "img.onload=function(){if(prev)URL.revokeObjectURL(prev);prev=u;};"
-        "img.src=u;n++;e=0;"
+        "ws=null,frameCount=0,fpsCount=0,lastSec=Date.now(),fps=0,prevUrl=null;"
+        "function connectWS(){"
+        "var proto=location.protocol==='https:'?'wss:':'ws:';"
+        "var wsUrl=proto+'//'+location.host+'/ws';"
+        "st.className='info';"
+        "st.textContent='Connecting WebSocket...';"
+        "ws=new WebSocket(wsUrl);"
+        "ws.binaryType='arraybuffer';"
+        "ws.onopen=function(){"
         "st.className='ok';"
-        "st.textContent='Live \\u25cf frame '+n;"
-        "busy=false;setTimeout(go,100);})"
-        ".catch(function(){"
-        "clearTimeout(t);e++;"
+        "st.textContent='WebSocket Connected! Streaming...';"
+        "ws.send('N');};"
+        "ws.onmessage=function(e){"
+        "if(e.data instanceof ArrayBuffer){"
+        "var blob=new Blob([e.data],{type:'image/jpeg'});"
+        "var url=URL.createObjectURL(blob);"
+        "img.onload=function(){if(prevUrl)URL.revokeObjectURL(prevUrl);prevUrl=url;};"
+        "img.src=url;"
+        "frameCount++;fpsCount++;"
+        "var now=Date.now();"
+        "if(now-lastSec>=1000){"
+        "fps=Math.round((fpsCount*1000)/(now-lastSec));"
+        "fpsCount=0;lastSec=now;}"
+        "st.className='ok';"
+        "st.textContent='LIVE \\u25cf '+fps+' FPS | Frame #'+frameCount;"
+        "if(ws.readyState===WebSocket.OPEN){ws.send('N');}}};"
+        "ws.onerror=function(){st.className='er';st.textContent='WS Error!';};"
+        "ws.onclose=function(){"
         "st.className='er';"
-        "st.textContent='Retry #'+e+'\\u2026';"
-        "busy=false;setTimeout(go,3000);});}"
-        "go();"
+        "st.textContent='WS Closed. Reconnecting in 2s...';"
+        "setTimeout(connectWS,2000);};}"
+        "connectWS();"
         "</script></body></html>";
 
     httpd_resp_set_type(req, "text/html");
@@ -177,22 +219,17 @@ static esp_err_t view_handler(httpd_req_t *req) {
 void startCameraServer() {
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.server_port = 80;
-    config.max_uri_handlers = 5;
-    config.max_open_sockets = 4;     // Default 7 — lower to leave sockets for tunnel/Supabase
-    config.recv_wait_timeout = 5;    // Kill idle receive after 5s (default 5)
-    config.send_wait_timeout = 5;    // Kill stalled send after 5s (default 5)
-    config.lru_purge_enable = true;  // When all 4 sockets are full, force-close the oldest
+    config.max_uri_handlers = 6;
+    config.max_open_sockets = 7;     // WebSockets use 1 long-lived socket
+    config.recv_wait_timeout = 10;
+    config.send_wait_timeout = 10;
+    config.lru_purge_enable = true;
     
     httpd_uri_t stream_uri = {
         .uri       = "/stream",
         .method    = HTTP_GET,
         .handler   = stream_handler,
         .user_ctx  = NULL
-#ifdef CONFIG_HTTPD_WS_SUPPORT
-        , .is_websocket = true,
-        .handle_ws_control_frames = false,
-        .supported_subprotocol = NULL
-#endif
     };
 
     httpd_uri_t capture_uri = {
@@ -208,6 +245,14 @@ void startCameraServer() {
         .handler   = view_handler,
         .user_ctx  = NULL
     };
+
+    httpd_uri_t ws_uri = {
+        .uri        = "/ws",
+        .method     = HTTP_GET,
+        .handler    = ws_handler,
+        .user_ctx   = NULL,
+        .is_websocket = true
+    };
     
     httpd_uri_t health_uri = {
         .uri       = "/health",
@@ -221,6 +266,7 @@ void startCameraServer() {
         httpd_register_uri_handler(camera_httpd, &stream_uri);
         httpd_register_uri_handler(camera_httpd, &capture_uri);
         httpd_register_uri_handler(camera_httpd, &view_uri);
+        httpd_register_uri_handler(camera_httpd, &ws_uri);
         httpd_register_uri_handler(camera_httpd, &health_uri);
     }
 }
