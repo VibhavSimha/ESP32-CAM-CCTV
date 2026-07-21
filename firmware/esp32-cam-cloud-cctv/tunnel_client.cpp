@@ -1,7 +1,7 @@
 #include "tunnel_client.h"
 #include "config.h"
 
-#include <esp32tunnel.h>
+#include "src/esp32tunnel.h"
 #include <WiFi.h>
 #include "cloud_storage.h"
 
