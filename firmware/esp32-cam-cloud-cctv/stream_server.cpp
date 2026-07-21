@@ -120,9 +120,11 @@ static esp_err_t view_handler(httpd_req_t *req) {
     }
 
     // Inline viewer using fetch()+AbortController.
-    // new Image() has no timeout — if the BORE tunnel takes too long to relay
-    // the /capture response, the load hangs forever with no onerror fired.
-    // fetch() lets us abort after a deadline and always resolve the promise.
+    // BORE tunnel creates a NEW TCP connection per request to the ESP32.
+    // The ESP32 only has ~7 LwIP sockets total. We MUST:
+    //  1. Serialize requests (only 1 in-flight at a time via 'busy' guard)
+    //  2. Poll slowly (2s gap) so sockets fully close between requests
+    //  3. Abort after 8s to prevent socket leaks from stalled relays
     static const char html[] =
         "<!DOCTYPE html><html>"
         "<head><meta charset='utf-8'>"
@@ -141,10 +143,12 @@ static esp_err_t view_handler(httpd_req_t *req) {
         "<script>"
         "var img=document.getElementById('cam'),"
         "st=document.getElementById('st'),"
-        "n=0,e=0,prev=null;"
+        "n=0,e=0,prev=null,busy=false;"
         "function go(){"
+        "if(busy){setTimeout(go,1000);return;}"
+        "busy=true;"
         "var ac=new AbortController();"
-        "var t=setTimeout(function(){ac.abort();},12000);"
+        "var t=setTimeout(function(){ac.abort();},8000);"
         "fetch('/capture?_='+Date.now(),{signal:ac.signal,cache:'no-store'})"
         ".then(function(r){clearTimeout(t);"
         "if(!r.ok)throw new Error(r.status);"
@@ -152,15 +156,15 @@ static esp_err_t view_handler(httpd_req_t *req) {
         ".then(function(b){"
         "var u=URL.createObjectURL(b);"
         "img.onload=function(){if(prev)URL.revokeObjectURL(prev);prev=u;};"
-        "img.src=u;n++;"
+        "img.src=u;n++;e=0;"
         "st.className='ok';"
         "st.textContent='Live \\u25cf frame '+n;"
-        "setTimeout(go,750);})"
+        "busy=false;setTimeout(go,2000);})"
         ".catch(function(){"
         "clearTimeout(t);e++;"
         "st.className='er';"
         "st.textContent='Retry #'+e+'\\u2026';"
-        "setTimeout(go,2000);});}"
+        "busy=false;setTimeout(go,3000);});}"
         "go();"
         "</script></body></html>";
 
@@ -174,9 +178,10 @@ void startCameraServer() {
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.server_port = 80;
     config.max_uri_handlers = 5;
-    config.recv_wait_timeout = 15;
-    config.send_wait_timeout = 15;
-    config.lru_purge_enable = true; // Auto-close oldest connections when sockets are full
+    config.max_open_sockets = 4;     // Default 7 — lower to leave sockets for tunnel/Supabase
+    config.recv_wait_timeout = 5;    // Kill idle receive after 5s (default 5)
+    config.send_wait_timeout = 5;    // Kill stalled send after 5s (default 5)
+    config.lru_purge_enable = true;  // When all 4 sockets are full, force-close the oldest
     
     httpd_uri_t stream_uri = {
         .uri       = "/stream",
