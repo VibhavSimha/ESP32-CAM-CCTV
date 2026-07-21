@@ -122,15 +122,12 @@ void tunnelBegin() {
 
 void handleTunnel() {
   static unsigned long lastStatusLog = 0;
-  static bool firstPrintDone = false;
+  static bool wasReady = false;
 
   bool ready = tunnelReady();
 
   if (ready) {
-    if (!firstPrintDone || millis() - lastStatusLog > 30000) {
-      lastStatusLog = millis();
-      firstPrintDone = true;
-
+    if (!wasReady) {
       Serial.println();
       Serial.println("============= TUNNEL CONNECTED =============");
       Serial.print("[Tunnel] URL: ");
@@ -139,8 +136,10 @@ void handleTunnel() {
       Serial.println("============================================");
       
       publishTunnelUrl(tunnelURL());
+      wasReady = true;
     }
   } else {
+    wasReady = false;
     if (millis() - lastStatusLog > 5000) {
       lastStatusLog = millis();
 
