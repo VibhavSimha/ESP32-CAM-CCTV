@@ -50,3 +50,13 @@ void uploadFrameToCloud() {
 
     esp_camera_fb_return(fb);
 }
+
+void publishTunnelUrl(String url) {
+    String json = "{\"url\":\"" + url + "\"}";
+    int code = supabase.insert("camera_status", json, false);
+    if (code == 201 || code == 200 || code == 204) {
+        Serial.println("[Supabase] Successfully published tunnel URL!");
+    } else {
+        Serial.printf("[Supabase] Failed to publish tunnel URL. HTTP code: %d\n", code);
+    }
+}
