@@ -1,58 +1,159 @@
 # ESP32-CAM Cloud CCTV
 
-This project is a minimal, zero-router-configuration CCTV solution for the AI-Thinker ESP32-CAM.
-It utilizes an outbound WebSocket tunnel (`localtunnel` via `esp32-tunnel`) to proxy a local MJPEG stream to a public URL, ensuring no port forwarding or ISP changes are required.
+A minimal, zero-router-configuration CCTV solution for the AI-Thinker ESP32-CAM.
+An outbound TCP tunnel (BORE) exposes your local camera server to a public URL with no port-forwarding or ISP changes required.
+
+---
+
+## Credentials — What Goes Where
+
+> This is the most important section. Read it before flashing.
+
+| Credential | Where you set it | Where you use it |
+|---|---|---|
+| **Camera viewer login** | `firmware/config.h` — `CONFIG_HTTP_USER` / `CONFIG_HTTP_PASS` | Browser prompt when opening `/view` URL |
+| **WiFi password** | **Not in code** — entered via captive portal on first boot | Saved automatically to ESP32 flash (NVS) |
+| **Supabase API key** | `firmware/config.h` — `SUPABASE_ANON_KEY` | ESP32 uses it internally to upload motion frames |
+
+### Camera viewer login (HTTP Basic Auth)
+When you open your public camera URL in a browser, it will show a login prompt. Enter:
+- **Username**: value of `CONFIG_HTTP_USER` in `config.h` (default: `admin`)
+- **Password**: value of `CONFIG_HTTP_PASS` in `config.h` (default: `changeme12345678`)
+
+> Change the default password before exposing your camera to the internet.
+
+### WiFi credentials
+WiFi is **never hardcoded**. Instead, on first boot the ESP32 sets up its own temporary hotspot named `ESP32-CAM-Setup`. You connect to it, fill in your home WiFi details on the popup webpage, and the board saves them permanently. See the **Quick Start** section below for the step-by-step.
+
+---
 
 ## Features
-- **Minimal MJPEG Stream**: Stripped down `esp_http_server` running on port 80.
-- **Outbound Tunnel**: Secure remote access via `localtunnel`.
-- **HTTP Basic Auth**: Secures the stream and endpoints.
-- **Cloud Storage**: Uploads motion-triggered clips to Supabase.
-- **PIR Motion Detection**: Hardware interrupt-driven burst capture (GPIO 13).
+- **JPEG-polling viewer** (`/view`) — works through any HTTP tunnel
+- **Outbound TCP tunnel** — BORE (`bore.pub`), no port-forwarding needed
+- **HTTP Basic Auth** — secures all camera endpoints
+- **WiFiManager** — captive portal WiFi provisioning, no hardcoded credentials
+- **Supabase cloud storage** — 200-frame circular motion buffer
+- **PIR motion detection** — HC-SR501 on GPIO 13, 5-frame burst capture
+
+---
 
 ## Prerequisites
-- AI-Thinker ESP32-CAM (OV2640, PSRAM)
-- Arduino IDE 2.x
-- ESP32 board package (≥ 3.0.x)
 
-## Required Libraries
-Install these via the Arduino Library Manager:
-- `esp32-tunnel` (by HamzaYslmn)
-- `WiFiManager` (by tzapu)
-- `ESPSupabase` (by jhagas)
-- `ArduinoJson`
+### Hardware
+- AI-Thinker ESP32-CAM (OV2640, PSRAM)
+- FTDI/USB-TTL adapter (3.3V logic) — for initial flashing only
+- Stable 5V ≥ 1A power supply (do NOT power from FTDI 5V pin — causes brownout resets)
+- Optional: HC-SR501 PIR sensor for motion detection
+
+### Arduino IDE Board Settings
+| Setting | Value |
+|---|---|
+| Board | AI Thinker ESP32-CAM |
+| PSRAM | Enabled |
+| Partition Scheme | Custom (select `firmware/partitions.csv`) |
+| Upload Speed | 115200 |
+| Flash Mode | QIO |
+| Flash Frequency | 80 MHz |
+
+### Required Libraries (install via Library Manager)
+| Library | Author | Purpose |
+|---|---|---|
+| `esp32-tunnel` | HamzaYslmn | BORE outbound tunnel |
+| `WiFiManager` | tzapu | Captive portal WiFi setup |
+| `ESPSupabase` | jhagas | Supabase storage upload |
+| `ArduinoJson` | bblanchon | JSON for Supabase metadata |
+
+---
 
 ## Quick Start & Setup
-1. Copy `config.example.h` to `config.h` and update credentials (DO NOT commit `config.h`).
+
+### Step 1 — Configure secrets
+```
+firmware/config.h   ← create this file (copy from config.example.h)
+```
+Open `config.example.h`, read every comment, then save a copy as `config.h` with your real values.
+`config.h` is gitignored — it will never be committed.
+
+The minimum you must change before going live:
+```cpp
+#define CONFIG_HTTP_PASS  "your-strong-unique-password"
+```
+
+### Step 2 — Flash
+1. Wire FTDI to ESP32-CAM (see [docs/FLASHING.md](docs/FLASHING.md)). Pull GPIO 0 to GND.
 2. Open `firmware/esp32-cam-cloud-cctv.ino` in Arduino IDE.
-3. Select board: `AI Thinker ESP32-CAM` (Enable PSRAM).
-4. Select Partition Scheme: `Custom` (Ensure `partitions.csv` is used).
-5. Flash the board.
-6. **Connect to the Captive Portal (WiFi Setup)**: We use `WiFiManager` to avoid hardcoding WiFi passwords into your code. 
-   - When the ESP32 boots for the first time, it will host its own WiFi network named `ESP32-CAM-Setup`. 
-   - Connect to this network using your phone or PC. A captive portal page will automatically pop up.
-   - Click "Configure WiFi", select your home WiFi network, and enter your password.
-   - The ESP32 will save these credentials to its permanent memory (NVS) and reboot.
-   - *Note: If you have flashed this specific ESP32 board before with other projects, it might already remember your WiFi credentials from its permanent memory and connect automatically (skipping the portal).*
+3. Select the board settings from the table above.
+4. Click Upload.
+5. Disconnect GPIO 0 from GND. Press RESET.
 
-## Verification & Testing (Next Steps)
-Now that your ESP32-CAM is flashed and connected to WiFi, here is how you verify each feature:
+### Step 3 — Connect to WiFi (first boot only)
+1. On your phone, open WiFi settings.
+2. Connect to the hotspot named **`ESP32-CAM-Setup`**.
+3. A webpage will appear automatically (captive portal).
+4. Tap **Configure WiFi**, select your home network, enter its password.
+5. The board saves the credentials and reboots. Done — it will connect automatically every time from now on.
 
-### 1. Verify the Tunnel (Internet Live Stream)
-- Open the Serial Monitor in the Arduino IDE (baud rate: 115200).
-- Wait a few seconds for the tunnel to connect. You will see a line print out: `Tunnel URL: https://<your-subdomain>.loca.lt`
-- **Disconnect your phone from your home WiFi** (so you are using mobile data) to prove it works over the internet.
-- Open that `loca.lt` URL in your phone's browser, appending `/stream` to the end (e.g. `https://cctv-dev-local.loca.lt/stream`).
-- A prompt will ask for a username and password. Enter the ones you defined in `config.h` (default: `admin` / `changeme12345678`).
-- You should now see the live video feed!
+> **Already connected?** If your board was previously used with other firmware on the same WiFi network, it may remember the credentials and skip straight to connecting — you'll see `AutoConnect: SUCCESS` in the Serial Monitor.
 
-### 2. Verify Motion Capture (Supabase)
-- Wave your hand in front of the PIR sensor.
-- Check the Serial Monitor. You should see logs indicating motion was detected and frames are uploading.
-- Go to your Supabase project dashboard -> **Storage** -> `cctv-clips` bucket.
-- Open the `events/` folder. You should see `frame_0.jpg` through `frame_4.jpg` uploaded.
+---
+
+## Viewing the Live Feed
+
+1. Open the **Serial Monitor** in Arduino IDE (baud rate: `115200`).
+2. After boot, wait ~5 seconds. You will see:
+   ```
+   >>> TUNNEL CONNECTED! URL: http://bore.pub:XXXXX
+   ```
+3. Note the port number — it changes every reboot.
+4. Open a browser and go to:
+   ```
+   http://bore.pub:XXXXX/view
+   ```
+   > ⚠️ You must use **`http://`** not `https://`. BORE is a plain TCP tunnel. If your browser forces HTTPS, open an Incognito/Private window and type the URL manually starting with `http://`.
+5. Enter your credentials when prompted:
+   - **Username**: `CONFIG_HTTP_USER` from `config.h`
+   - **Password**: `CONFIG_HTTP_PASS` from `config.h`
+6. The live camera feed will load at ~3-5 fps.
+
+### Endpoints
+| URL | Auth | Description |
+|---|---|---|
+| `/view` | ✅ Required | **Use this** — JPEG-polling HTML viewer |
+| `/capture` | ✅ Required | Single JPEG snapshot |
+| `/stream` | ✅ Required | Raw MJPEG (LAN only — hangs through BORE tunnel) |
+| `/health` | ❌ None | JSON uptime and free heap |
+
+---
+
+## Motion Capture Verification (Supabase + PIR)
+
+1. Complete [docs/SUPABASE_SETUP.md](docs/SUPABASE_SETUP.md) first.
+2. Wire PIR sensor as shown in [docs/WIRING.md](docs/WIRING.md).
+3. Set `ENABLE_PIR_MOTION 1` in `config.h`.
+4. Wave your hand in front of the PIR sensor.
+5. Serial Monitor should log:
+   ```
+   Motion detected! Capturing frame 1 of 5
+   Uploading events/frame_0.jpg ...
+   Upload successful!
+   ```
+6. Check **Supabase Dashboard → Storage → cctv-clips → events/** for uploaded frames.
+
+---
+
+## Known Behaviours
+
+| Behaviour | Explanation |
+|---|---|
+| Port changes every reboot | BORE assigns a random port. Note the new port from Serial Monitor after each restart. |
+| `No core dump partition found` on boot | Normal — we removed the unused core dump partition to save flash space. |
+| `gpio_install_isr_service already installed` | Normal — the camera driver installs the ISR first; Arduino re-installs it for PIR. Harmless. |
+| Camera not found on reboot | Check the camera ribbon cable — the latch is fragile. Reseat it firmly. |
+| Brownout reset (`rst:0x1`) | Power issue — do not power ESP32-CAM from FTDI. Use a dedicated 5V ≥ 1A supply. |
+
+---
 
 ## Documentation
-- [Flashing Guide](docs/FLASHING.md)
-- [Supabase Setup](docs/SUPABASE_SETUP.md)
-- [Wiring Guide](docs/WIRING.md)
+- [docs/FLASHING.md](docs/FLASHING.md) — FTDI wiring and Arduino IDE settings
+- [docs/SUPABASE_SETUP.md](docs/SUPABASE_SETUP.md) — Supabase bucket, RLS policies, metadata table
+- [docs/WIRING.md](docs/WIRING.md) — PIR sensor wiring to ESP32-CAM GPIO 13
