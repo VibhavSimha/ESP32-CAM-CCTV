@@ -81,22 +81,16 @@ static void _boreProxyConn(WiFiClient &remote, WiFiClient &local) {
   while (remote.connected() && local.connected() && millis() - idle < 30000) {
     bool activity = false;
 
-    // CRITICAL FIX 1: Drain control connection while proxying long-lived streams (like MJPEG).
+    // Drain control connection while proxying long-lived streams (like MJPEG).
+    // bore.pub sends heartbeats every 10s over _boreCtrl.
     if (_boreCtrl.connected() && _boreCtrl.available()) {
       _boreRecvMsg(_boreCtrl, 10);
       activity = true;
     }
 
-    // CRITICAL FIX 2: Non-blocking flow-controlled TCP proxying.
-    // Always check availableForWrite() BEFORE reading from source socket.
-    // If destination socket's TCP buffer is full, do NOT read from source socket.
-    // This prevents remote.write() / local.write() from blocking the task thread!
-
     // Remote (WAN) -> Local (camera server)
-    int localAvail = local.availableForWrite();
-    if (localAvail > 0 && remote.available()) {
-      int toRead = min((int)sizeof(buf), localAvail);
-      int n = remote.read(buf, toRead);
+    if (remote.available()) {
+      int n = remote.read(buf, sizeof(buf));
       if (n > 0) {
         local.write(buf, n);
         activity = true;
@@ -104,10 +98,8 @@ static void _boreProxyConn(WiFiClient &remote, WiFiClient &local) {
     }
 
     // Local (camera server) -> Remote (WAN)
-    int remoteAvail = remote.availableForWrite();
-    if (remoteAvail > 0 && local.available()) {
-      int toRead = min((int)sizeof(buf), remoteAvail);
-      int n = local.read(buf, toRead);
+    if (local.available()) {
+      int n = local.read(buf, sizeof(buf));
       if (n > 0) {
         remote.write(buf, n);
         activity = true;
