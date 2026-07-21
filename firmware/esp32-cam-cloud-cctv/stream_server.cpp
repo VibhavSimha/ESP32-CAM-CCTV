@@ -33,6 +33,7 @@ static esp_err_t capture_handler(httpd_req_t *req) {
     httpd_resp_set_hdr(req, "Content-Disposition", "inline; filename=capture.jpg");
     httpd_resp_set_hdr(req, "Cache-Control", "no-store, no-cache, must-revalidate, max-age=0");
     httpd_resp_set_hdr(req, "Pragma", "no-cache");
+    httpd_resp_set_hdr(req, "Connection", "close");
 
     size_t out_len = fb->len;
     res = httpd_resp_send(req, (const char *)fb->buf, out_len);
@@ -175,6 +176,7 @@ void startCameraServer() {
     config.max_uri_handlers = 5;
     config.recv_wait_timeout = 15;
     config.send_wait_timeout = 15;
+    config.lru_purge_enable = true; // Auto-close oldest connections when sockets are full
     
     httpd_uri_t stream_uri = {
         .uri       = "/stream",
