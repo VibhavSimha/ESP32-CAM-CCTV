@@ -159,7 +159,7 @@ static esp_err_t view_handler(httpd_req_t *req) {
         "img.src=u;n++;e=0;"
         "st.className='ok';"
         "st.textContent='Live \\u25cf frame '+n;"
-        "busy=false;setTimeout(go,2000);})"
+        "busy=false;setTimeout(go,100);})"
         ".catch(function(){"
         "clearTimeout(t);e++;"
         "st.className='er';"
