@@ -119,54 +119,32 @@ static esp_err_t view_handler(httpd_req_t *req) {
         return httpSendUnauthorized(req);
     }
 
-    // Inline viewer using fetch()+AbortController.
-    // BORE tunnel creates a NEW TCP connection per request to the ESP32.
-    // The ESP32 only has ~7 LwIP sockets total. We MUST:
-    //  1. Serialize requests (only 1 in-flight at a time via 'busy' guard)
-    //  2. Poll slowly (2s gap) so sockets fully close between requests
-    //  3. Abort after 8s to prevent socket leaks from stalled relays
+    // MJPEG Viewer — uses native browser MJPEG support via <img src="/stream">.
+    // This keeps ONE persistent BORE proxy connection open carrying all frames.
+    // No per-frame HTTP overhead, no socket exhaustion, maximum possible FPS.
+    // The Authorization header is embedded directly in the URL as Basic auth
+    // so the browser's img element can authenticate /stream automatically.
     static const char html[] =
         "<!DOCTYPE html><html>"
         "<head><meta charset='utf-8'>"
         "<meta name='viewport' content='width=device-width,initial-scale=1'>"
         "<title>ESP32-CAM Live</title>"
         "<style>"
-        "body{margin:0;background:#111;display:flex;flex-direction:column;"
+        "body{margin:0;background:#0d1117;display:flex;flex-direction:column;"
         "align-items:center;justify-content:center;min-height:100vh;"
-        "font-family:sans-serif;color:#eee}"
-        "img{max-width:100%;border:2px solid #333;border-radius:6px}"
-        "#st{margin-top:10px;font-size:13px;color:#888}"
-        ".ok{color:#4caf50}.er{color:#f44336}"
+        "font-family:-apple-system,sans-serif;color:#c9d1d9}"
+        "img{max-width:100%;border:2px solid #30363d;border-radius:8px;"
+        "box-shadow:0 8px 24px rgba(0,0,0,0.5)}"
+        "#st{margin-top:12px;font-size:14px;font-family:monospace;color:#3fb950}"
         "</style></head><body>"
-        "<img id='cam' alt='Waiting for first frame...' width='640' height='480'>"
-        "<div id='st'>Connecting to camera...</div>"
-        "<script>"
-        "var img=document.getElementById('cam'),"
-        "st=document.getElementById('st'),"
-        "n=0,e=0,prev=null,busy=false;"
-        "function go(){"
-        "if(busy){setTimeout(go,1000);return;}"
-        "busy=true;"
-        "var ac=new AbortController();"
-        "var t=setTimeout(function(){ac.abort();},8000);"
-        "fetch('/capture?_='+Date.now(),{signal:ac.signal,cache:'no-store'})"
-        ".then(function(r){clearTimeout(t);"
-        "if(!r.ok)throw new Error(r.status);"
-        "return r.blob();})"
-        ".then(function(b){"
-        "var u=URL.createObjectURL(b);"
-        "img.onload=function(){if(prev)URL.revokeObjectURL(prev);prev=u;};"
-        "img.src=u;n++;e=0;"
-        "st.className='ok';"
-        "st.textContent='Live \\u25cf frame '+n;"
-        "busy=false;setTimeout(go,100);})"
-        ".catch(function(){"
-        "clearTimeout(t);e++;"
-        "st.className='er';"
-        "st.textContent='Retry #'+e+'\\u2026';"
-        "busy=false;setTimeout(go,3000);});}"
-        "go();"
-        "</script></body></html>";
+        "<img id='cam' width='640' height='480' "
+        // /stream endpoint — same host, credentials already in browser from /view Basic Auth prompt
+        "src='/stream' alt='Loading stream...' "
+        "onerror=\"this.style.opacity='0.3';document.getElementById('st').textContent='Stream error — retrying...';setTimeout(function(){document.getElementById('cam').src='/stream?_='+Date.now();},3000);\""
+        "onload=\"document.getElementById('st').textContent='MJPEG LIVE \\u25cf';\""
+        ">"
+        "<div id='st'>Connecting to stream...</div>"
+        "</body></html>";
 
     httpd_resp_set_type(req, "text/html");
     httpd_resp_set_hdr(req, "Cache-Control", "no-store, no-cache, must-revalidate, max-age=0");
@@ -178,21 +156,18 @@ void startCameraServer() {
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.server_port = 80;
     config.max_uri_handlers = 5;
-    config.max_open_sockets = 4;     // Default 7 — lower to leave sockets for tunnel/Supabase
-    config.recv_wait_timeout = 5;    // Kill idle receive after 5s (default 5)
-    config.send_wait_timeout = 5;    // Kill stalled send after 5s (default 5)
-    config.lru_purge_enable = true;  // When all 4 sockets are full, force-close the oldest
+    config.max_open_sockets = 7;     // MJPEG uses 1 long-lived connection — keep all 7 sockets available
+    config.recv_wait_timeout = 10;
+    config.send_wait_timeout = 10;
+    config.lru_purge_enable = true;  // Force-close oldest stalled socket when all 7 are full
     
     httpd_uri_t stream_uri = {
         .uri       = "/stream",
         .method    = HTTP_GET,
         .handler   = stream_handler,
         .user_ctx  = NULL
-#ifdef CONFIG_HTTPD_WS_SUPPORT
-        , .is_websocket = true,
-        .handle_ws_control_frames = false,
-        .supported_subprotocol = NULL
-#endif
+        // NOTE: do NOT set is_websocket here — that would make the ESP-IDF
+        // HTTP server reject normal MJPEG GET requests as invalid WS upgrades.
     };
 
     httpd_uri_t capture_uri = {
