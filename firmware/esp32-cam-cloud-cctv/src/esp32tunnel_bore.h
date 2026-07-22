@@ -285,18 +285,6 @@ static unsigned long _lastBorePing = 0;
 static bool _boreServe() {
   if (!_boreCtrl.connected()) return false;
 
-  // Watchdog: Check if any proxy task is permanently blocked in WiFiClient::write()
-  for (int i = 0; i < BORE_MAX_PROXY; i++) {
-    if (_slotBusy[i] && _slotLastActive[i] > 0) {
-      if (millis() - _slotLastActive[i] > 12000) {
-        Serial.printf("[Tunnel] WATCHDOG: Slot %d is completely frozen for > 12s! Force closing sockets to unblock task!\n", i);
-        _boreProxy[i].stop();
-        _boreLocal[i].stop();
-        _slotLastActive[i] = 0; // Prevent spamming
-      }
-    }
-  }
-
   // Application-level keepalive to detect silent WAN drops
   if (millis() - _lastBorePing > 30000) {
     _lastBorePing = millis();
@@ -362,7 +350,27 @@ static void _boreBegin(const char *host, uint16_t localPort) {
 static unsigned long _boreBackoff = 2000;
 
 static void _boreLoop() {
-  if (!_bore.started || _bore.stop) return;
+  if (!_bore.started) return;
+
+  // Global Watchdog: Check if any proxy task is permanently blocked in WiFiClient::write()
+  // This MUST run unconditionally, even if the control socket is disconnected!
+  static unsigned long lastWdLog = 0;
+  if (millis() - lastWdLog > 10000) {
+    lastWdLog = millis();
+    // Serial.printf("[Tunnel] Main loop watchdog active.\n"); // Optional heartbeat
+  }
+
+  for (int i = 0; i < BORE_MAX_PROXY; i++) {
+    if (_slotBusy[i] && _slotLastActive[i] > 0) {
+      if (millis() - _slotLastActive[i] > 12000) {
+        Serial.printf("[Tunnel] WATCHDOG: Slot %d is completely frozen for > 12s! Force closing sockets to unblock task!\n", i);
+        _boreProxy[i].stop();
+        _boreLocal[i].stop();
+        _slotLastActive[i] = 0; // Prevent spamming
+      }
+    }
+  }
+
   switch (_bore.phase) {
     case _PH_IDLE: break;
     case _PH_INIT:
