@@ -43,6 +43,7 @@ static struct {
 static WiFiClient _boreCtrl;
 static WiFiClient _boreProxy[BORE_MAX_PROXY];
 static WiFiClient _boreLocal[BORE_MAX_PROXY];
+static volatile bool _slotBusy[BORE_MAX_PROXY] = {false};
 
 // ---------------------------------------------------------------------------
 // MARK: Null-delimited JSON read — reads until \0 or timeout
@@ -164,6 +165,7 @@ static void _boreProxyConn(WiFiClient &remote, WiFiClient &local, int slot) {
   free(buf);
   remote.stop();
   local.stop();
+  _slotBusy[slot] = false;
 }
 
 // MARK: Handle a single Connection message — open accept stream + proxy
@@ -171,11 +173,16 @@ static void _boreAccept(const String &uuid, int slot) {
   WiFiClient &proxy = _boreProxy[slot];
   WiFiClient &local = _boreLocal[slot];
 
-  if (!_tcpConnectHost(proxy, _bore.host.c_str(), BORE_CONTROL_PORT)) return;
+  if (!_tcpConnectHost(proxy, _bore.host.c_str(), BORE_CONTROL_PORT)) {
+    _slotBusy[slot] = false;
+    return;
+  }
   _boreSendMsg(proxy, "{\"Accept\":\"" + uuid + "\"}");
 
   if (!_tcpConnect(local, IPAddress(127, 0, 0, 1), _bore.localPort)) {
-    proxy.stop(); return;
+    proxy.stop();
+    _slotBusy[slot] = false;
+    return;
   }
   proxy.setTimeout(15000);
   local.setTimeout(15000);
@@ -242,23 +249,17 @@ static bool _boreServe() {
     String uuid = _jStr(msg, "Connection");
     if (!uuid.length()) continue;
 
-    // Reclaim half-dead slots first (Bug #3)
-    for (int i = 0; i < BORE_MAX_PROXY; i++) {
-      if (!_boreProxy[i].connected() || !_boreLocal[i].connected()) {
-        _boreProxy[i].stop();
-        _boreLocal[i].stop();
-      }
-    }
-
     // Find a free proxy slot
     int slot = -1;
     for (int i = 0; i < BORE_MAX_PROXY; i++) {
-      if (!_boreProxy[i].connected() && !_boreLocal[i].connected()) {
+      if (!_slotBusy[i]) {
         slot = i; break;
       }
     }
     if (slot < 0) continue; // all slots busy
 
+    _slotBusy[slot] = true; // Mark busy immediately so concurrent connections don't steal it
+    
     // Dispatch each proxy connection to its own FreeRTOS task (Bug #1)
     struct _ProxyArgs { String uuid; int slot; };
     auto *args = new _ProxyArgs{uuid, slot};
@@ -321,6 +322,7 @@ static void _boreStop() {
   for (int i = 0; i < BORE_MAX_PROXY; i++) {
     _boreProxy[i].stop();
     _boreLocal[i].stop();
+    _slotBusy[i] = false;
   }
   _bore.ready   = false;
   _bore.started = false;
