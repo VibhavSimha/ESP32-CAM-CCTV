@@ -177,6 +177,8 @@ static void _boreAccept(const String &uuid, int slot) {
   if (!_tcpConnect(local, IPAddress(127, 0, 0, 1), _bore.localPort)) {
     proxy.stop(); return;
   }
+  proxy.setTimeout(15000);
+  local.setTimeout(15000);
   proxy.setNoDelay(true);
   local.setNoDelay(true);
   Serial.printf("[Tunnel] Dispatching slot %d to Proxy Loop\n", slot);
@@ -213,8 +215,20 @@ static bool _boreInit() {
   return true;
 }
 
+static unsigned long _lastBorePing = 0;
+
 static bool _boreServe() {
   if (!_boreCtrl.connected()) return false;
+
+  // Application-level keepalive to detect silent WAN drops
+  if (millis() - _lastBorePing > 30000) {
+    _lastBorePing = millis();
+    _boreSendMsg(_boreCtrl, "{\"Ping\":1}");
+    if (_boreCtrl.getWriteError()) {
+      Serial.printf("[Tunnel] ERROR: Control socket write failed (silent drop detected)!\n");
+      return false;
+    }
+  }
 
   // Drain all queued control messages in a loop (Bug #7)
   while (_boreCtrl.connected() && _boreCtrl.available()) {
