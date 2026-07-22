@@ -102,8 +102,33 @@ static void _boreProxyConn(WiFiClient &remote, WiFiClient &local, int slot) {
   size_t totalRx = 0, totalTx = 0;
   bool backpressureWarning = false;
 
+  // Throughput stall detector: if we TX bytes to WAN but progress stops, the WAN is a black hole
+  size_t lastTxSnapshot = 0;
+  unsigned long lastTxProgress = millis();
+  unsigned long lastHeartbeat = millis();
+  bool streamingActive = false; // true once we've seen any LAN->WAN traffic
+
   while (remote.connected() && local.connected() && millis() - idle < 30000) {
     bool activity = false;
+
+    // Periodic heartbeat: log proxy state every 10s so we can see it's alive
+    if (millis() - lastHeartbeat > 10000) {
+      lastHeartbeat = millis();
+      Serial.printf("[Tunnel] Slot %d alive: TX=%u RX=%u idle=%lums r=%d l=%d\n",
+                    slot, totalTx, totalRx, millis() - idle,
+                    remote.connected(), local.connected());
+    }
+
+    // Throughput stall detector: if streaming and no TX progress for 10s → WAN black hole
+    if (streamingActive && millis() - lastTxProgress > 10000) {
+      if (totalTx == lastTxSnapshot) {
+        Serial.printf("[Tunnel] Slot %d STALL: TX frozen at %u bytes for 10s! WAN may be silently dropping. Killing slot.\n",
+                      slot, totalTx);
+        break;
+      }
+      lastTxSnapshot = totalTx;
+      lastTxProgress = millis();
+    }
 
     // Remote (WAN) -> Local (camera server)
     if (remote.available()) {
@@ -138,6 +163,7 @@ static void _boreProxyConn(WiFiClient &remote, WiFiClient &local, int slot) {
     if (local.available()) {
       int n = local.read(buf, 2048);
       if (n > 0) {
+        streamingActive = true; // we've started carrying LAN traffic
         int written = 0;
         unsigned long innerDeadline = millis() + 8000; // 8s ABSOLUTE deadline for this entire chunk
         while (written < n && remote.connected() && local.connected()) {
@@ -163,6 +189,7 @@ static void _boreProxyConn(WiFiClient &remote, WiFiClient &local, int slot) {
           break;
         }
         totalTx += written;
+        lastTxProgress = millis(); // TX made progress
         activity = true;
         backpressureWarning = false;
       }
@@ -171,6 +198,7 @@ static void _boreProxyConn(WiFiClient &remote, WiFiClient &local, int slot) {
     if (activity) idle = millis();
     else _DELAY(1);
   }
+
 
   const char *reason = "Idle timeout (30s)";
   if (!remote.connected()) reason = "WAN disconnect";
