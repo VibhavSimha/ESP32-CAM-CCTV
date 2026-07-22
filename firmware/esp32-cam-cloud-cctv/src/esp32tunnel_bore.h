@@ -233,6 +233,10 @@ static void _boreProxyConn(WiFiClient &remote, WiFiClient &local, int slot) {
   Serial.printf("[Tunnel] Slot %d final state: remote.connected=%d, local.connected=%d, idle_age=%lums\n",
                 slot, remote.connected(), local.connected(), millis() - idle);
 
+  // Log remaining stack depth to catch near-overflow situations
+  UBaseType_t stackHWM = uxTaskGetStackHighWaterMark(nullptr);
+  Serial.printf("[Tunnel] Slot %d: Stack high-water mark: %u words remaining.\n", slot, stackHWM);
+
   free(buf);
   remote.stop();
   local.stop();
@@ -276,7 +280,7 @@ static void _boreAccept(const String &uuid, int slot) {
       _boreProxyTaskHandle[a->slot] = nullptr;
       vTaskDelete(nullptr);
     },
-    "bore_proxy", 4096, &_boreProxyArgs[slot], 5, &_boreProxyTaskHandle[slot], 0 // Core 0!
+    "bore_proxy", 12288, &_boreProxyArgs[slot], 5, &_boreProxyTaskHandle[slot], 0 // Core 0! Stack=12KB
   );
 }
 
