@@ -83,6 +83,8 @@ static esp_err_t stream_handler(httpd_req_t *req) {
             _jpg_buf = fb->buf;
         }
 
+        unsigned long frameStart = millis();
+
         if (res == ESP_OK) {
             size_t hlen = snprintf((char *)part_buf, 64, _STREAM_PART, _jpg_buf_len);
             res = httpd_resp_send_chunk(req, (const char *)part_buf, hlen);
@@ -113,8 +115,18 @@ static esp_err_t stream_handler(httpd_req_t *req) {
         }
 
         if (res != ESP_OK) {
+            if (res == HTTPD_SOCK_ERR_TIMEOUT) {
+                Serial.printf("[/stream] Fatal: Network timeout (send_wait_timeout). Connection dropped due to extreme lag!\n");
+            } else if (res == HTTPD_SOCK_ERR_FAIL) {
+                Serial.printf("[/stream] Fatal: Socket closed by client or proxy.\n");
+            }
             Serial.printf("[/stream] Stream ended after %u frames. Heap: %u\n", frame_num, ESP.getFreeHeap());
             break;
+        }
+
+        unsigned long frameTime = millis() - frameStart;
+        if (frame_num % 10 == 0) { // Log every 10 frames to avoid completely flooding the console
+            Serial.printf("[/stream] Frame %u sent (%u bytes). Net TX time: %lums\n", frame_num, _jpg_buf_len, frameTime);
         }
 
         frame_num++;

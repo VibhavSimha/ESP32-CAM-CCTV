@@ -86,11 +86,17 @@ static void _boreSendMsg(WiFiClient &c, const String &msg) {
 // MARK: Proxy — bidirectional TCP copy
 // ---------------------------------------------------------------------------
 
-static void _boreProxyConn(WiFiClient &remote, WiFiClient &local) {
+static void _boreProxyConn(WiFiClient &remote, WiFiClient &local, int slot) {
   uint8_t *buf = (uint8_t *)malloc(2048);
   if (!buf) return;
+  
+  Serial.printf("[Tunnel] Proxy task started in slot %d\n", slot);
 
   unsigned long idle = millis();
+  unsigned long start = millis();
+  size_t totalRx = 0, totalTx = 0;
+  bool backpressureWarning = false;
+
   while (remote.connected() && local.connected() && millis() - idle < 30000) {
     bool activity = false;
 
@@ -104,7 +110,9 @@ static void _boreProxyConn(WiFiClient &remote, WiFiClient &local) {
         if (n > 0) {
           size_t w = local.write(buf, n);
           if (w == 0) break; // break only on complete write failure
+          totalRx += w;
           activity = true;
+          backpressureWarning = false;
         }
       }
     }
@@ -119,7 +127,14 @@ static void _boreProxyConn(WiFiClient &remote, WiFiClient &local) {
         if (n > 0) {
           size_t w = remote.write(buf, n);
           if (w == 0) break; // break only on complete write failure
+          totalTx += w;
           activity = true;
+          backpressureWarning = false;
+        }
+      } else {
+        if (!backpressureWarning) {
+          Serial.printf("[Tunnel] Slot %d WAN buffer full! Engaging backpressure...\n", slot);
+          backpressureWarning = true;
         }
       }
     }
@@ -127,6 +142,13 @@ static void _boreProxyConn(WiFiClient &remote, WiFiClient &local) {
     if (activity) idle = millis();
     else _DELAY(1);
   }
+
+  const char *reason = "Idle timeout (30s)";
+  if (!remote.connected()) reason = "WAN disconnect";
+  else if (!local.connected()) reason = "Local disconnect";
+
+  Serial.printf("[Tunnel] Proxy slot %d closed. Reason: %s. Duration: %lums, TX: %u bytes, RX: %u bytes\n", 
+                slot, reason, millis() - start, totalTx, totalRx);
 
   free(buf);
   remote.stop();
@@ -146,7 +168,8 @@ static void _boreAccept(const String &uuid, int slot) {
   }
   proxy.setNoDelay(true);
   local.setNoDelay(true);
-  _boreProxyConn(proxy, local);
+  Serial.printf("[Tunnel] Dispatching slot %d to Proxy Loop\n", slot);
+  _boreProxyConn(proxy, local, slot);
 }
 
 // ---------------------------------------------------------------------------
