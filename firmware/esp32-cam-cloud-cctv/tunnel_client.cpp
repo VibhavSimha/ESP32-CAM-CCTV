@@ -124,12 +124,24 @@ void handleTunnel() {
   static unsigned long lastStatusLog = 0;
   static bool wasReady = false;
   static bool watchdogLogged = false;
+  static unsigned long lastWifiReconnectAttempt = 0;
 
   if (!watchdogLogged) {
     watchdogLogged = true;
     Serial.println("[Tunnel] Main-loop watchdog enabled.");
   }
   tunnelWatchdog();
+
+  wl_status_t wifiStatus = WiFi.status();
+  if (wifiStatus != WL_CONNECTED) {
+    unsigned long now = millis();
+    if (now - lastWifiReconnectAttempt > 5000) {
+      lastWifiReconnectAttempt = now;
+      Serial.printf("[WiFi] Lost connection while tunnel running. status=%d ip=%s heap=%u. Calling WiFi.reconnect().\n",
+          wifiStatus, WiFi.localIP().toString().c_str(), ESP.getFreeHeap());
+      WiFi.reconnect();
+    }
+  }
 
   bool ready = tunnelReady();
 
