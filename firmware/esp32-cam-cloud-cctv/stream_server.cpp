@@ -212,8 +212,8 @@ void startCameraServer() {
     config.server_port = 80;
     config.max_uri_handlers = 5;
     config.max_open_sockets = 7;     // MJPEG uses 1 long-lived connection — keep all 7 sockets available
-    config.recv_wait_timeout = 60;
-    config.send_wait_timeout = 60;
+    config.recv_wait_timeout = 15;
+    config.send_wait_timeout = 10;   // Let stalled MJPEG tunnel streams fail and retry instead of wedging for a minute.
     config.lru_purge_enable = true;  // Force-close oldest stalled socket when all 7 are full
     
     httpd_uri_t stream_uri = {
@@ -247,6 +247,8 @@ void startCameraServer() {
     };
     
     Serial.printf("Starting web server on port: '%d'\n", config.server_port);
+    Serial.printf("[/stream] HTTPD timeouts: recv=%ds send=%ds, max_open_sockets=%d, lru_purge=%d\n",
+        config.recv_wait_timeout, config.send_wait_timeout, config.max_open_sockets, config.lru_purge_enable);
     if (httpd_start(&camera_httpd, &config) == ESP_OK) {
         httpd_register_uri_handler(camera_httpd, &stream_uri);
         httpd_register_uri_handler(camera_httpd, &capture_uri);
