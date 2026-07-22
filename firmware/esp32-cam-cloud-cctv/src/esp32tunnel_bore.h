@@ -101,41 +101,46 @@ static void _boreProxyConn(WiFiClient &remote, WiFiClient &local, int slot) {
     bool activity = false;
 
     // Remote (WAN) -> Local (camera server)
-    int remoteAvail = remote.available();
-    if (remoteAvail > 0) {
-      int localRoom = local.availableForWrite();
-      if (localRoom > 0) {
-        int toRead = min(remoteAvail, min(localRoom, 2048));
-        int n = remote.read(buf, toRead);
-        if (n > 0) {
-          size_t w = local.write(buf, n);
-          if (w == 0) break; // break only on complete write failure
-          totalRx += w;
-          activity = true;
-          backpressureWarning = false;
+    if (remote.available()) {
+      int n = remote.read(buf, 2048);
+      if (n > 0) {
+        int written = 0;
+        while (written < n && remote.connected() && local.connected()) {
+          size_t w = local.write(buf + written, n - written);
+          if (w == 0) {
+            _DELAY(5); // buffer full, wait
+          } else {
+            written += w;
+          }
         }
+        if (written < n) break; // connection broke during write
+        totalRx += written;
+        activity = true;
+        backpressureWarning = false;
       }
     }
 
     // Local (camera server) -> Remote (WAN)
-    int localAvail = local.available();
-    if (localAvail > 0) {
-      int remoteRoom = remote.availableForWrite();
-      if (remoteRoom > 0) {
-        int toRead = min(localAvail, min(remoteRoom, 2048));
-        int n = local.read(buf, toRead);
-        if (n > 0) {
-          size_t w = remote.write(buf, n);
-          if (w == 0) break; // break only on complete write failure
-          totalTx += w;
-          activity = true;
-          backpressureWarning = false;
+    if (local.available()) {
+      int n = local.read(buf, 2048);
+      if (n > 0) {
+        int written = 0;
+        while (written < n && remote.connected() && local.connected()) {
+          size_t w = remote.write(buf + written, n - written);
+          if (w == 0) {
+            _DELAY(5); // buffer full, wait
+            if (!backpressureWarning) {
+              Serial.printf("[Tunnel] Slot %d WAN buffer full! Engaging backpressure...\n", slot);
+              backpressureWarning = true;
+            }
+          } else {
+            written += w;
+          }
         }
-      } else {
-        if (!backpressureWarning) {
-          Serial.printf("[Tunnel] Slot %d WAN buffer full! Engaging backpressure...\n", slot);
-          backpressureWarning = true;
-        }
+        if (written < n) break; // connection broke during write
+        totalTx += written;
+        activity = true;
+        backpressureWarning = false;
       }
     }
 
