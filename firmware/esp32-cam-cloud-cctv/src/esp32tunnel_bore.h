@@ -110,18 +110,17 @@ static void _boreProxyConn(WiFiClient &remote, WiFiClient &local, int slot) {
       int n = remote.read(buf, 2048);
       if (n > 0) {
         int written = 0;
-        unsigned long writeStart = millis();
+        unsigned long innerDeadline = millis() + 8000; // 8s ABSOLUTE deadline for this entire chunk
         while (written < n && remote.connected() && local.connected()) {
+          if (millis() > innerDeadline) {
+            Serial.printf("[Tunnel] Slot %d WAN->LAN DEADLOCK! written=%d/%d after 8s. Killing slot.\n", slot, written, n);
+            break;
+          }
           size_t w = local.write(buf + written, n - written);
           if (w == 0) {
-            if (millis() - writeStart > 15000) {
-              Serial.printf("[Tunnel] Slot %d WAN->LAN write TIMED OUT (15s). written=%d/%d. Killing slot.\n", slot, written, n);
-              break;
-            }
-            _DELAY(5);
+            _DELAY(2);
           } else {
             written += w;
-            writeStart = millis();
           }
         }
         if (written < n) {
@@ -140,22 +139,21 @@ static void _boreProxyConn(WiFiClient &remote, WiFiClient &local, int slot) {
       int n = local.read(buf, 2048);
       if (n > 0) {
         int written = 0;
-        unsigned long writeStart = millis();
+        unsigned long innerDeadline = millis() + 8000; // 8s ABSOLUTE deadline for this entire chunk
         while (written < n && remote.connected() && local.connected()) {
+          if (millis() > innerDeadline) {
+            Serial.printf("[Tunnel] Slot %d LAN->WAN DEADLOCK! written=%d/%d after 8s. Killing slot.\n", slot, written, n);
+            break;
+          }
           size_t w = remote.write(buf + written, n - written);
           if (w == 0) {
-            if (millis() - writeStart > 15000) {
-              Serial.printf("[Tunnel] Slot %d LAN->WAN write TIMED OUT (15s). written=%d/%d. Killing slot.\n", slot, written, n);
-              break;
-            }
-            _DELAY(5);
             if (!backpressureWarning) {
               Serial.printf("[Tunnel] Slot %d WAN buffer full! Engaging backpressure...\n", slot);
               backpressureWarning = true;
             }
+            _DELAY(2);
           } else {
             written += w;
-            writeStart = millis();
             backpressureWarning = false;
           }
         }
@@ -211,8 +209,8 @@ static void _boreAccept(const String &uuid, int slot) {
     _slotBusy[slot] = false;
     return;
   }
-  proxy.setTimeout(15000);
-  local.setTimeout(15000);
+  proxy.setTimeout(3000);  // 3s: keeps blocking writes short so deadlines can fire
+  local.setTimeout(3000);
   proxy.setNoDelay(true);
   local.setNoDelay(true);
   Serial.printf("[Tunnel] Slot %d: Both sockets connected. Entering proxy loop.\n", slot);
