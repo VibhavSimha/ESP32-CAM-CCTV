@@ -95,22 +95,32 @@ static void _boreProxyConn(WiFiClient &remote, WiFiClient &local) {
     bool activity = false;
 
     // Remote (WAN) -> Local (camera server)
-    if (remote.available()) {
-      int n = remote.read(buf, 2048);
-      if (n > 0) {
-        size_t w = local.write(buf, n);
-        if (w != (size_t)n) break; // abort proxy on failed/partial write
-        activity = true;
+    int remoteAvail = remote.available();
+    if (remoteAvail > 0) {
+      int localRoom = local.availableForWrite();
+      if (localRoom > 0) {
+        int toRead = min(remoteAvail, min(localRoom, 2048));
+        int n = remote.read(buf, toRead);
+        if (n > 0) {
+          size_t w = local.write(buf, n);
+          if (w == 0) break; // break only on complete write failure
+          activity = true;
+        }
       }
     }
 
     // Local (camera server) -> Remote (WAN)
-    if (local.available()) {
-      int n = local.read(buf, 2048);
-      if (n > 0) {
-        size_t w = remote.write(buf, n);
-        if (w != (size_t)n) break; // abort proxy on failed/partial write
-        activity = true;
+    int localAvail = local.available();
+    if (localAvail > 0) {
+      int remoteRoom = remote.availableForWrite();
+      if (remoteRoom > 0) {
+        int toRead = min(localAvail, min(remoteRoom, 2048));
+        int n = local.read(buf, toRead);
+        if (n > 0) {
+          size_t w = remote.write(buf, n);
+          if (w == 0) break; // break only on complete write failure
+          activity = true;
+        }
       }
     }
 

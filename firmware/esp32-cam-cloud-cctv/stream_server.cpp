@@ -200,8 +200,8 @@ void startCameraServer() {
     config.server_port = 80;
     config.max_uri_handlers = 5;
     config.max_open_sockets = 7;     // MJPEG uses 1 long-lived connection — keep all 7 sockets available
-    config.recv_wait_timeout = 10;
-    config.send_wait_timeout = 10;
+    config.recv_wait_timeout = 60;
+    config.send_wait_timeout = 60;
     config.lru_purge_enable = true;  // Force-close oldest stalled socket when all 7 are full
     
     httpd_uri_t stream_uri = {
