@@ -237,8 +237,8 @@ static void _boreAccept(const String &uuid, int slot) {
     _slotBusy[slot] = false;
     return;
   }
-  proxy.setTimeout(3000);  // 3s: keeps blocking writes short so deadlines can fire
-  local.setTimeout(3000);
+  proxy.setTimeout(3);  // 3 SECONDS (ESP32 WiFiClient uses seconds!)
+  local.setTimeout(3);
   proxy.setNoDelay(true);
   local.setNoDelay(true);
   Serial.printf("[Tunnel] Slot %d: Both sockets connected. Entering proxy loop.\n", slot);
