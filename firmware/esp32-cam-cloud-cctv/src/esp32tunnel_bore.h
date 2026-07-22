@@ -48,16 +48,27 @@ static WiFiClient _boreLocal[BORE_MAX_PROXY];
 // MARK: Null-delimited JSON read — reads until \0 or timeout
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// MARK: Null-delimited JSON read — reads until \0 or timeout
+// ---------------------------------------------------------------------------
+
 static String _boreRecvMsg(WiFiClient &c, int timeoutMs = 5000) {
-  String msg; msg.reserve(128);
+  char buf[256];
+  int pos = 0;
   unsigned long t = millis();
   while (millis() - t < (unsigned long)timeoutMs) {
     if (!c.connected()) return "";
     if (!c.available()) { _DELAY(1); continue; }
     char ch = c.read();
-    if (ch == '\0') return msg;
-    msg += ch;
-    if (msg.length() > 256) return ""; // safety cap
+    if (ch == '\0') {
+      buf[pos] = '\0';
+      return String(buf);
+    }
+    if (pos < 255) {
+      buf[pos++] = ch;
+    } else {
+      return "";
+    }
   }
   return "";
 }
@@ -76,32 +87,29 @@ static void _boreSendMsg(WiFiClient &c, const String &msg) {
 // ---------------------------------------------------------------------------
 
 static void _boreProxyConn(WiFiClient &remote, WiFiClient &local) {
-  uint8_t buf[2048];
+  uint8_t *buf = (uint8_t *)malloc(2048);
+  if (!buf) return;
+
   unsigned long idle = millis();
   while (remote.connected() && local.connected() && millis() - idle < 30000) {
     bool activity = false;
 
-    // Drain control connection while proxying long-lived streams (like MJPEG).
-    // bore.pub sends heartbeats every 10s over _boreCtrl.
-    if (_boreCtrl.connected() && _boreCtrl.available()) {
-      _boreRecvMsg(_boreCtrl, 10);
-      activity = true;
-    }
-
     // Remote (WAN) -> Local (camera server)
     if (remote.available()) {
-      int n = remote.read(buf, sizeof(buf));
+      int n = remote.read(buf, 2048);
       if (n > 0) {
-        local.write(buf, n);
+        size_t w = local.write(buf, n);
+        if (w != (size_t)n) break; // abort proxy on failed/partial write
         activity = true;
       }
     }
 
     // Local (camera server) -> Remote (WAN)
     if (local.available()) {
-      int n = local.read(buf, sizeof(buf));
+      int n = local.read(buf, 2048);
       if (n > 0) {
-        remote.write(buf, n);
+        size_t w = remote.write(buf, n);
+        if (w != (size_t)n) break; // abort proxy on failed/partial write
         activity = true;
       }
     }
@@ -109,6 +117,8 @@ static void _boreProxyConn(WiFiClient &remote, WiFiClient &local) {
     if (activity) idle = millis();
     else _DELAY(1);
   }
+
+  free(buf);
   remote.stop();
   local.stop();
 }
@@ -162,29 +172,46 @@ static bool _boreInit() {
 static bool _boreServe() {
   if (!_boreCtrl.connected()) return false;
 
-  // Non-blocking: check if control connection has data
-  if (!_boreCtrl.available()) return true;
+  // Drain all queued control messages in a loop (Bug #7)
+  while (_boreCtrl.connected() && _boreCtrl.available()) {
+    String msg = _boreRecvMsg(_boreCtrl, 500); // 500ms safe timeout (Bug #5)
+    if (!msg.length()) break;
 
-  String msg = _boreRecvMsg(_boreCtrl, 3000);
-  if (!msg.length()) return _boreCtrl.connected();
+    // Heartbeat — ignore
+    if (msg.indexOf("\"Heartbeat\"") >= 0) continue;
 
-  // Heartbeat — just ignore
-  if (msg.indexOf("\"Heartbeat\"") >= 0) return true;
+    // Connection request
+    String uuid = _jStr(msg, "Connection");
+    if (!uuid.length()) continue;
 
-  // Connection request
-  String uuid = _jStr(msg, "Connection");
-  if (!uuid.length()) return true;
-
-  // Find a free proxy slot
-  int slot = -1;
-  for (int i = 0; i < BORE_MAX_PROXY; i++) {
-    if (!_boreProxy[i].connected() && !_boreLocal[i].connected()) {
-      slot = i; break;
+    // Reclaim half-dead slots first (Bug #3)
+    for (int i = 0; i < BORE_MAX_PROXY; i++) {
+      if (!_boreProxy[i].connected() || !_boreLocal[i].connected()) {
+        _boreProxy[i].stop();
+        _boreLocal[i].stop();
+      }
     }
-  }
-  if (slot < 0) return true; // all slots busy, drop connection
 
-  _boreAccept(uuid, slot);
+    // Find a free proxy slot
+    int slot = -1;
+    for (int i = 0; i < BORE_MAX_PROXY; i++) {
+      if (!_boreProxy[i].connected() && !_boreLocal[i].connected()) {
+        slot = i; break;
+      }
+    }
+    if (slot < 0) continue; // all slots busy
+
+    // Dispatch each proxy connection to its own FreeRTOS task (Bug #1)
+    struct _ProxyArgs { String uuid; int slot; };
+    auto *args = new _ProxyArgs{uuid, slot};
+    xTaskCreatePinnedToCore([](void *p) {
+      auto *a = (_ProxyArgs*)p;
+      _boreAccept(a->uuid, a->slot);
+      delete a;
+      vTaskDelete(nullptr);
+    }, "boreProxy", 6144, args, 1, nullptr, TUN_TASK_CORE);
+  }
+
   return true;
 }
 

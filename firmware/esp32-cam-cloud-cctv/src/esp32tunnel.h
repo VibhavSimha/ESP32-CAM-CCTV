@@ -116,7 +116,7 @@ static String _tunMakeKey() {
 
 // MARK: Background task (ESP32) — tunnelSetup() runs the tunnel in its own task.
 #ifndef TUN_TASK_STACK
-#define TUN_TASK_STACK 8192      // proven enough for the WS + TLS path
+#define TUN_TASK_STACK 12288     // Increased stack to avoid overflow
 #endif
 #ifndef TUN_TASK_PRIO
 #define TUN_TASK_PRIO 1
@@ -195,22 +195,16 @@ static String _jStr(const String &j, const char *key) {
   int i = _jFind(j, key);
   if (i < 0 || j[i] != '"') return "";
   i++;
-  char stack[128]; int pos = 0; bool heap = false;
-  String out;
+  char stack[256]; int pos = 0;
   while (i < (int)j.length() && j[i] != '"') {
     char c;
     if (j[i] == '\\' && i + 1 < (int)j.length()) {
       char e = j[++i];
       c = (e == 'n') ? '\n' : (e == 'r') ? '\r' : (e == 't') ? '\t' : e;
     } else c = j[i];
-    if (!heap && pos < 127) { stack[pos++] = c; }
-    else {
-      if (!heap) { heap = true; out.reserve(256); out.concat(stack, pos); }
-      out += c;
-    }
+    if (pos < 255) stack[pos++] = c;
     i++;
   }
-  if (heap) return out;
   stack[pos] = 0;
   return String(stack);
 }
