@@ -45,6 +45,7 @@ static WiFiClient _boreProxy[BORE_MAX_PROXY];
 static WiFiClient _boreLocal[BORE_MAX_PROXY];
 static volatile bool _slotBusy[BORE_MAX_PROXY] = {false};
 static volatile unsigned long _slotLastActive[BORE_MAX_PROXY] = {0};
+static volatile bool _slotWatchdogArmed[BORE_MAX_PROXY] = {false};
 static TaskHandle_t _boreProxyTaskHandle[BORE_MAX_PROXY] = {nullptr};
 
 // Per-slot task argument (static so it outlives the launching function)
@@ -114,7 +115,9 @@ static void _boreProxyConn(WiFiClient &remote, WiFiClient &local, int slot) {
   unsigned long lastHeartbeat = millis();
   bool streamingActive = false; // true once we've seen any LAN->WAN traffic
 
-  _slotLastActive[slot] = millis(); // Initialize watchdog timer
+  _slotLastActive[slot] = start; // Initialize watchdog timer
+  _slotWatchdogArmed[slot] = true;
+  Serial.printf("[Tunnel] Slot %d watchdog armed at %lums.\n", slot, start);
 
   while (remote.connected() && local.connected() && millis() - idle < 30000) {
     bool activity = false;
@@ -240,18 +243,22 @@ static void _boreProxyConn(WiFiClient &remote, WiFiClient &local, int slot) {
   free(buf);
   remote.stop();
   local.stop();
+  _slotWatchdogArmed[slot] = false;
   _slotLastActive[slot] = 0;
   _slotBusy[slot] = false;
 }
 
 static void _boreWatchdog(const char *source) {
   for (int i = 0; i < BORE_MAX_PROXY; i++) {
-    if (_slotBusy[i] && _slotLastActive[i] > 0) {
-      if (millis() - _slotLastActive[i] > 12000) {
-        Serial.printf("[Tunnel] WATCHDOG(%s): Slot %d is completely frozen for > 12s! Force closing sockets to unblock task!\n",
-                      source, i);
+    if (_slotBusy[i] && _slotWatchdogArmed[i] && _slotLastActive[i] > 0) {
+      unsigned long now = millis();
+      unsigned long age = now - _slotLastActive[i];
+      if (age > 12000) {
+        Serial.printf("[Tunnel] WATCHDOG(%s): Slot %d frozen. age=%lums last=%lums now=%lums heap=%u wifi=%d. Force closing sockets.\n",
+                      source, i, age, _slotLastActive[i], now, ESP.getFreeHeap(), WiFi.status());
         _boreProxy[i].stop();
         _boreLocal[i].stop();
+        _slotWatchdogArmed[i] = false;
         _slotLastActive[i] = 0; // Prevent spamming
       }
     }
@@ -263,9 +270,13 @@ static void _boreAccept(const String &uuid, int slot) {
   WiFiClient &proxy = _boreProxy[slot];
   WiFiClient &local = _boreLocal[slot];
 
+  _slotWatchdogArmed[slot] = false;
+  _slotLastActive[slot] = 0;
   Serial.printf("[Tunnel] Slot %d: Connecting proxy socket to bore.pub...\n", slot);
   if (!_tcpConnectHost(proxy, _bore.host.c_str(), BORE_CONTROL_PORT)) {
     Serial.printf("[Tunnel] Slot %d: FAILED to connect proxy socket to bore.pub! Releasing slot.\n", slot);
+    _slotWatchdogArmed[slot] = false;
+    _slotLastActive[slot] = 0;
     _slotBusy[slot] = false;
     return;
   }
@@ -276,6 +287,8 @@ static void _boreAccept(const String &uuid, int slot) {
   if (!_tcpConnect(local, IPAddress(127, 0, 0, 1), _bore.localPort)) {
     Serial.printf("[Tunnel] Slot %d: FAILED to connect local socket to camera server! Releasing slot.\n", slot);
     proxy.stop();
+    _slotWatchdogArmed[slot] = false;
+    _slotLastActive[slot] = 0;
     _slotBusy[slot] = false;
     return;
   }
@@ -301,6 +314,7 @@ static void _boreAccept(const String &uuid, int slot) {
     proxy.stop();
     local.stop();
     _boreProxyTaskHandle[slot] = nullptr;
+    _slotWatchdogArmed[slot] = false;
     _slotLastActive[slot] = 0;
     _slotBusy[slot] = false;
   }
@@ -447,6 +461,8 @@ static void _boreStop() {
   for (int i = 0; i < BORE_MAX_PROXY; i++) {
     _boreProxy[i].stop();
     _boreLocal[i].stop();
+    _slotWatchdogArmed[i] = false;
+    _slotLastActive[i] = 0;
     _slotBusy[i] = false;
   }
   _bore.ready   = false;
