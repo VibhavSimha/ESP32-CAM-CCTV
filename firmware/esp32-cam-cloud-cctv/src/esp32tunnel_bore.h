@@ -89,7 +89,11 @@ static void _boreSendMsg(WiFiClient &c, const String &msg) {
 
 static void _boreProxyConn(WiFiClient &remote, WiFiClient &local, int slot) {
   uint8_t *buf = (uint8_t *)malloc(2048);
-  if (!buf) return;
+  if (!buf) {
+    Serial.printf("[Tunnel] Slot %d FATAL: malloc failed! Aborting proxy.\n", slot);
+    _slotBusy[slot] = false;
+    return;
+  }
   
   Serial.printf("[Tunnel] Proxy task started in slot %d\n", slot);
 
@@ -110,14 +114,21 @@ static void _boreProxyConn(WiFiClient &remote, WiFiClient &local, int slot) {
         while (written < n && remote.connected() && local.connected()) {
           size_t w = local.write(buf + written, n - written);
           if (w == 0) {
-            if (millis() - writeStart > 15000) break; // 15s absolute timeout
-            _DELAY(5); // buffer full, wait
+            if (millis() - writeStart > 15000) {
+              Serial.printf("[Tunnel] Slot %d WAN->LAN write TIMED OUT (15s). written=%d/%d. Killing slot.\n", slot, written, n);
+              break;
+            }
+            _DELAY(5);
           } else {
             written += w;
             writeStart = millis();
           }
         }
-        if (written < n) break; // connection broke during write
+        if (written < n) {
+          Serial.printf("[Tunnel] Slot %d WAN->LAN write incomplete (%d/%d bytes). r=%d l=%d. Breaking.\n",
+                        slot, written, n, remote.connected(), local.connected());
+          break;
+        }
         totalRx += written;
         activity = true;
         backpressureWarning = false;
@@ -133,8 +144,11 @@ static void _boreProxyConn(WiFiClient &remote, WiFiClient &local, int slot) {
         while (written < n && remote.connected() && local.connected()) {
           size_t w = remote.write(buf + written, n - written);
           if (w == 0) {
-            if (millis() - writeStart > 15000) break; // 15s absolute timeout
-            _DELAY(5); // buffer full, wait
+            if (millis() - writeStart > 15000) {
+              Serial.printf("[Tunnel] Slot %d LAN->WAN write TIMED OUT (15s). written=%d/%d. Killing slot.\n", slot, written, n);
+              break;
+            }
+            _DELAY(5);
             if (!backpressureWarning) {
               Serial.printf("[Tunnel] Slot %d WAN buffer full! Engaging backpressure...\n", slot);
               backpressureWarning = true;
@@ -142,9 +156,14 @@ static void _boreProxyConn(WiFiClient &remote, WiFiClient &local, int slot) {
           } else {
             written += w;
             writeStart = millis();
+            backpressureWarning = false;
           }
         }
-        if (written < n) break; // connection broke during write
+        if (written < n) {
+          Serial.printf("[Tunnel] Slot %d LAN->WAN write incomplete (%d/%d bytes). r=%d l=%d. Breaking.\n",
+                        slot, written, n, remote.connected(), local.connected());
+          break;
+        }
         totalTx += written;
         activity = true;
         backpressureWarning = false;
@@ -158,9 +177,12 @@ static void _boreProxyConn(WiFiClient &remote, WiFiClient &local, int slot) {
   const char *reason = "Idle timeout (30s)";
   if (!remote.connected()) reason = "WAN disconnect";
   else if (!local.connected()) reason = "Local disconnect";
+  else reason = "Write failure / timeout";
 
-  Serial.printf("[Tunnel] Proxy slot %d closed. Reason: %s. Duration: %lums, TX: %u bytes, RX: %u bytes\n", 
+  Serial.printf("[Tunnel] Proxy slot %d closed. Reason: %s. Duration: %lums, TX: %u bytes, RX: %u bytes\n",
                 slot, reason, millis() - start, totalTx, totalRx);
+  Serial.printf("[Tunnel] Slot %d final state: remote.connected=%d, local.connected=%d, idle_age=%lums\n",
+                slot, remote.connected(), local.connected(), millis() - idle);
 
   free(buf);
   remote.stop();
@@ -173,13 +195,18 @@ static void _boreAccept(const String &uuid, int slot) {
   WiFiClient &proxy = _boreProxy[slot];
   WiFiClient &local = _boreLocal[slot];
 
+  Serial.printf("[Tunnel] Slot %d: Connecting proxy socket to bore.pub...\n", slot);
   if (!_tcpConnectHost(proxy, _bore.host.c_str(), BORE_CONTROL_PORT)) {
+    Serial.printf("[Tunnel] Slot %d: FAILED to connect proxy socket to bore.pub! Releasing slot.\n", slot);
     _slotBusy[slot] = false;
     return;
   }
+  Serial.printf("[Tunnel] Slot %d: Sending Accept for UUID=%s\n", slot, uuid.c_str());
   _boreSendMsg(proxy, "{\"Accept\":\"" + uuid + "\"}");
 
+  Serial.printf("[Tunnel] Slot %d: Connecting local socket to 127.0.0.1:%d...\n", slot, _bore.localPort);
   if (!_tcpConnect(local, IPAddress(127, 0, 0, 1), _bore.localPort)) {
+    Serial.printf("[Tunnel] Slot %d: FAILED to connect local socket to camera server! Releasing slot.\n", slot);
     proxy.stop();
     _slotBusy[slot] = false;
     return;
@@ -188,7 +215,7 @@ static void _boreAccept(const String &uuid, int slot) {
   local.setTimeout(15000);
   proxy.setNoDelay(true);
   local.setNoDelay(true);
-  Serial.printf("[Tunnel] Dispatching slot %d to Proxy Loop\n", slot);
+  Serial.printf("[Tunnel] Slot %d: Both sockets connected. Entering proxy loop.\n", slot);
   _boreProxyConn(proxy, local, slot);
 }
 
