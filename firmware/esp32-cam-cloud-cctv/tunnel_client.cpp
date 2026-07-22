@@ -123,6 +123,13 @@ void tunnelBegin() {
 void handleTunnel() {
   static unsigned long lastStatusLog = 0;
   static bool wasReady = false;
+  static bool watchdogLogged = false;
+
+  if (!watchdogLogged) {
+    watchdogLogged = true;
+    Serial.println("[Tunnel] Main-loop watchdog enabled.");
+  }
+  tunnelWatchdog();
 
   bool ready = tunnelReady();
 

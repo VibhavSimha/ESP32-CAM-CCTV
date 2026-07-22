@@ -484,6 +484,10 @@ inline bool tunnelReady() {
   return _lt.ready;
 }
 
+inline void tunnelWatchdog() {
+  if (_tunProvider == BORE) _boreWatchdog("loop");
+}
+
 inline String tunnelLastIP() {
   if (_tunProvider == SELFHOST) return _sh.lastIP;
   if (_tunProvider == BORE)     return _bore.lastIP;

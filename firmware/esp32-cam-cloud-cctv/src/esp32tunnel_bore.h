@@ -244,6 +244,20 @@ static void _boreProxyConn(WiFiClient &remote, WiFiClient &local, int slot) {
   _slotBusy[slot] = false;
 }
 
+static void _boreWatchdog(const char *source) {
+  for (int i = 0; i < BORE_MAX_PROXY; i++) {
+    if (_slotBusy[i] && _slotLastActive[i] > 0) {
+      if (millis() - _slotLastActive[i] > 12000) {
+        Serial.printf("[Tunnel] WATCHDOG(%s): Slot %d is completely frozen for > 12s! Force closing sockets to unblock task!\n",
+                      source, i);
+        _boreProxy[i].stop();
+        _boreLocal[i].stop();
+        _slotLastActive[i] = 0; // Prevent spamming
+      }
+    }
+  }
+}
+
 // MARK: Handle a single Connection message — open accept stream + proxy
 static void _boreAccept(const String &uuid, int slot) {
   WiFiClient &proxy = _boreProxy[slot];
@@ -402,16 +416,7 @@ static void _boreLoop() {
     // Serial.printf("[Tunnel] Main loop watchdog active.\n"); // Optional heartbeat
   }
 
-  for (int i = 0; i < BORE_MAX_PROXY; i++) {
-    if (_slotBusy[i] && _slotLastActive[i] > 0) {
-      if (millis() - _slotLastActive[i] > 12000) {
-        Serial.printf("[Tunnel] WATCHDOG: Slot %d is completely frozen for > 12s! Force closing sockets to unblock task!\n", i);
-        _boreProxy[i].stop();
-        _boreLocal[i].stop();
-        _slotLastActive[i] = 0; // Prevent spamming
-      }
-    }
-  }
+  _boreWatchdog("tunnel");
 
   switch (_bore.phase) {
     case _PH_IDLE: break;
