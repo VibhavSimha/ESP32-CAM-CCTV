@@ -45,6 +45,11 @@ static WiFiClient _boreProxy[BORE_MAX_PROXY];
 static WiFiClient _boreLocal[BORE_MAX_PROXY];
 static volatile bool _slotBusy[BORE_MAX_PROXY] = {false};
 static volatile unsigned long _slotLastActive[BORE_MAX_PROXY] = {0};
+static TaskHandle_t _boreProxyTaskHandle[BORE_MAX_PROXY] = {nullptr};
+
+// Per-slot task argument (static so it outlives the launching function)
+struct _BoreProxyArg { int slot; };
+static _BoreProxyArg _boreProxyArgs[BORE_MAX_PROXY];
 
 // ---------------------------------------------------------------------------
 // MARK: Null-delimited JSON read — reads until \0 or timeout
@@ -246,8 +251,19 @@ static void _boreAccept(const String &uuid, int slot) {
   local.setTimeout(3);
   proxy.setNoDelay(true);
   local.setNoDelay(true);
-  Serial.printf("[Tunnel] Slot %d: Both sockets connected. Entering proxy loop.\n", slot);
-  _boreProxyConn(proxy, local, slot);
+  Serial.printf("[Tunnel] Slot %d: Both sockets connected. Spawning proxy task on Core 0.\n", slot);
+
+  // Spawn proxy on Core 0 so Core 1 (tunnel task) stays free to run the Watchdog!
+  _boreProxyArgs[slot] = {slot};
+  xTaskCreatePinnedToCore(
+    [](void *arg) {
+      _BoreProxyArg *a = (_BoreProxyArg *)arg;
+      _boreProxyConn(_boreProxy[a->slot], _boreLocal[a->slot], a->slot);
+      _boreProxyTaskHandle[a->slot] = nullptr;
+      vTaskDelete(nullptr);
+    },
+    "bore_proxy", 4096, &_boreProxyArgs[slot], 5, &_boreProxyTaskHandle[slot], 0 // Core 0!
+  );
 }
 
 // ---------------------------------------------------------------------------
