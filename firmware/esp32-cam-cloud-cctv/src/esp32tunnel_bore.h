@@ -273,7 +273,7 @@ static void _boreAccept(const String &uuid, int slot) {
 
   // Spawn proxy on Core 0 so Core 1 (tunnel task) stays free to run the Watchdog!
   _boreProxyArgs[slot] = {slot};
-  xTaskCreatePinnedToCore(
+  BaseType_t taskOk = xTaskCreatePinnedToCore(
     [](void *arg) {
       _BoreProxyArg *a = (_BoreProxyArg *)arg;
       _boreProxyConn(_boreProxy[a->slot], _boreLocal[a->slot], a->slot);
@@ -282,6 +282,14 @@ static void _boreAccept(const String &uuid, int slot) {
     },
     "bore_proxy", 12288, &_boreProxyArgs[slot], 5, &_boreProxyTaskHandle[slot], 0 // Core 0! Stack=12KB
   );
+  if (taskOk != pdPASS) {
+    Serial.printf("[Tunnel] Slot %d: FAILED to spawn proxy task! Closing sockets. Heap=%u\n", slot, ESP.getFreeHeap());
+    proxy.stop();
+    local.stop();
+    _boreProxyTaskHandle[slot] = nullptr;
+    _slotLastActive[slot] = 0;
+    _slotBusy[slot] = false;
+  }
 }
 
 // ---------------------------------------------------------------------------
