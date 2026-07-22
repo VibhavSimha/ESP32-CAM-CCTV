@@ -128,15 +128,19 @@ static void _boreProxyConn(WiFiClient &remote, WiFiClient &local, int slot) {
                     remote.connected(), local.connected());
     }
 
-    // Throughput stall detector: if streaming and no TX progress for 10s → WAN black hole
-    if (streamingActive && millis() - lastTxProgress > 10000) {
-      if (totalTx == lastTxSnapshot) {
-        Serial.printf("[Tunnel] Slot %d STALL: TX frozen at %u bytes for 10s! WAN may be silently dropping. Killing slot.\n",
-                      slot, totalTx);
-        break;
+    // Throughput stall detector: TX must GROW within 10s window while streaming
+    if (streamingActive) {
+      if (millis() - lastTxProgress > 10000) {
+        Serial.printf("[Tunnel] Slot %d STALL CHECK: TX now=%u snapshot=%u\n", slot, totalTx, lastTxSnapshot);
+        if (totalTx == lastTxSnapshot) {
+          Serial.printf("[Tunnel] Slot %d STALL: TX frozen at %u bytes for 10s! WAN silently dropping. Killing slot.\n",
+                        slot, totalTx);
+          break;
+        }
+        // TX DID grow - update snapshot and reset timer for next check
+        lastTxSnapshot = totalTx;
+        lastTxProgress = millis();
       }
-      lastTxSnapshot = totalTx;
-      lastTxProgress = millis();
     }
 
     // Remote (WAN) -> Local (camera server)
@@ -208,6 +212,16 @@ static void _boreProxyConn(WiFiClient &remote, WiFiClient &local, int slot) {
     else _DELAY(1);
   }
 
+
+  // Log why the while() condition itself became false (natural exit, not a break)
+  bool naturalExit = remote.connected() && local.connected();
+  if (naturalExit) {
+    Serial.printf("[Tunnel] Slot %d: Loop exited naturally (30s idle). r=%d l=%d TX=%u\n",
+                  slot, remote.connected(), local.connected(), totalTx);
+  } else {
+    Serial.printf("[Tunnel] Slot %d: Loop exited via socket drop. r=%d l=%d TX=%u\n",
+                  slot, remote.connected(), local.connected(), totalTx);
+  }
 
   const char *reason = "Idle timeout (30s)";
   if (!remote.connected()) reason = "WAN disconnect";
