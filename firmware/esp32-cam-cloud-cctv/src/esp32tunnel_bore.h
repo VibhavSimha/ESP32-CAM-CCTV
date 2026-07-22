@@ -105,12 +105,15 @@ static void _boreProxyConn(WiFiClient &remote, WiFiClient &local, int slot) {
       int n = remote.read(buf, 2048);
       if (n > 0) {
         int written = 0;
+        unsigned long writeStart = millis();
         while (written < n && remote.connected() && local.connected()) {
           size_t w = local.write(buf + written, n - written);
           if (w == 0) {
+            if (millis() - writeStart > 15000) break; // 15s absolute timeout
             _DELAY(5); // buffer full, wait
           } else {
             written += w;
+            writeStart = millis();
           }
         }
         if (written < n) break; // connection broke during write
@@ -125,9 +128,11 @@ static void _boreProxyConn(WiFiClient &remote, WiFiClient &local, int slot) {
       int n = local.read(buf, 2048);
       if (n > 0) {
         int written = 0;
+        unsigned long writeStart = millis();
         while (written < n && remote.connected() && local.connected()) {
           size_t w = remote.write(buf + written, n - written);
           if (w == 0) {
+            if (millis() - writeStart > 15000) break; // 15s absolute timeout
             _DELAY(5); // buffer full, wait
             if (!backpressureWarning) {
               Serial.printf("[Tunnel] Slot %d WAN buffer full! Engaging backpressure...\n", slot);
@@ -135,6 +140,7 @@ static void _boreProxyConn(WiFiClient &remote, WiFiClient &local, int slot) {
             }
           } else {
             written += w;
+            writeStart = millis();
           }
         }
         if (written < n) break; // connection broke during write
