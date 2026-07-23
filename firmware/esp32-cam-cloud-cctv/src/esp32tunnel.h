@@ -256,6 +256,8 @@ static void _setKeepAlive(WiFiClient &c) {
   setsockopt(fd, IPPROTO_TCP, TCP_KEEPINTVL, &intvl, sizeof(intvl));
   setsockopt(fd, IPPROTO_TCP, TCP_KEEPCNT,   &cnt,   sizeof(cnt));
   setsockopt(fd, IPPROTO_TCP, TCP_NODELAY,   &on,    sizeof(on));
+  struct timeval snd = { 8, 0 };
+  setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &snd, sizeof(snd));
 #endif
   c.setNoDelay(true);
 }
