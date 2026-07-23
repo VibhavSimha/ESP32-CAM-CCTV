@@ -22,39 +22,9 @@ static bool publishTunnelUrlNow(const String &url) {
 
   Serial.printf("[Supabase] Publishing tunnel URL: %s | heap: %u\n", url.c_str(), ESP.getFreeHeap());
   unsigned long t0 = millis();
-  // Check if row with id=1 exists
-  supabase.from("camera_status").select("*").eq("id", "1");
-  String response = supabase.doSelect();
 
-  bool exists = false;
-
-  // Parse response
-  DynamicJsonDocument doc(1024);
-  DeserializationError err = deserializeJson(doc, response);
-
-  if (!err && doc.is<JsonArray>() && doc.size() > 0) {
-    exists = true;
-  }
-
-  int code;
-
-  if (exists) {
-    // Only update the URL
-    String updateJson =
-      "{\"url\":\"" + url + "\",\"created_at\":\"now()\"}";
-
-    code = supabase
-             .from("camera_status")
-             .update("camera_status")
-             .eq("id", "1")
-             .doUpdate(updateJson);
-  } else {
-    // Create the row
-    String insertJson =
-      "{\"id\":1,\"url\":\"" + url + "\",\"created_at\":\"now()\"}";
-
-    code = supabase.insert("camera_status", insertJson, false);
-  }
+  String insertJson = "{\"url\":\"" + url + "\"}";
+  int code = supabase.insert("camera_status", insertJson, false);
   unsigned long elapsed = millis() - t0;
   if (code == 201 || code == 200 || code == 204) {
     Serial.printf("[Supabase] Tunnel URL published OK (HTTP %d) in %lums\n", code, elapsed);
