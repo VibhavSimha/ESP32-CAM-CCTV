@@ -182,6 +182,7 @@ static void _boreProxyConn(WiFiClient &remote, WiFiClient &local, int slot) {
       int n = local.read(buf, 2048);
       if (n > 0) {
         streamingActive = true; // we've started carrying LAN traffic
+        _slotBackpressured[slot] = true;
         int written = 0;
         unsigned long innerDeadline = millis() + 8000; // 8s ABSOLUTE deadline for this entire chunk
         while (written < n && remote.connected() && local.connected()) {
@@ -224,8 +225,8 @@ static void _boreProxyConn(WiFiClient &remote, WiFiClient &local, int slot) {
   // Log why the while() condition itself became false (natural exit, not a break)
   bool naturalExit = remote.connected() && local.connected();
   if (naturalExit) {
-    Serial.printf("[Tunnel] Slot %d: Loop exited naturally (30s idle). r=%d l=%d TX=%u\n",
-                  slot, remote.connected(), local.connected(), totalTx);
+    Serial.printf("[Tunnel] Slot %d: Loop exited naturally (%us idle). r=%d l=%d TX=%u\n",
+      slot, streamingActive ? 30 : 8, remote.connected(), local.connected(), totalTx);
   } else {
     Serial.printf("[Tunnel] Slot %d: Loop exited via socket drop. r=%d l=%d TX=%u\n",
                   slot, remote.connected(), local.connected(), totalTx);
@@ -256,7 +257,8 @@ static void _boreProxyConn(WiFiClient &remote, WiFiClient &local, int slot) {
 
 static void _boreWatchdog(const char *source) {
   for (int i = 0; i < BORE_MAX_PROXY; i++) {
-    if (_slotBusy[i] && _slotWatchdogArmed[i] && _slotLastActive[i] > 0) {
+    if (_slotBusy[i] && _slotWatchdogArmed[i] && _slotLastActive[i] > 0 &&
+      millis() >= _slotLastActive[i]) {
       unsigned long now = millis();
       if (now < _slotLastActive[i]) {
         Serial.printf("[Tunnel] WATCHDOG(%s): Slot %d timestamp moved backward. last=%lums now=%lums. Re-arming.\n",
