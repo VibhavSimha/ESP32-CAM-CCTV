@@ -12,6 +12,8 @@
  * Self-hosted:   `bore server` on your VPS
  */
 
+#include <new>
+
 #ifndef ESP32TUNNEL_BORE_H
 #define ESP32TUNNEL_BORE_H
 
@@ -99,64 +101,81 @@ static void _boreSendMsg(WiFiClient &c, const String &msg) {
 static void _boreProxyConn(WiFiClient &remote, WiFiClient &local, int slot) {
   uint8_t *buf = (uint8_t *)malloc(2048);
   if (!buf) {
-    Serial.printf("[Tunnel] Slot %d FATAL: malloc failed! Aborting proxy.\n", slot);
+    Serial.printf("[Tunnel] Slot %d FATAL: malloc(2048) failed! heap=%u. Aborting proxy.\n",
+                  slot, ESP.getFreeHeap());
+    _slotBackpressured[slot] = false;
+    _slotBackpressureSince[slot] = 0;
+    _slotWatchdogArmed[slot] = false;
+    _slotLastActive[slot] = 0;
     _slotBusy[slot] = false;
     return;
   }
-  
-  Serial.printf("[Tunnel] Proxy task started in slot %d\n", slot);
+
+  Serial.printf("[Tunnel] Proxy task started in slot %d. heap=%u\n", slot, ESP.getFreeHeap());
 
   unsigned long idle = millis();
   unsigned long start = millis();
   size_t totalRx = 0, totalTx = 0;
   bool backpressureWarning = false;
 
-  // Throughput stall detector: if we TX bytes to WAN but progress stops, the WAN is a black hole
   size_t lastTxSnapshot = 0;
   unsigned long lastTxProgress = millis();
   unsigned long lastHeartbeat = millis();
-  bool streamingActive = false; // true once we've seen any LAN->WAN traffic
+  bool streamingActive = false;
 
-  _slotLastActive[slot] = start; // Initialize watchdog timer
+  // Arm the watchdog with a real timestamp BEFORE anything can block.
+  _slotBackpressured[slot] = false;
+  _slotBackpressureSince[slot] = 0;
+  _slotLastActive[slot] = start;
   _slotWatchdogArmed[slot] = true;
   Serial.printf("[Tunnel] Slot %d watchdog armed at %lums.\n", slot, start);
 
-  while (remote.connected() && local.connected() && millis() - idle < (streamingActive ? 30000UL : 8000UL)) {
-    bool activity = false;
-    _slotLastActive[slot] = millis(); // Pet the watchdog so main loop knows we aren't blocked
+  const char *exitReason = "unknown";
 
-    // Periodic heartbeat: log proxy state every 10s so we can see it's alive
+  while (remote.connected() && local.connected() &&
+         millis() - idle < (streamingActive ? 30000UL : 8000UL)) {
+    bool activity = false;
+    _slotLastActive[slot] = millis(); // pet watchdog each iteration (proves task is looping)
+
     if (millis() - lastHeartbeat > 10000) {
       lastHeartbeat = millis();
-      Serial.printf("[Tunnel] Slot %d alive: TX=%u RX=%u idle=%lums r=%d l=%d\n",
-                    slot, totalTx, totalRx, millis() - idle,
-                    remote.connected(), local.connected());
+      Serial.printf("[Tunnel] Slot %d alive: TX=%u RX=%u idle=%lums bp=%d r=%d l=%d heap=%u\n",
+                    slot, totalTx, totalRx, millis() - idle, _slotBackpressured[slot],
+                    remote.connected(), local.connected(), ESP.getFreeHeap());
     }
 
-    // Throughput stall detector: TX must GROW within 10s window while streaming
+    // Throughput stall detector (genuine WAN black-hole while streaming).
     if (streamingActive) {
       if (millis() - lastTxProgress > 10000) {
-        Serial.printf("[Tunnel] Slot %d STALL CHECK: TX now=%u snapshot=%u\n", slot, totalTx, lastTxSnapshot);
+        Serial.printf("[Tunnel] Slot %d STALL CHECK: TX now=%u snapshot=%u\n",
+                      slot, totalTx, lastTxSnapshot);
         if (totalTx == lastTxSnapshot) {
-          Serial.printf("[Tunnel] Slot %d STALL: TX frozen at %u bytes for 10s! WAN silently dropping. Killing slot.\n",
+          Serial.printf("[Tunnel] Slot %d STALL: TX frozen at %u bytes for 10s! Killing slot.\n",
                         slot, totalTx);
+          exitReason = "stall-tx-frozen";
           break;
         }
-        // TX DID grow - update snapshot and reset timer for next check
         lastTxSnapshot = totalTx;
         lastTxProgress = millis();
       }
     }
 
-    // Remote (WAN) -> Local (camera server)
+    // ---- Remote (WAN) -> Local (camera server) ----
     if (remote.available()) {
       int n = remote.read(buf, 2048);
+      if (n < 0) {
+        Serial.printf("[Tunnel] Slot %d WAN->LAN read error (n=%d). r=%d l=%d. Breaking.\n",
+                      slot, n, remote.connected(), local.connected());
+        exitReason = "wan-read-error";
+        break;
+      }
       if (n > 0) {
         int written = 0;
-        unsigned long innerDeadline = millis() + 8000; // 8s ABSOLUTE deadline for this entire chunk
+        unsigned long innerDeadline = millis() + 8000;
         while (written < n && remote.connected() && local.connected()) {
           if (millis() > innerDeadline) {
-            Serial.printf("[Tunnel] Slot %d WAN->LAN DEADLOCK! written=%d/%d after 8s. Killing slot.\n", slot, written, n);
+            Serial.printf("[Tunnel] Slot %d WAN->LAN DEADLOCK! written=%d/%d after 8s. Killing.\n",
+                          slot, written, n);
             break;
           }
           size_t w = local.write(buf + written, n - written);
@@ -164,12 +183,13 @@ static void _boreProxyConn(WiFiClient &remote, WiFiClient &local, int slot) {
             _DELAY(2);
           } else {
             written += w;
-            _slotLastActive[slot] = millis();
+            _slotLastActive[slot] = millis(); // progress = liveness
           }
         }
         if (written < n) {
-          Serial.printf("[Tunnel] Slot %d WAN->LAN write incomplete (%d/%d bytes). r=%d l=%d. Breaking.\n",
+          Serial.printf("[Tunnel] Slot %d WAN->LAN write incomplete (%d/%d). r=%d l=%d. Breaking.\n",
                         slot, written, n, remote.connected(), local.connected());
+          exitReason = "wan->lan-incomplete";
           break;
         }
         totalRx += written;
@@ -178,43 +198,58 @@ static void _boreProxyConn(WiFiClient &remote, WiFiClient &local, int slot) {
       }
     }
 
-    // Local (camera server) -> Remote (WAN)
+    // ---- Local (camera server) -> Remote (WAN) ----
     if (local.available()) {
       int n = local.read(buf, 2048);
+      if (n < 0) {
+        Serial.printf("[Tunnel] Slot %d LAN->WAN read error (n=%d). r=%d l=%d. Breaking.\n",
+                      slot, n, remote.connected(), local.connected());
+        exitReason = "lan-read-error";
+        break;
+      }
       if (n > 0) {
-        streamingActive = true; // we've started carrying LAN traffic
+        streamingActive = true;
         _slotBackpressured[slot] = true;
         if (_slotBackpressureSince[slot] == 0) _slotBackpressureSince[slot] = millis();
         int written = 0;
-        unsigned long innerDeadline = millis() + 8000; // 8s ABSOLUTE deadline for this entire chunk
+        unsigned long innerDeadline = millis() + 8000;
         while (written < n && remote.connected() && local.connected()) {
           if (millis() > innerDeadline) {
-            Serial.printf("[Tunnel] Slot %d LAN->WAN DEADLOCK! written=%d/%d after 8s. Killing slot.\n", slot, written, n);
+            Serial.printf("[Tunnel] Slot %d LAN->WAN DEADLOCK! written=%d/%d after 8s heap=%u. Killing.\n",
+                          slot, written, n, ESP.getFreeHeap());
             break;
           }
           size_t w = remote.write(buf + written, n - written);
           if (w == 0) {
             if (!backpressureWarning) {
-              Serial.printf("[Tunnel] Slot %d WAN buffer full! Engaging backpressure...\n", slot);
+              Serial.printf("[Tunnel] Slot %d WAN buffer full! Engaging backpressure... heap=%u\n",
+                            slot, ESP.getFreeHeap());
               backpressureWarning = true;
             }
-            _slotBackpressured[slot] = true;
+            _slotBackpressured[slot] = true; // keep flag while stalled
             _DELAY(2);
           } else {
             written += w;
             backpressureWarning = false;
-            _slotLastActive[slot] = millis();
+            _slotLastActive[slot] = millis(); // progress = liveness
+            // Backpressure relieved as soon as a write succeeds.
+            _slotBackpressured[slot] = false;
+            _slotBackpressureSince[slot] = 0;
           }
         }
         if (written < n) {
-          Serial.printf("[Tunnel] Slot %d LAN->WAN write incomplete (%d/%d bytes). r=%d l=%d. Breaking.\n",
+          Serial.printf("[Tunnel] Slot %d LAN->WAN write incomplete (%d/%d). r=%d l=%d. Breaking.\n",
                         slot, written, n, remote.connected(), local.connected());
+          // Clear BP flags on this exit path too (prevents latched bpStuck).
+          _slotBackpressured[slot] = false;
+          _slotBackpressureSince[slot] = 0;
+          exitReason = "lan->wan-incomplete";
           break;
         }
         _slotBackpressured[slot] = false;
         _slotBackpressureSince[slot] = 0;
         totalTx += written;
-        lastTxProgress = millis(); // TX made progress
+        lastTxProgress = millis();
         activity = true;
         backpressureWarning = false;
       }
@@ -224,69 +259,78 @@ static void _boreProxyConn(WiFiClient &remote, WiFiClient &local, int slot) {
     else _DELAY(1);
   }
 
-
-  // Log why the while() condition itself became false (natural exit, not a break)
-  bool naturalExit = remote.connected() && local.connected();
-  if (naturalExit) {
-    Serial.printf("[Tunnel] Slot %d: Loop exited naturally (%us idle). r=%d l=%d TX=%u\n",
-      slot, streamingActive ? 30 : 8, remote.connected(), local.connected(), totalTx);
-  } else {
-    Serial.printf("[Tunnel] Slot %d: Loop exited via socket drop. r=%d l=%d TX=%u\n",
-                  slot, remote.connected(), local.connected(), totalTx);
+  // Determine why the loop ended (for the log).
+  if (exitReason[0] == 'u') { // still "unknown" => while() condition went false
+    if (remote.connected() && local.connected()) exitReason = "idle-timeout";
+    else if (!remote.connected()) exitReason = "wan-dropped";
+    else exitReason = "lan-dropped";
   }
 
-  const char *reason = "Idle timeout (30s)";
-  if (!remote.connected()) reason = "WAN disconnect";
-  else if (!local.connected()) reason = "Local disconnect";
-  else reason = "Write failure / timeout";
+  bool naturalExit = remote.connected() && local.connected();
+  Serial.printf("[Tunnel] Slot %d: Loop exit (%s). natural=%d r=%d l=%d TX=%u RX=%u dur=%lums\n",
+                slot, exitReason, naturalExit, remote.connected(), local.connected(),
+                totalTx, totalRx, millis() - start);
 
-  Serial.printf("[Tunnel] Proxy slot %d closed. Reason: %s. Duration: %lums, TX: %u bytes, RX: %u bytes\n",
-                slot, reason, millis() - start, totalTx, totalRx);
-  Serial.printf("[Tunnel] Slot %d final state: remote.connected=%d, local.connected=%d, idle_age=%lums\n",
-                slot, remote.connected(), local.connected(), millis() - idle);
-
-  // Log remaining stack depth to catch near-overflow situations
   UBaseType_t stackHWM = uxTaskGetStackHighWaterMark(nullptr);
-  Serial.printf("[Tunnel] Slot %d: Stack high-water mark: %u words remaining.\n", slot, stackHWM);
+  Serial.printf("[Tunnel] Slot %d: Stack HWM: %u words. heap=%u\n", slot, stackHWM, ESP.getFreeHeap());
 
   free(buf);
   remote.stop();
   local.stop();
+  // Single, authoritative cleanup of ALL slot state (no path skips this).
   _slotBackpressured[slot] = false;
   _slotBackpressureSince[slot] = 0;
   _slotWatchdogArmed[slot] = false;
   _slotLastActive[slot] = 0;
   _slotBusy[slot] = false;
+  Serial.printf("[Tunnel] Slot %d: released.\n", slot);
 }
 
 static void _boreWatchdog(const char *source) {
   for (int i = 0; i < BORE_MAX_PROXY; i++) {
-    if (_slotBusy[i] && _slotWatchdogArmed[i] && _slotLastActive[i] > 0 &&
-        millis() >= _slotLastActive[i]) {
-      unsigned long now = millis();
-      unsigned long age = now - _slotLastActive[i];
+    if (!_slotBusy[i] || !_slotWatchdogArmed[i]) continue;
 
-      // A slot backpressured continuously for >20s is not "backpressured" — it's
-      // wedged (remote.write() parked forever). That is the #5 silent-freeze case.
-      bool bpStuck = _slotBackpressured[i] &&
-                     _slotBackpressureSince[i] > 0 &&
-                     (now - _slotBackpressureSince[i] > 20000);
+    // Single volatile read of the activity timestamp, THEN read the clock.
+    // Reading in this order + the (now < last) guard below makes the
+    // subtraction underflow-proof (fixes age=4294967295ms false freeze).
+    unsigned long last = _slotLastActive[i];
+    if (last == 0) continue;                 // proxy task hasn't armed yet
+    unsigned long now = millis();
+    if (now < last) {                        // clock skew / just-petted on other core
+      // Not an error — just skip this pass. Log at debug volume only.
+      // Serial.printf("[Tunnel] WATCHDOG(%s): Slot %d skew last=%lu now=%lu; skipping.\n",
+      //               source, i, last, now);
+      continue;
+    }
 
-      // Normal freeze: no progress for 40s AND not merely (briefly) backpressured.
-      bool frozen = (age > 40000 && !_slotBackpressured[i]);
+    unsigned long age = now - last;
 
-      if (frozen || bpStuck) {
-        Serial.printf("[Tunnel] WATCHDOG(%s): Slot %d frozen. age=%lums bpStuck=%d bpAge=%lums heap=%u wifi=%d. Force closing sockets.\n",
-                      source, i, age, bpStuck,
-                      _slotBackpressureSince[i] ? (now - _slotBackpressureSince[i]) : 0UL,
-                      ESP.getFreeHeap(), WiFi.status());
-        _boreProxy[i].stop();
-        _boreLocal[i].stop();
-        _slotWatchdogArmed[i] = false;
-        _slotLastActive[i] = 0;
-        _slotBackpressured[i] = false;
-        _slotBackpressureSince[i] = 0;
-      }
+    unsigned long bpSince = _slotBackpressureSince[i];
+    // "Stuck" = backpressured AND no forward byte progress for >20s.
+    // The age>20000 term is critical: a slot that petted the watchdog
+    // recently (age small) is by definition making progress and must
+    // NEVER be declared stuck (fixes bpStuck=1 age=0ms killing live streams).
+    bool bpStuck = _slotBackpressured[i] &&
+                   bpSince > 0 &&
+                   (now - bpSince > 20000) &&
+                   (age > 20000);
+
+    // Normal freeze: task blocked inside write() with no progress for 40s,
+    // and not currently in a (legitimate, short) backpressure spell.
+    bool frozen = (age > 40000) && !_slotBackpressured[i];
+
+    if (frozen || bpStuck) {
+      Serial.printf("[Tunnel] WATCHDOG(%s): Slot %d KILL. reason=%s age=%lums bpSince=%lums heap=%u wifi=%d r=%d l=%d\n",
+                    source, i, frozen ? "frozen40s" : "bpStuck20s",
+                    age, bpSince ? (now - bpSince) : 0UL,
+                    ESP.getFreeHeap(), WiFi.status(),
+                    _boreProxy[i].connected(), _boreLocal[i].connected());
+      _boreProxy[i].stop();
+      _boreLocal[i].stop();
+      _slotWatchdogArmed[i] = false;
+      _slotLastActive[i] = 0;
+      _slotBackpressured[i] = false;
+      _slotBackpressureSince[i] = 0;
     }
   }
 }
@@ -416,14 +460,28 @@ static bool _boreServe() {
     _slotBusy[slot] = true; // Mark busy immediately so concurrent connections don't steal it
     
     // Dispatch each proxy connection to its own FreeRTOS task (Bug #1)
+    _slotBusy[slot] = true; // reserve immediately
+
     struct _ProxyArgs { String uuid; int slot; };
-    auto *args = new _ProxyArgs{uuid, slot};
-    xTaskCreatePinnedToCore([](void *p) {
+    auto *args = new (std::nothrow) _ProxyArgs{uuid, slot};
+    if (!args) {
+      Serial.printf("[Tunnel] Slot %d: new _ProxyArgs failed (OOM heap=%u). Releasing slot.\n",
+                    slot, ESP.getFreeHeap());
+      _slotBusy[slot] = false;
+      continue;
+    }
+    BaseType_t ok = xTaskCreatePinnedToCore([](void *p) {
       auto *a = (_ProxyArgs*)p;
       _boreAccept(a->uuid, a->slot);
       delete a;
       vTaskDelete(nullptr);
     }, "boreProxy", 6144, args, 1, nullptr, TUN_TASK_CORE);
+    if (ok != pdPASS) {
+      Serial.printf("[Tunnel] Slot %d: FAILED to spawn accept task (heap=%u). Releasing slot.\n",
+                    slot, ESP.getFreeHeap());
+      delete args;              // ← was leaked before: real fix
+      _slotBusy[slot] = false;
+    }
   }
 
   return true;
