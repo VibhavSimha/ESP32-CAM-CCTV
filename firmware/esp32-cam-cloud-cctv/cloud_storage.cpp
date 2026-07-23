@@ -2,12 +2,37 @@
 #include "config.h"
 #include <ESPSupabase.h>
 #include <Preferences.h>
+#include <WiFi.h>
 #include "esp_camera.h"
 
 Supabase supabase;
 Preferences preferences;
 
 static int frame_index = 0;
+static String pendingTunnelUrl;
+static unsigned long nextTunnelPublishAttempt = 0;
+static uint8_t tunnelPublishFailures = 0;
+
+static bool publishTunnelUrlNow(const String &url) {
+    if (WiFi.status() != WL_CONNECTED) {
+        Serial.printf("[Supabase] Tunnel URL publish deferred: WiFi status=%d ip=%s\n",
+            WiFi.status(), WiFi.localIP().toString().c_str());
+        return false;
+    }
+
+    Serial.printf("[Supabase] Publishing tunnel URL: %s | heap: %u\n", url.c_str(), ESP.getFreeHeap());
+    String json = "{\"url\":\"" + url + "\"}";
+    unsigned long t0 = millis();
+    int code = supabase.insert("camera_status", json, false);
+    unsigned long elapsed = millis() - t0;
+    if (code == 201 || code == 200 || code == 204) {
+        Serial.printf("[Supabase] Tunnel URL published OK (HTTP %d) in %lums\n", code, elapsed);
+        return true;
+    }
+
+    Serial.printf("[Supabase] ERROR: Failed to publish tunnel URL. HTTP code: %d (took %lums)\n", code, elapsed);
+    return false;
+}
 
 void setupCloudStorage() {
     preferences.begin("cctv", false);
@@ -43,14 +68,28 @@ void uploadFrameToCloud() {
 }
 
 void publishTunnelUrl(String url) {
-    Serial.printf("[Supabase] Publishing tunnel URL: %s | heap: %u\n", url.c_str(), ESP.getFreeHeap());
-    String json = "{\"url\":\"" + url + "\"}";
-    unsigned long t0 = millis();
-    int code = supabase.insert("camera_status", json, false);
-    unsigned long elapsed = millis() - t0;
-    if (code == 201 || code == 200 || code == 204) {
-        Serial.printf("[Supabase] Tunnel URL published OK (HTTP %d) in %lums\n", code, elapsed);
-    } else {
-        Serial.printf("[Supabase] ERROR: Failed to publish tunnel URL. HTTP code: %d (took %lums)\n", code, elapsed);
+    pendingTunnelUrl = url;
+    tunnelPublishFailures = 0;
+    nextTunnelPublishAttempt = 0;
+    Serial.printf("[Supabase] Queued tunnel URL publish: %s\n", pendingTunnelUrl.c_str());
+    loopCloudStorage();
+}
+
+void loopCloudStorage() {
+    if (!pendingTunnelUrl.length()) return;
+    unsigned long now = millis();
+    if (nextTunnelPublishAttempt != 0 && now < nextTunnelPublishAttempt) return;
+
+    if (publishTunnelUrlNow(pendingTunnelUrl)) {
+        pendingTunnelUrl = "";
+        tunnelPublishFailures = 0;
+        nextTunnelPublishAttempt = 0;
+        return;
     }
+
+    tunnelPublishFailures++;
+    unsigned long backoff = min(60000UL, 5000UL * (unsigned long)tunnelPublishFailures);
+    nextTunnelPublishAttempt = now + backoff;
+    Serial.printf("[Supabase] Tunnel URL publish retry scheduled in %lums (failure #%u)\n",
+        backoff, tunnelPublishFailures);
 }

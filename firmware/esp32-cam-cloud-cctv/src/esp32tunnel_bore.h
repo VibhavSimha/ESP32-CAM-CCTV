@@ -252,6 +252,12 @@ static void _boreWatchdog(const char *source) {
   for (int i = 0; i < BORE_MAX_PROXY; i++) {
     if (_slotBusy[i] && _slotWatchdogArmed[i] && _slotLastActive[i] > 0) {
       unsigned long now = millis();
+      if (now < _slotLastActive[i]) {
+        Serial.printf("[Tunnel] WATCHDOG(%s): Slot %d timestamp moved backward. last=%lums now=%lums. Re-arming.\n",
+                      source, i, _slotLastActive[i], now);
+        _slotLastActive[i] = now;
+        continue;
+      }
       unsigned long age = now - _slotLastActive[i];
       if (age > 12000) {
         Serial.printf("[Tunnel] WATCHDOG(%s): Slot %d frozen. age=%lums last=%lums now=%lums heap=%u wifi=%d. Force closing sockets.\n",

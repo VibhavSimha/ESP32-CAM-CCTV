@@ -5,3 +5,4 @@
 void setupCloudStorage();
 void uploadFrameToCloud();
 void publishTunnelUrl(String url);
+void loopCloudStorage();

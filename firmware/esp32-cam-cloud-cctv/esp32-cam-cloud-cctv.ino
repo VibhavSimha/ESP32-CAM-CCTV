@@ -46,6 +46,9 @@ void loop() {
 
     // Keep localtunnel alive
     handleTunnel();
+
+    // Retry best-effort cloud status updates without blocking local serving
+    loopCloudStorage();
     
     // Handle PIR motion detection and cloud upload
     loopPIR();

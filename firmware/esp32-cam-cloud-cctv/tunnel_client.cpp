@@ -125,6 +125,8 @@ void handleTunnel() {
   static bool wasReady = false;
   static bool watchdogLogged = false;
   static unsigned long lastWifiReconnectAttempt = 0;
+  static bool tunnelStoppedForWifi = false;
+  static unsigned long wifiConnectedSince = 0;
 
   if (!watchdogLogged) {
     watchdogLogged = true;
@@ -135,11 +137,31 @@ void handleTunnel() {
   wl_status_t wifiStatus = WiFi.status();
   if (wifiStatus != WL_CONNECTED) {
     unsigned long now = millis();
+    wifiConnectedSince = 0;
+    if (!tunnelStoppedForWifi) {
+      tunnelStoppedForWifi = true;
+      wasReady = false;
+      Serial.printf("[Tunnel] WiFi lost. Stopping tunnel to return to stable local-listening state. status=%d ip=%s heap=%u\n",
+          wifiStatus, WiFi.localIP().toString().c_str(), ESP.getFreeHeap());
+      tunnelStop();
+    }
     if (now - lastWifiReconnectAttempt > 5000) {
       lastWifiReconnectAttempt = now;
-      Serial.printf("[WiFi] Lost connection while tunnel running. status=%d ip=%s heap=%u. Calling WiFi.reconnect().\n",
+      Serial.printf("[WiFi] Link down. status=%d ip=%s heap=%u. Calling WiFi.reconnect().\n",
           wifiStatus, WiFi.localIP().toString().c_str(), ESP.getFreeHeap());
       WiFi.reconnect();
+    }
+  } else if (tunnelStoppedForWifi) {
+    unsigned long now = millis();
+    if (wifiConnectedSince == 0) {
+      wifiConnectedSince = now;
+      Serial.printf("[WiFi] Reconnected. ip=%s heap=%u. Waiting for link to stabilize before tunnel restart.\n",
+          WiFi.localIP().toString().c_str(), ESP.getFreeHeap());
+    } else if (now - wifiConnectedSince > 3000) {
+      tunnelStoppedForWifi = false;
+      Serial.printf("[Tunnel] Restarting tunnel after WiFi recovery. stable_for=%lums ip=%s heap=%u\n",
+          now - wifiConnectedSince, WiFi.localIP().toString().c_str(), ESP.getFreeHeap());
+      tunnelBegin();
     }
   }
 
