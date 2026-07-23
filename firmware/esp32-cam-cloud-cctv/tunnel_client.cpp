@@ -127,6 +127,7 @@ void handleTunnel() {
   static unsigned long lastWifiReconnectAttempt = 0;
   static bool tunnelStoppedForWifi = false;
   static unsigned long wifiConnectedSince = 0;
+  static unsigned long wifiLostSince = 0;
 
   if (!watchdogLogged) {
     watchdogLogged = true;
@@ -138,21 +139,28 @@ void handleTunnel() {
   if (wifiStatus != WL_CONNECTED) {
     unsigned long now = millis();
     wifiConnectedSince = 0;
-    if (!tunnelStoppedForWifi) {
-      tunnelStoppedForWifi = true;
-      wasReady = false;
-      Serial.printf("[Tunnel] WiFi lost. Stopping tunnel to return to stable local-listening state. status=%d ip=%s heap=%u\n",
-          wifiStatus, WiFi.localIP().toString().c_str(), ESP.getFreeHeap());
-      tunnelStop();
-    }
-    if (now - lastWifiReconnectAttempt > 5000) {
-      lastWifiReconnectAttempt = now;
-      Serial.printf("[WiFi] Link down. status=%d ip=%s heap=%u. Calling WiFi.reconnect().\n",
-          wifiStatus, WiFi.localIP().toString().c_str(), ESP.getFreeHeap());
-      WiFi.reconnect();
+    if (wifiLostSince == 0) wifiLostSince = now;      // start debounce timer
+
+    // Only act after WiFi has been down continuously for >5s. A transient
+    // status=6 blip caused by socket churn must NOT restart the tunnel.
+    if (now - wifiLostSince > 5000) {
+      if (!tunnelStoppedForWifi) {
+        tunnelStoppedForWifi = true;
+        wasReady = false;
+        Serial.printf("[Tunnel] WiFi durably lost (%lums). Stopping tunnel. status=%d ip=%s heap=%u\n",
+            now - wifiLostSince, wifiStatus, WiFi.localIP().toString().c_str(), ESP.getFreeHeap());
+        tunnelStop();
+      }
+      if (now - lastWifiReconnectAttempt > 5000) {
+        lastWifiReconnectAttempt = now;
+        Serial.printf("[WiFi] Link down. status=%d ip=%s heap=%u. Calling WiFi.reconnect().\n",
+            wifiStatus, WiFi.localIP().toString().c_str(), ESP.getFreeHeap());
+        WiFi.reconnect();
+      }
     }
   } else if (tunnelStoppedForWifi) {
     unsigned long now = millis();
+    wifiLostSince = 0;                                 // reset debounce
     if (wifiConnectedSince == 0) {
       wifiConnectedSince = now;
       Serial.printf("[WiFi] Reconnected. ip=%s heap=%u. Waiting for link to stabilize before tunnel restart.\n",
@@ -163,6 +171,8 @@ void handleTunnel() {
           now - wifiConnectedSince, WiFi.localIP().toString().c_str(), ESP.getFreeHeap());
       tunnelBegin();
     }
+  } else {
+    wifiLostSince = 0;                                 // WiFi fine, tunnel up: clear debounce
   }
 
   bool ready = tunnelReady();

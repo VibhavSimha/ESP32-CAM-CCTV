@@ -46,6 +46,7 @@ static WiFiClient _boreLocal[BORE_MAX_PROXY];
 static volatile bool _slotBusy[BORE_MAX_PROXY] = {false};
 static volatile unsigned long _slotLastActive[BORE_MAX_PROXY] = {0};
 static volatile bool _slotWatchdogArmed[BORE_MAX_PROXY] = {false};
+static volatile bool _slotBackpressured[BORE_MAX_PROXY] = {false};
 static TaskHandle_t _boreProxyTaskHandle[BORE_MAX_PROXY] = {nullptr};
 
 // Per-slot task argument (static so it outlives the launching function)
@@ -119,7 +120,7 @@ static void _boreProxyConn(WiFiClient &remote, WiFiClient &local, int slot) {
   _slotWatchdogArmed[slot] = true;
   Serial.printf("[Tunnel] Slot %d watchdog armed at %lums.\n", slot, start);
 
-  while (remote.connected() && local.connected() && millis() - idle < 30000) {
+  while (remote.connected() && local.connected() && millis() - idle < (streamingActive ? 30000UL : 8000UL)) {
     bool activity = false;
     _slotLastActive[slot] = millis(); // Pet the watchdog so main loop knows we aren't blocked
 
@@ -162,6 +163,7 @@ static void _boreProxyConn(WiFiClient &remote, WiFiClient &local, int slot) {
             _DELAY(2);
           } else {
             written += w;
+            _slotLastActive[slot] = millis();
           }
         }
         if (written < n) {
@@ -193,10 +195,12 @@ static void _boreProxyConn(WiFiClient &remote, WiFiClient &local, int slot) {
               Serial.printf("[Tunnel] Slot %d WAN buffer full! Engaging backpressure...\n", slot);
               backpressureWarning = true;
             }
+            _slotBackpressured[slot] = true;
             _DELAY(2);
           } else {
             written += w;
             backpressureWarning = false;
+            _slotLastActive[slot] = millis();
           }
         }
         if (written < n) {
@@ -204,6 +208,7 @@ static void _boreProxyConn(WiFiClient &remote, WiFiClient &local, int slot) {
                         slot, written, n, remote.connected(), local.connected());
           break;
         }
+        _slotBackpressured[slot] = false;
         totalTx += written;
         lastTxProgress = millis(); // TX made progress
         activity = true;
@@ -243,6 +248,7 @@ static void _boreProxyConn(WiFiClient &remote, WiFiClient &local, int slot) {
   free(buf);
   remote.stop();
   local.stop();
+  _slotBackpressured[slot] = false;
   _slotWatchdogArmed[slot] = false;
   _slotLastActive[slot] = 0;
   _slotBusy[slot] = false;
@@ -259,13 +265,15 @@ static void _boreWatchdog(const char *source) {
         continue;
       }
       unsigned long age = now - _slotLastActive[i];
-      if (age > 12000) {
+      // Only kill a slot that made ZERO progress AND is not merely backpressured.
+      // Genuine WAN black-holes are still caught by the throughput STALL detector.
+      if (age > 40000 && !_slotBackpressured[i]) {
         Serial.printf("[Tunnel] WATCHDOG(%s): Slot %d frozen. age=%lums last=%lums now=%lums heap=%u wifi=%d. Force closing sockets.\n",
                       source, i, age, _slotLastActive[i], now, ESP.getFreeHeap(), WiFi.status());
         _boreProxy[i].stop();
         _boreLocal[i].stop();
         _slotWatchdogArmed[i] = false;
-        _slotLastActive[i] = 0; // Prevent spamming
+        _slotLastActive[i] = 0;
       }
     }
   }
