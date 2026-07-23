@@ -21,9 +21,9 @@ static bool publishTunnelUrlNow(const String &url) {
     }
 
     Serial.printf("[Supabase] Publishing tunnel URL: %s | heap: %u\n", url.c_str(), ESP.getFreeHeap());
-    String json = "{\"id\":1,\"url\":\"" + url + "\",\"updated_at\":\"now()\"}";
     unsigned long t0 = millis();
-    int code = supabase.upsert("camera_status", json, false);
+    String json = "{\"id\":1,\"url\":\"" + url + "\",\"created_at\":\"now()\"}";
+int code = supabase.insert("camera_status", json, true);
     unsigned long elapsed = millis() - t0;
     if (code == 201 || code == 200 || code == 204) {
         Serial.printf("[Supabase] Tunnel URL published OK (HTTP %d) in %lums\n", code, elapsed);
