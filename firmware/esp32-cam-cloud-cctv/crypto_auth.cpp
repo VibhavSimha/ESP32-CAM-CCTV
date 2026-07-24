@@ -4,6 +4,10 @@
 #include <Preferences.h>
 #include <ArduinoJson.h>
 #include <string.h>
+#include <new>
+
+#include <freertos/FreeRTOS.h>
+#include <freertos/semphr.h>
 
 #include <mbedtls/ecdh.h>
 #include <mbedtls/ecp.h>
@@ -13,9 +17,13 @@
 #include <mbedtls/base64.h>
 #include <mbedtls/ctr_drbg.h>
 #include <mbedtls/entropy.h>
+#include <mbedtls/constant_time.h>
+#include <mbedtls/platform_util.h>
 
 // -----------------------------------------------------------------------------
 // Device static X25519 keypair (persisted in NVS namespace "crypto").
+// NVS key names MUST stay <= 15 chars (Preferences limit): "x25519_priv" (11)
+// and "x25519_pub" (10) are within budget — do not lengthen them.
 // -----------------------------------------------------------------------------
 static uint8_t s_priv[32];      // device X25519 private scalar
 static uint8_t s_pub[32];       // device X25519 public key (u-coordinate)
@@ -25,17 +33,28 @@ static mbedtls_ctr_drbg_context s_drbg;
 static mbedtls_entropy_context  s_entropy;
 
 // -----------------------------------------------------------------------------
+// Concurrency: the ESP-IDF httpd services requests from multiple sockets, so the
+// session table, the DRBG (mbedTLS CTR_DRBG is NOT thread-safe on its own), and
+// login CPU-cost must all be serialized. One recursive mutex guards them.
+// -----------------------------------------------------------------------------
+static SemaphoreHandle_t s_lock = NULL;
+static inline void LOCK()   { if (s_lock) xSemaphoreTakeRecursive(s_lock, portMAX_DELAY); }
+static inline void UNLOCK() { if (s_lock) xSemaphoreGiveRecursive(s_lock); }
+
+// -----------------------------------------------------------------------------
 // Session token table (small in-RAM ring). Tokens expire after SESSION_TTL_MS.
 // -----------------------------------------------------------------------------
 #define SESSION_SLOTS     4
 #define SESSION_TTL_MS    (6UL * 60UL * 60UL * 1000UL)   // 6 hours
 #define TOKEN_RAW_LEN     32
+#define LOGIN_MIN_GAP_MS  500     // M2: minimum spacing between /login attempts
 
 struct Session {
   char          token[45];   // base64 of 32 bytes + NUL (44 chars)
   unsigned long expiresAt;
 };
 static Session s_sessions[SESSION_SLOTS];
+static unsigned long s_lastLoginAttempt = 0;   // M2: cheap rate-limit
 
 static size_t b64enc(const uint8_t *in, size_t inlen, char *out, size_t outcap) {
   size_t olen = 0;
@@ -48,13 +67,12 @@ static int b64dec(const char *in, size_t inlen, uint8_t *out, size_t outcap, siz
   return mbedtls_base64_decode(out, outcap, olen, (const unsigned char *)in, inlen);
 }
 
+// Constant-time equality (fixed work regardless of where bytes differ). Length
+// is compared first but token/credential lengths are not secret.
 static bool ctEqual(const char *a, const char *b) {
-  // constant-time-ish compare over equal-length strings
   size_t la = strlen(a), lb = strlen(b);
   if (la != lb) return false;
-  uint8_t diff = 0;
-  for (size_t i = 0; i < la; i++) diff |= (uint8_t)(a[i] ^ b[i]);
-  return diff == 0;
+  return mbedtls_ct_memcmp(a, b, la) == 0;
 }
 
 // -----------------------------------------------------------------------------
@@ -103,6 +121,12 @@ static bool genKeypair() {
 void setupCryptoAuth() {
   memset(s_sessions, 0, sizeof(s_sessions));
 
+  if (!s_lock) s_lock = xSemaphoreCreateRecursiveMutex();
+  if (!s_lock) {
+    Serial.println("[Crypto] FATAL: could not create mutex — encrypted login unavailable");
+    return;
+  }
+
   uint32_t h0 = ESP.getFreeHeap();
   unsigned long t0 = millis();
 
@@ -136,12 +160,13 @@ void setupCryptoAuth() {
   char pubb64[64];
   b64enc(s_pub, 32, pubb64, sizeof(pubb64));
   Serial.printf("[Crypto] Device pubkey (b64): %s\n", pubb64);
-  Serial.printf("[Crypto] setup took %lums, heap %u -> %u\n",
-                millis() - t0, h0, ESP.getFreeHeap());
+  Serial.printf("[Crypto] setup took %lums, heap %u -> %u (delta %d)\n",
+                millis() - t0, h0, ESP.getFreeHeap(), (int)ESP.getFreeHeap() - (int)h0);
 }
 
 // -----------------------------------------------------------------------------
 // ECDH shared secret: device private + browser ephemeral public (32 bytes LE).
+// Caller MUST hold the lock (uses s_drbg).
 // -----------------------------------------------------------------------------
 static bool ecdhShared(const uint8_t *peerPub, uint8_t out[32]) {
   mbedtls_ecp_group grp;
@@ -197,6 +222,7 @@ static int aesGcmDecrypt(const uint8_t *key, const uint8_t *iv, size_t ivlen,
   return rc == 0 ? (int)ctlen : -1;
 }
 
+// Caller MUST hold the lock (uses s_drbg + s_sessions).
 static void issueSession(char *outToken, size_t cap) {
   uint8_t raw[TOKEN_RAW_LEN];
   mbedtls_ctr_drbg_random(&s_drbg, raw, sizeof(raw));
@@ -218,6 +244,24 @@ static void issueSession(char *outToken, size_t cap) {
   outToken[cap - 1] = '\0';
 }
 
+// Match a cookie token only at a proper name boundary ("sid=" at start of the
+// header or right after "; ") so e.g. "xsid=" cannot false-match.
+static bool extractCookieToken(const char *cookie, char *out, size_t cap) {
+  const char *p = cookie;
+  while (p && *p) {
+    bool atBoundary = (p == cookie) || (p[-1] == ' ');
+    if (atBoundary && strncmp(p, "sid=", 4) == 0) {
+      p += 4;
+      size_t i = 0;
+      while (*p && *p != ';' && *p != ' ' && i < cap - 1) out[i++] = *p++;
+      out[i] = '\0';
+      return i > 0;
+    }
+    p++;
+  }
+  return false;
+}
+
 bool cryptoAuthCheckSession(httpd_req_t *req) {
   char token[64] = {0};
   bool have = false;
@@ -229,30 +273,28 @@ bool cryptoAuthCheckSession(httpd_req_t *req) {
   }
   if (!have) {
     size_t cl = httpd_req_get_hdr_value_len(req, "Cookie");
-    if (cl > 0) {
+    if (cl > 0 && cl < 512) {
       char *cookie = (char *)malloc(cl + 1);
-      if (cookie && httpd_req_get_hdr_value_str(req, "Cookie", cookie, cl + 1) == ESP_OK) {
-        char *p = strstr(cookie, "sid=");
-        if (p) {
-          p += 4;
-          size_t i = 0;
-          while (*p && *p != ';' && *p != ' ' && i < sizeof(token) - 1) token[i++] = *p++;
-          token[i] = '\0';
-          have = i > 0;
+      if (cookie) {
+        if (httpd_req_get_hdr_value_str(req, "Cookie", cookie, cl + 1) == ESP_OK) {
+          have = extractCookieToken(cookie, token, sizeof(token));
         }
+        free(cookie);
       }
-      free(cookie);
     }
   }
   if (!have) return false;
 
+  bool valid = false;
   unsigned long now = millis();
+  LOCK();
   for (int i = 0; i < SESSION_SLOTS; i++) {
     if (s_sessions[i].token[0] == '\0') continue;
     if (now > s_sessions[i].expiresAt) continue;
-    if (ctEqual(s_sessions[i].token, token)) return true;
+    if (ctEqual(s_sessions[i].token, token)) { valid = true; break; }
   }
-  return false;
+  UNLOCK();
+  return valid;
 }
 
 bool cryptoAuthRequire(httpd_req_t *req) {
@@ -289,101 +331,152 @@ static esp_err_t pubkey_handler(httpd_req_t *req) {
 //     "ct":  b64(ciphertext),
 //     "tag": b64(16B GCM tag) }
 // Plaintext is JSON { "user":..., "pass":... }.
+//
+// Memory: the big scratch buffers (ct/pt) and the request JSON are heap-
+// allocated, NOT stack, so this handler stays well within the httpd task stack.
 static esp_err_t login_handler(httpd_req_t *req) {
   if (!s_ready) { httpd_resp_send_500(req); return ESP_FAIL; }
 
+  uint32_t h0 = ESP.getFreeHeap();
+  unsigned long t0 = millis();
+
+  // M2: cheap global rate-limit. /login is unauthenticated and CPU-heavy.
+  LOCK();
+  unsigned long nowRl = millis();
+  if (s_lastLoginAttempt != 0 && (nowRl - s_lastLoginAttempt) < LOGIN_MIN_GAP_MS) {
+    UNLOCK();
+    Serial.println("[Crypto] login rejected: rate-limited");
+    httpd_resp_set_status(req, "429 Too Many Requests");
+    httpd_resp_set_hdr(req, "Retry-After", "1");
+    httpd_resp_send(req, "slow down", HTTPD_RESP_USE_STRLEN);
+    return ESP_FAIL;
+  }
+  s_lastLoginAttempt = nowRl;
+  UNLOCK();
+
   int total = req->content_len;
-  if (total <= 0 || total > 2048) { httpd_resp_send_408(req); return ESP_FAIL; }
-  char *body = (char *)malloc(total + 1);
-  if (!body) { httpd_resp_send_500(req); return ESP_FAIL; }
-  int recvd = 0;
-  while (recvd < total) {
-    int r = httpd_req_recv(req, body + recvd, total - recvd);
-    if (r <= 0) { free(body); httpd_resp_send_408(req); return ESP_FAIL; }
-    recvd += r;
-  }
-  body[total] = '\0';
-
-  StaticJsonDocument<1024> in;
-  DeserializationError jerr = deserializeJson(in, body);
-  free(body);
-  if (jerr) {
-    httpd_resp_set_status(req, "400 Bad Request");
-    httpd_resp_send(req, "bad json", HTTPD_RESP_USE_STRLEN);
+  if (total <= 0 || total > 2048) {
+    Serial.printf("[Crypto] login rejected: bad content_len=%d\n", total);
+    httpd_resp_send_408(req);
     return ESP_FAIL;
   }
 
-  const char *epk_b = in["epk"] | "";
-  const char *iv_b  = in["iv"]  | "";
-  const char *ct_b  = in["ct"]  | "";
-  const char *tag_b = in["tag"] | "";
-
-  uint8_t epk[32], iv[16], tag[16];
-  uint8_t ct[1024], pt[1024];
-  size_t epklen = 0, ivlen = 0, ctlen = 0, taglen = 0;
-
-  bool okdec =
-    b64dec(epk_b, strlen(epk_b), epk, sizeof(epk), &epklen) == 0 && epklen == 32 &&
-    b64dec(iv_b,  strlen(iv_b),  iv,  sizeof(iv),  &ivlen) == 0 && ivlen == 12 &&
-    b64dec(tag_b, strlen(tag_b), tag, sizeof(tag), &taglen) == 0 && taglen == 16 &&
-    b64dec(ct_b,  strlen(ct_b),  ct,  sizeof(ct),  &ctlen) == 0 && ctlen > 0;
-
-  if (!okdec) {
-    httpd_resp_set_status(req, "400 Bad Request");
-    httpd_resp_send(req, "bad fields", HTTPD_RESP_USE_STRLEN);
-    return ESP_FAIL;
-  }
-
-  uint8_t shared[32], aesKey[32];
-  if (!ecdhShared(epk, shared) || !deriveAesKey(shared, aesKey)) {
+  // Heap scratch: request body + decode buffers + plaintext (kept OFF the stack).
+  char    *body  = (char *)malloc(total + 1);
+  uint8_t *ctbuf = (uint8_t *)malloc(1024);
+  uint8_t *ptbuf = (uint8_t *)malloc(1024);
+  DynamicJsonDocument *in = new (std::nothrow) DynamicJsonDocument(1024);
+  if (!body || !ctbuf || !ptbuf || !in) {
+    Serial.println("[Crypto] login rejected: OOM allocating scratch");
+    free(body); free(ctbuf); free(ptbuf); delete in;
     httpd_resp_send_500(req);
     return ESP_FAIL;
   }
 
-  int ptlen = aesGcmDecrypt(aesKey, iv, ivlen, ct, ctlen, tag, taglen, pt);
-  memset(shared, 0, sizeof(shared));
-  memset(aesKey, 0, sizeof(aesKey));
-  if (ptlen < 0) {
-    httpd_resp_set_status(req, "401 Unauthorized");
-    httpd_resp_send(req, "decrypt failed", HTTPD_RESP_USE_STRLEN);
-    return ESP_FAIL;
+  esp_err_t result = ESP_FAIL;
+  const char *failReason = "unknown";
+  int httpStatusFail = 0;
+
+  do {
+    int recvd = 0;
+    bool recvOk = true;
+    while (recvd < total) {
+      int r = httpd_req_recv(req, body + recvd, total - recvd);
+      if (r <= 0) { recvOk = false; break; }
+      recvd += r;
+    }
+    if (!recvOk) { failReason = "recv"; httpStatusFail = 408; break; }
+    body[total] = '\0';
+
+    if (deserializeJson(*in, body)) { failReason = "bad-json"; httpStatusFail = 400; break; }
+
+    const char *epk_b = (*in)["epk"] | "";
+    const char *iv_b  = (*in)["iv"]  | "";
+    const char *ct_b  = (*in)["ct"]  | "";
+    const char *tag_b = (*in)["tag"] | "";
+
+    uint8_t epk[32], iv[16], tag[16];
+    size_t epklen = 0, ivlen = 0, ctlen = 0, taglen = 0;
+
+    bool okdec =
+      b64dec(epk_b, strlen(epk_b), epk, sizeof(epk), &epklen) == 0 && epklen == 32 &&
+      b64dec(iv_b,  strlen(iv_b),  iv,  sizeof(iv),  &ivlen) == 0 && ivlen == 12 &&
+      b64dec(tag_b, strlen(tag_b), tag, sizeof(tag), &taglen) == 0 && taglen == 16 &&
+      b64dec(ct_b,  strlen(ct_b),  ctbuf, 1024, &ctlen) == 0 && ctlen > 0 && ctlen <= 1000;
+
+    if (!okdec) { failReason = "bad-fields"; httpStatusFail = 400; break; }
+
+    uint8_t shared[32], aesKey[32];
+    LOCK();
+    bool derived = ecdhShared(epk, shared) && deriveAesKey(shared, aesKey);
+    UNLOCK();
+    if (!derived) {
+      mbedtls_platform_zeroize(shared, sizeof(shared));
+      mbedtls_platform_zeroize(aesKey, sizeof(aesKey));
+      failReason = "ecdh"; httpStatusFail = 500; break;
+    }
+
+    int ptlen = aesGcmDecrypt(aesKey, iv, ivlen, ctbuf, ctlen, tag, taglen, ptbuf);
+    mbedtls_platform_zeroize(shared, sizeof(shared));
+    mbedtls_platform_zeroize(aesKey, sizeof(aesKey));
+    if (ptlen < 0 || ptlen >= 1024) { failReason = "decrypt"; httpStatusFail = 401; break; }
+    ptbuf[ptlen] = '\0';
+
+    StaticJsonDocument<256> creds;
+    if (deserializeJson(creds, (const char *)ptbuf)) {
+      mbedtls_platform_zeroize(ptbuf, 1024);
+      failReason = "bad-creds"; httpStatusFail = 400; break;
+    }
+    const char *user = creds["user"] | "";
+    const char *pass = creds["pass"] | "";
+
+    bool credsOk = ctEqual(user, CONFIG_HTTP_USER) && ctEqual(pass, CONFIG_HTTP_PASS);
+    mbedtls_platform_zeroize(ptbuf, 1024);   // wipe decrypted credentials ASAP
+    if (!credsOk) { failReason = "creds"; httpStatusFail = 401; break; }
+
+    char token[64];
+    LOCK();
+    issueSession(token, sizeof(token));
+    UNLOCK();
+
+    char setcookie[128];
+    snprintf(setcookie, sizeof(setcookie),
+             "sid=%s; Path=/; Max-Age=21600; HttpOnly; SameSite=Lax", token);
+
+    StaticJsonDocument<128> out;
+    out["token"] = token;
+    char outbuf[160];
+    serializeJson(out, outbuf);
+
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+    httpd_resp_set_hdr(req, "Set-Cookie", setcookie);
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+    httpd_resp_send(req, outbuf, HTTPD_RESP_USE_STRLEN);
+    result = ESP_OK;
+    Serial.printf("[Crypto] login OK — session issued in %lums, heap %u -> %u\n",
+                  millis() - t0, h0, ESP.getFreeHeap());
+  } while (0);
+
+  if (result != ESP_OK && httpStatusFail != 0) {
+    const char *st = "400 Bad Request";
+    if (httpStatusFail == 401) st = "401 Unauthorized";
+    else if (httpStatusFail == 408) st = "408 Request Timeout";
+    else if (httpStatusFail == 500) st = "500 Internal Server Error";
+    Serial.printf("[Crypto] login rejected: %s (%lums, heap=%u)\n",
+                  failReason, millis() - t0, ESP.getFreeHeap());
+    httpd_resp_set_status(req, st);
+    httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+    httpd_resp_send(req, failReason, HTTPD_RESP_USE_STRLEN);
   }
-  pt[ptlen] = '\0';
 
-  StaticJsonDocument<256> creds;
-  if (deserializeJson(creds, (const char *)pt)) {
-    httpd_resp_set_status(req, "400 Bad Request");
-    httpd_resp_send(req, "bad creds", HTTPD_RESP_USE_STRLEN);
-    return ESP_FAIL;
-  }
-  const char *user = creds["user"] | "";
-  const char *pass = creds["pass"] | "";
-
-  if (!ctEqual(user, CONFIG_HTTP_USER) || !ctEqual(pass, CONFIG_HTTP_PASS)) {
-    memset(pt, 0, sizeof(pt));
-    httpd_resp_set_status(req, "401 Unauthorized");
-    httpd_resp_send(req, "invalid credentials", HTTPD_RESP_USE_STRLEN);
-    return ESP_FAIL;
-  }
-  memset(pt, 0, sizeof(pt));
-
-  char token[64];
-  issueSession(token, sizeof(token));
-
-  char setcookie[128];
-  snprintf(setcookie, sizeof(setcookie), "sid=%s; Path=/; Max-Age=21600; SameSite=Lax", token);
-
-  StaticJsonDocument<128> out;
-  out["token"] = token;
-  char outbuf[160];
-  serializeJson(out, outbuf);
-
-  httpd_resp_set_type(req, "application/json");
-  httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
-  httpd_resp_set_hdr(req, "Set-Cookie", setcookie);
-  httpd_resp_set_hdr(req, "Cache-Control", "no-store");
-  Serial.println("[Crypto] Login OK — session issued");
-  return httpd_resp_send(req, outbuf, HTTPD_RESP_USE_STRLEN);
+  // Wipe + free all scratch (no leaks on any path).
+  mbedtls_platform_zeroize(ptbuf, 1024);
+  free(body);
+  free(ctbuf);
+  free(ptbuf);
+  delete in;
+  return result;
 }
 
 void registerCryptoAuthHandlers(httpd_handle_t server) {
