@@ -17,7 +17,6 @@
 #include <mbedtls/base64.h>
 #include <mbedtls/ctr_drbg.h>
 #include <mbedtls/entropy.h>
-#include <mbedtls/constant_time.h>
 #include <mbedtls/platform_util.h>
 
 // -----------------------------------------------------------------------------
@@ -47,14 +46,14 @@ static inline void UNLOCK() { if (s_lock) xSemaphoreGiveRecursive(s_lock); }
 #define SESSION_SLOTS     4
 #define SESSION_TTL_MS    (6UL * 60UL * 60UL * 1000UL)   // 6 hours
 #define TOKEN_RAW_LEN     32
-#define LOGIN_MIN_GAP_MS  500     // M2: minimum spacing between /login attempts
+#define LOGIN_FAIL_GAP_MS 500     // BUG2: backoff applied ONLY after a failed login
 
 struct Session {
   char          token[45];   // base64 of 32 bytes + NUL (44 chars)
   unsigned long expiresAt;
 };
 static Session s_sessions[SESSION_SLOTS];
-static unsigned long s_lastLoginAttempt = 0;   // M2: cheap rate-limit
+static unsigned long s_lastFailedLogin = 0;   // BUG2: only FAILED attempts set this
 
 static size_t b64enc(const uint8_t *in, size_t inlen, char *out, size_t outcap) {
   size_t olen = 0;
@@ -67,12 +66,17 @@ static int b64dec(const char *in, size_t inlen, uint8_t *out, size_t outcap, siz
   return mbedtls_base64_decode(out, outcap, olen, (const unsigned char *)in, inlen);
 }
 
-// Constant-time equality (fixed work regardless of where bytes differ). Length
-// is compared first but token/credential lengths are not secret.
+// Portable constant-time equality (fixed work regardless of where bytes differ).
+// Avoids mbedtls_ct_memcmp, which is absent on older mbedTLS. Length is compared
+// first; token/credential lengths are not secret.
 static bool ctEqual(const char *a, const char *b) {
   size_t la = strlen(a), lb = strlen(b);
   if (la != lb) return false;
-  return mbedtls_ct_memcmp(a, b, la) == 0;
+  volatile uint8_t diff = 0;
+  for (size_t i = 0; i < la; i++) {
+    diff |= (uint8_t)((uint8_t)a[i] ^ (uint8_t)b[i]);
+  }
+  return diff == 0;
 }
 
 // -----------------------------------------------------------------------------
@@ -334,29 +338,33 @@ static esp_err_t pubkey_handler(httpd_req_t *req) {
 //
 // Memory: the big scratch buffers (ct/pt) and the request JSON are heap-
 // allocated, NOT stack, so this handler stays well within the httpd task stack.
+//
+// Rate limiting (BUG2): a backoff of LOGIN_FAIL_GAP_MS is applied ONLY after a
+// FAILED attempt. A valid login is never rate-limited, and a flood of bogus
+// requests cannot starve a legitimate one.
 static esp_err_t login_handler(httpd_req_t *req) {
   if (!s_ready) { httpd_resp_send_500(req); return ESP_FAIL; }
 
   uint32_t h0 = ESP.getFreeHeap();
   unsigned long t0 = millis();
 
-  // M2: cheap global rate-limit. /login is unauthenticated and CPU-heavy.
+  // Backoff: reject only while we are inside the window opened by a PRIOR FAILURE.
   LOCK();
-  unsigned long nowRl = millis();
-  if (s_lastLoginAttempt != 0 && (nowRl - s_lastLoginAttempt) < LOGIN_MIN_GAP_MS) {
-    UNLOCK();
-    Serial.println("[Crypto] login rejected: rate-limited");
+  unsigned long now = millis();
+  bool backoff = (s_lastFailedLogin != 0 && (now - s_lastFailedLogin) < LOGIN_FAIL_GAP_MS);
+  UNLOCK();
+  if (backoff) {
+    Serial.println("[Crypto] login rejected: backoff after recent failure");
     httpd_resp_set_status(req, "429 Too Many Requests");
     httpd_resp_set_hdr(req, "Retry-After", "1");
     httpd_resp_send(req, "slow down", HTTPD_RESP_USE_STRLEN);
     return ESP_FAIL;
   }
-  s_lastLoginAttempt = nowRl;
-  UNLOCK();
 
   int total = req->content_len;
   if (total <= 0 || total > 2048) {
     Serial.printf("[Crypto] login rejected: bad content_len=%d\n", total);
+    LOCK(); s_lastFailedLogin = millis(); UNLOCK();
     httpd_resp_send_408(req);
     return ESP_FAIL;
   }
@@ -437,6 +445,7 @@ static esp_err_t login_handler(httpd_req_t *req) {
     char token[64];
     LOCK();
     issueSession(token, sizeof(token));
+    s_lastFailedLogin = 0;   // BUG2: success clears any prior backoff window
     UNLOCK();
 
     char setcookie[128];
@@ -459,6 +468,9 @@ static esp_err_t login_handler(httpd_req_t *req) {
   } while (0);
 
   if (result != ESP_OK && httpStatusFail != 0) {
+    // BUG2: open the backoff window ONLY on failure.
+    LOCK(); s_lastFailedLogin = millis(); UNLOCK();
+
     const char *st = "400 Bad Request";
     if (httpStatusFail == 401) st = "401 Unauthorized";
     else if (httpStatusFail == 408) st = "408 Request Timeout";
