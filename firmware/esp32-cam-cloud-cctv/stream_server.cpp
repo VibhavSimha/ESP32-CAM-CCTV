@@ -166,6 +166,32 @@ static esp_err_t health_handler(httpd_req_t *req) {
     return httpd_resp_send(req, buf, HTTPD_RESP_USE_STRLEN);
 }
 
+#ifndef STR
+#define STR_HELPER(x) #x
+#define STR(x) STR_HELPER(x)
+#endif
+
+static esp_err_t flash_handler(httpd_req_t *req) {
+    if (!httpCheckBasicAuth(req, CONFIG_HTTP_USER, CONFIG_HTTP_PASS)) {
+        return httpSendUnauthorized(req);
+    }
+    
+    char param[32];
+    if (httpd_req_get_url_query_str(req, param, sizeof(param)) == ESP_OK) {
+        char value[8];
+        if (httpd_query_key_value(param, "s", value, sizeof(value)) == ESP_OK) {
+            int state = atoi(value);
+            pinMode(4, OUTPUT);
+            digitalWrite(4, state ? HIGH : LOW);
+            Serial.printf("[/flash] Flash set to %d\n", state);
+        }
+    }
+    
+    httpd_resp_set_type(req, "text/plain");
+    httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+    return httpd_resp_send(req, "OK", HTTPD_RESP_USE_STRLEN);
+}
+
 static esp_err_t view_handler(httpd_req_t *req) {
     if (!httpCheckBasicAuth(req, CONFIG_HTTP_USER, CONFIG_HTTP_PASS)) {
         return httpSendUnauthorized(req);
@@ -191,6 +217,8 @@ static esp_err_t view_handler(httpd_req_t *req) {
         "img{max-width:100%;border:2px solid #30363d;border-radius:8px;"
         "box-shadow:0 8px 24px rgba(0,0,0,0.5)}"
         "#st{margin-top:12px;font-size:14px;font-family:monospace;color:#3fb950}"
+        "button{margin-top:16px;padding:10px 20px;background:#238636;color:white;border:none;border-radius:6px;cursor:pointer;font-weight:bold;font-size:14px;transition:0.2s}"
+        "button:hover{background:#2ea043}"
         "</style></head><body>"
         "<img id='cam' width='640' height='480' "
         // /stream endpoint — same host, credentials already in browser from /view Basic Auth prompt
@@ -199,6 +227,26 @@ static esp_err_t view_handler(httpd_req_t *req) {
         "onload=\"document.getElementById('st').textContent='MJPEG LIVE \\u25cf';\""
         ">"
         "<div id='st'>Connecting to stream...</div>"
+        "<button onclick=\"fetch('/flash?s='+(this.dataset.s^=1)).catch(console.error)\" data-s='0'>\u26A1 Toggle Flash</button>"
+        "<script src='https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2'></script>"
+        "<script>"
+        "const sb=supabase.createClient(" SUPABASE_URL "," SUPABASE_ANON_KEY ");"
+        "const bkt=" SUPABASE_BUCKET ";"
+        "const lim=" STR(STORAGE_FRAME_LIMIT) ";"
+        "let idx=0;"
+        "setInterval(()=>{const i=document.getElementById('cam');"
+        "if(!i.complete||!i.naturalWidth)return;"
+        "const c=document.createElement('canvas');c.width=i.naturalWidth;c.height=i.naturalHeight;"
+        "c.getContext('2d').drawImage(i,0,0);"
+        "c.toBlob(async(blob)=>{"
+        "idx=(idx%lim)+1;"
+        "const n='frame_'+idx+'.jpg';"
+        "try{"
+        "await sb.storage.from(bkt).upload(n,blob,{upsert:true});"
+        "console.log('Uploaded '+n);"
+        "}catch(e){console.error('Supabase err:',e);}"
+        "},'image/jpeg');},5000);"
+        "</script>"
         "</body></html>";
 
     httpd_resp_set_type(req, "text/html");
@@ -210,7 +258,7 @@ static esp_err_t view_handler(httpd_req_t *req) {
 void startCameraServer() {
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.server_port = 80;
-    config.max_uri_handlers = 5;
+    config.max_uri_handlers = 6;
     config.max_open_sockets = 7;     // MJPEG uses 1 long-lived connection — keep all 7 sockets available
     config.recv_wait_timeout = 15;
     config.send_wait_timeout = 10;   // Let stalled MJPEG tunnel streams fail and retry instead of wedging for a minute.
@@ -245,6 +293,13 @@ void startCameraServer() {
         .handler   = health_handler,
         .user_ctx  = NULL
     };
+
+    httpd_uri_t flash_uri = {
+        .uri       = "/flash",
+        .method    = HTTP_GET,
+        .handler   = flash_handler,
+        .user_ctx  = NULL
+    };
     
     Serial.printf("Starting web server on port: '%d'\n", config.server_port);
     Serial.printf("[/stream] HTTPD timeouts: recv=%ds send=%ds, max_open_sockets=%d, lru_purge=%d\n",
@@ -254,5 +309,6 @@ void startCameraServer() {
         httpd_register_uri_handler(camera_httpd, &capture_uri);
         httpd_register_uri_handler(camera_httpd, &view_uri);
         httpd_register_uri_handler(camera_httpd, &health_uri);
+        httpd_register_uri_handler(camera_httpd, &flash_uri);
     }
 }
