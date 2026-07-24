@@ -55,7 +55,7 @@ void loop() {
     
     // Background autonomous CCTV upload (when no clients are watching)
     static unsigned long lastIdleUpload = 0;
-    if (active_stream_clients == 0 && millis() - lastIdleUpload > 5000) {
+    if (active_stream_clients == 0 && millis() - lastIdleUpload > 3000) {
         lastIdleUpload = millis();
         Serial.println("[Idle] No clients streaming. Performing autonomous background upload.");
         uploadFrameToCloud();
