@@ -90,13 +90,20 @@
 //
 // Upload behavior:
 //   - No client connected: firmware uploads 1 frame every 3s (idle uploader).
-//   - Browser client connected: firmware stops; the browser uploads every
-//     received frame best-effort (dropping frames while an upload is in flight).
+//   - Browser client connected: firmware stops; the browser uploads received
+//     frames best-effort, dropping frames while an upload is in flight AND
+//     honoring STORAGE_UPLOAD_MIN_GAP_MS between completed uploads so a fast
+//     client cannot hammer Supabase.
 // -----------------------------------------------------------------------------
 #define SUPABASE_URL         "https://xxxx.supabase.co"
 #define SUPABASE_ANON_KEY    "your-anon-key"
 #define SUPABASE_BUCKET      "cctv-clips"
 #define STORAGE_FRAME_LIMIT  200   // circular buffer: overwrites oldest frame
+
+// Minimum spacing (ms) between browser best-effort uploads. Lower = more frames
+// uploaded (more Supabase writes/egress); higher = gentler. 0 disables the floor
+// (still bounded by the in-flight drop guard).
+#define STORAGE_UPLOAD_MIN_GAP_MS 250
 
 // -----------------------------------------------------------------------------
 // PIR MOTION SENSOR
