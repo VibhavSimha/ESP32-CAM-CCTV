@@ -14,8 +14,18 @@ static const char* _STREAM_CONTENT_TYPE = "multipart/x-mixed-replace;boundary=" 
 static const char* _STREAM_BOUNDARY = "\r\n--" PART_BOUNDARY "\r\n";
 static const char* _STREAM_PART = "Content-Type: image/jpeg\r\nContent-Length: %u\r\n\r\n";
 
+// Minimum spacing between browser best-effort uploads (ms). See STORAGE_UPLOAD_MIN_GAP_MS
+// in config.h; fall back to a safe default if not defined.
+#ifndef STORAGE_UPLOAD_MIN_GAP_MS
+#define STORAGE_UPLOAD_MIN_GAP_MS 250
+#endif
+
 httpd_handle_t camera_httpd = NULL;
-int active_stream_clients = 0;
+
+// M4: touched from stream tasks (inc/dec) and read from the main loop's idle
+// uploader. Marked volatile so the compiler always re-reads it and a decrement
+// on any exit path is observed promptly (a missed dec would wedge idle uploads).
+volatile int active_stream_clients = 0;
 
 #define FLASH_GPIO 4
 
@@ -89,7 +99,11 @@ static esp_err_t stream_handler(httpd_req_t *req) {
     }
     Serial.println("[/stream] Auth OK — starting MJPEG stream loop");
 
+    // M4: single owned increment; guaranteed matching decrement on EVERY exit
+    // path below (content-type failure + natural loop break) so the idle
+    // uploader resumes correctly when this client goes away.
     active_stream_clients++;
+    Serial.printf("[/stream] active_stream_clients=%d\n", active_stream_clients);
 
     camera_fb_t * fb = NULL;
     esp_err_t res = ESP_OK;
@@ -102,6 +116,7 @@ static esp_err_t stream_handler(httpd_req_t *req) {
     if (res != ESP_OK) {
         Serial.printf("[/stream] ERROR: Failed to set content type: %d\n", res);
         active_stream_clients--;
+        Serial.printf("[/stream] active_stream_clients=%d (early exit)\n", active_stream_clients);
         return res;
     }
 
@@ -182,6 +197,7 @@ static esp_err_t stream_handler(httpd_req_t *req) {
     }
 
     active_stream_clients--;
+    Serial.printf("[/stream] active_stream_clients=%d (stream ended)\n", active_stream_clients);
     return res;
 }
 
@@ -216,7 +232,6 @@ static esp_err_t flash_handler(httpd_req_t *req) {
     }
 
     char param[32];
-    bool didSet = false;
     if (httpd_req_get_url_query_str(req, param, sizeof(param)) == ESP_OK) {
         char value[8];
         if (httpd_query_key_value(param, "s", value, sizeof(value)) == ESP_OK) {
@@ -224,11 +239,9 @@ static esp_err_t flash_handler(httpd_req_t *req) {
             g_flash_on = on;
             flashApply(on);
             flashPersist(on);
-            didSet = true;
             Serial.printf("[/flash] Global flash set to %d (persisted)\n", on);
         }
     }
-    (void)didSet;
 
     // Always return the (possibly just-updated) current global state so the UI
     // can sync its toggle. This makes GET /flash a reader when no ?s is given.
@@ -310,7 +323,7 @@ static esp_err_t view_handler(httpd_req_t *req) {
         "const ctFull=new Uint8Array(await crypto.subtle.encrypt({name:'AES-GCM',iv},aesKey,pt));"
         "const tag=ctFull.slice(ctFull.length-16);const ct=ctFull.slice(0,ctFull.length-16);"
         "const r=await fetch('/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({epk:b64(ephPubRaw),iv:b64(iv),ct:b64(ct),tag:b64(tag)})});"
-        "if(!r.ok){le.textContent='Login failed';return;}"
+        "if(!r.ok){le.textContent='Login failed ('+r.status+')';return;}"
         "SID=(await r.json()).token;"
         "startApp();"
         "}catch(e){le.textContent='Login error: '+e.message;console.error(e);}"
@@ -335,12 +348,16 @@ static esp_err_t view_handler(httpd_req_t *req) {
         "}"
         "function initUpload(){"
         "const sb=supabase.createClient(" SUPABASE_URL "," SUPABASE_ANON_KEY ");"
-        "const bkt=" SUPABASE_BUCKET ";const lim=" STR(STORAGE_FRAME_LIMIT) ";let idx=0;let inflight=false;"
+        "const bkt=" SUPABASE_BUCKET ";const lim=" STR(STORAGE_FRAME_LIMIT) ";const minGap=" STR(STORAGE_UPLOAD_MIN_GAP_MS) ";"
+        "let idx=0;let inflight=false;let lastDone=0;"
         "const cam=document.getElementById('cam');"
-        // Best-effort: attempt to upload EVERY received frame. If an upload is
-        // still in flight, DROP this frame (do not queue) to avoid backlog.
+        // Best-effort: attempt to upload received frames. If an upload is still
+        // in flight, DROP this frame (do not queue) to avoid backlog. Also honor
+        // a minimum gap since the last completed upload so we never hammer
+        // Supabase on a fast machine/network.
         "async function tick(){"
-        "if(cam.complete&&cam.naturalWidth&&!inflight){"
+        "const now=performance.now();"
+        "if(cam.complete&&cam.naturalWidth&&!inflight&&(now-lastDone)>=minGap){"
         "inflight=true;"
         "try{"
         "const c=document.createElement('canvas');c.width=cam.naturalWidth;c.height=cam.naturalHeight;"
@@ -349,6 +366,7 @@ static esp_err_t view_handler(httpd_req_t *req) {
         "idx=(idx%lim)+1;const n='frame_'+idx+'.jpg';"
         "await sb.storage.from(bkt).upload(n,blob,{upsert:true});"
         "}catch(e){/*best effort*/}"
+        "lastDone=performance.now();"
         "inflight=false;"
         "}"
         "requestAnimationFrame(tick);"
