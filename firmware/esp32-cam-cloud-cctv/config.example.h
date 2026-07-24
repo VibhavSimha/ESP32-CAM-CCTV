@@ -8,10 +8,19 @@
 // =============================================================================
 
 // -----------------------------------------------------------------------------
-// CAMERA VIEWER LOGIN (HTTP Basic Auth)
+// CAMERA VIEWER LOGIN (credentials)
 // -----------------------------------------------------------------------------
 // These credentials protect the camera feed from unauthorised access.
-// You will be prompted for these when you open the /view URL in your browser.
+//
+// The DEFAULT login path is an ENCRYPTED login: the browser fetches the device
+// X25519 public key from /pubkey, performs ECDH + HKDF-SHA256 to derive an
+// AES-256-GCM key, and encrypts your username/password before sending them to
+// /login. The ESP32 decrypts with its private key and issues a session token.
+// This avoids sending credentials in plaintext over the plain-HTTP BORE tunnel.
+//
+// See docs/SECURITY.md for the full threat model and the important caveat that
+// crypto.subtle may be unavailable over plain http:// — the HTTPS SELFHOST
+// tunnel is recommended for a fully-encrypted channel.
 //
 //   Username: CONFIG_HTTP_USER
 //   Password: CONFIG_HTTP_PASS
@@ -20,6 +29,11 @@
 // -----------------------------------------------------------------------------
 #define CONFIG_HTTP_USER     "admin"
 #define CONFIG_HTTP_PASS     "changeme12345678"
+
+// Optional legacy fallback: allow plaintext HTTP Basic Auth in addition to the
+// encrypted /login flow. Keep 0 (OFF) — the secure encrypted path is default.
+// Only enable for debugging on a trusted LAN; it sends credentials in the clear.
+#define ENABLE_BASIC_AUTH_FALLBACK 0
 
 // -----------------------------------------------------------------------------
 // WIFI CREDENTIALS
@@ -44,8 +58,11 @@
 // Default BORE URL:
 //   http://bore.pub:<server-assigned-port>/view
 // The BORE port is assigned by the public server and can change on reboot.
-// For a stable URL, use CONFIG_TUNNEL_MODE_SELFHOST and choose a random UUID
-// for CONFIG_SELFHOST_TUNNEL_ID.
+//
+// SECURITY: BORE is plain HTTP (no TLS). For a fully-encrypted channel and to
+// make browser crypto.subtle available for the encrypted login, use SELFHOST
+// mode, which is served over HTTPS at:
+//   https://esp32-tunnel.onrender.com/<CONFIG_SELFHOST_TUNNEL_ID>/view
 // -----------------------------------------------------------------------------
 #define CONFIG_TUNNEL_MODE_BORE      1
 #define CONFIG_TUNNEL_MODE_SELFHOST  2
@@ -63,13 +80,18 @@
 // -----------------------------------------------------------------------------
 // SUPABASE — Cloud Motion Storage
 // -----------------------------------------------------------------------------
-// Required for PIR motion capture uploads.
+// Required for cloud frame uploads.
 // Get these values from: Supabase Dashboard → Project Settings → API
 //
 //   SUPABASE_URL      = "https://<your-project-id>.supabase.co"
 //   SUPABASE_ANON_KEY = the "anon public" key (safe to use in firmware)
 //
 // DO NOT use the "service_role" key — it has admin access to your database.
+//
+// Upload behavior:
+//   - No client connected: firmware uploads 1 frame every 3s (idle uploader).
+//   - Browser client connected: firmware stops; the browser uploads every
+//     received frame best-effort (dropping frames while an upload is in flight).
 // -----------------------------------------------------------------------------
 #define SUPABASE_URL         "https://xxxx.supabase.co"
 #define SUPABASE_ANON_KEY    "your-anon-key"
@@ -79,13 +101,16 @@
 // -----------------------------------------------------------------------------
 // PIR MOTION SENSOR
 // -----------------------------------------------------------------------------
-// Set ENABLE_PIR_MOTION to 0 if you have no PIR wired up.
+// PIR is DISABLED by default (not currently of interest). When disabled, the
+// firmware idle uploader (1 frame / 3s when no client is connected) is the sole
+// firmware-side upload path. Set ENABLE_PIR_MOTION to 1 to re-enable PIR bursts.
+//
 // PIR_GPIO: HC-SR501 OUT pin → GPIO 13 on AI-Thinker ESP32-CAM
 // PIR_DEBOUNCE_MS: ignore re-triggers for this many milliseconds after motion
 // MOTION_BURST_COUNT: number of frames to capture per motion event
 // MOTION_BURST_INTERVAL_MS: delay between each burst frame
 // -----------------------------------------------------------------------------
-#define ENABLE_PIR_MOTION        1
+#define ENABLE_PIR_MOTION        0
 #define PIR_GPIO                 13
 #define PIR_DEBOUNCE_MS          10000
 #define MOTION_BURST_COUNT       5
