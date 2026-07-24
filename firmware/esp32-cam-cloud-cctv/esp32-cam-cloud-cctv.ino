@@ -5,6 +5,7 @@
 #include "stream_server.h"
 #include "tunnel_client.h"
 #include "cloud_storage.h"
+#include "crypto_auth.h"
 #include "motion_pir.h"
 
 void setup() {
@@ -19,21 +20,27 @@ void setup() {
         ESP.restart();
     }
 
-    // 2. Initialize WiFi via WiFiManager
+    // 2. Restore persisted global flash (LED) state and apply to GPIO.
+    setupFlashState();
+
+    // 3. Initialize WiFi via WiFiManager
     setupWiFiManager();
-    
-    // 3. Initialize Cloud Storage (Supabase)
+
+    // 4. Initialize Cloud Storage (Supabase)
     setupCloudStorage();
-    
-    // 4. Start Local Stream Server
+
+    // 5. Initialize crypto auth (X25519 keypair from NVS or first-boot gen)
+    setupCryptoAuth();
+
+    // 6. Start Local Stream Server
     startCameraServer();
-    
-    // 5. Initialize Localtunnel
+
+    // 7. Initialize Localtunnel
     tunnelBegin();
-    
-    // 6. Initialize PIR Motion Sensor
+
+    // 8. Initialize PIR Motion Sensor (no-op when ENABLE_PIR_MOTION == 0)
     setupPIR();
-    
+
     Serial.println("System setup complete.");
 }
 
@@ -49,11 +56,13 @@ void loop() {
 
     // Retry best-effort cloud status updates without blocking local serving
     loopCloudStorage();
-    
-    // Handle PIR motion detection and cloud upload
+
+    // Handle PIR motion detection (disabled by default via ENABLE_PIR_MOTION)
     loopPIR();
-    
-    // Background autonomous CCTV upload (when no clients are watching)
+
+    // Background autonomous CCTV upload (only when no clients are watching).
+    // When a browser client connects it becomes the uploader (best-effort per
+    // frame) and this stops via active_stream_clients.
     static unsigned long lastIdleUpload = 0;
     if (active_stream_clients == 0 && millis() - lastIdleUpload > 3000) {
         lastIdleUpload = millis();
