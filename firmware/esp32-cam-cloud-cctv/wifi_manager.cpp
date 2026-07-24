@@ -5,9 +5,10 @@
 
 void setupWiFiManager() {
     WiFiManager wm;
+    WiFi.setTxPower(WIFI_POWER_8_5dBm);
     WiFi.persistent(false);
     WiFi.setAutoReconnect(true);
-    Serial.println("[WiFi] Auto-reconnect enabled; flash persistence disabled.");
+    Serial.println("[WiFi] TX Power set to 8.5dBm; Auto-reconnect enabled; flash persistence disabled.");
     
     // reset settings if requested or specific condition met
     // wm.resetSettings();
