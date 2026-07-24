@@ -171,10 +171,10 @@ static void _boreProxyConn(WiFiClient &remote, WiFiClient &local, int slot) {
       }
       if (n > 0) {
         int written = 0;
-        unsigned long innerDeadline = millis() + 8000;
+        unsigned long innerDeadline = millis() + 3000;
         while (written < n && remote.connected() && local.connected()) {
           if (millis() > innerDeadline) {
-            Serial.printf("[Tunnel] Slot %d WAN->LAN DEADLOCK! written=%d/%d after 8s. Killing.\n",
+            Serial.printf("[Tunnel] Slot %d WAN->LAN DEADLOCK! written=%d/%d after 3s. Killing.\n",
                           slot, written, n);
             break;
           }
@@ -212,10 +212,10 @@ static void _boreProxyConn(WiFiClient &remote, WiFiClient &local, int slot) {
         _slotBackpressured[slot] = true;
         if (_slotBackpressureSince[slot] == 0) _slotBackpressureSince[slot] = millis();
         int written = 0;
-        unsigned long innerDeadline = millis() + 8000;
+        unsigned long innerDeadline = millis() + 3000;
         while (written < n && remote.connected() && local.connected()) {
           if (millis() > innerDeadline) {
-            Serial.printf("[Tunnel] Slot %d LAN->WAN DEADLOCK! written=%d/%d after 8s heap=%u. Killing.\n",
+            Serial.printf("[Tunnel] Slot %d LAN->WAN DEADLOCK! written=%d/%d after 3s heap=%u. Killing.\n",
                           slot, written, n, ESP.getFreeHeap());
             break;
           }
@@ -306,22 +306,22 @@ static void _boreWatchdog(const char *source) {
     unsigned long age = now - last;
 
     unsigned long bpSince = _slotBackpressureSince[i];
-    // "Stuck" = backpressured AND no forward byte progress for >20s.
-    // The age>20000 term is critical: a slot that petted the watchdog
+    // "Stuck" = backpressured AND no forward byte progress for >4s.
+    // The age>4000 term is critical: a slot that petted the watchdog
     // recently (age small) is by definition making progress and must
     // NEVER be declared stuck (fixes bpStuck=1 age=0ms killing live streams).
     bool bpStuck = _slotBackpressured[i] &&
                    bpSince > 0 &&
-                   (now - bpSince > 20000) &&
-                   (age > 20000);
+                   (now - bpSince > 4000) &&
+                   (age > 4000);
 
-    // Normal freeze: task blocked inside write() with no progress for 40s,
+    // Normal freeze: task blocked inside write() with no progress for 12s,
     // and not currently in a (legitimate, short) backpressure spell.
-    bool frozen = (age > 40000) && !_slotBackpressured[i];
+    bool frozen = (age > 12000) && !_slotBackpressured[i];
 
     if (frozen || bpStuck) {
       Serial.printf("[Tunnel] WATCHDOG(%s): Slot %d KILL. reason=%s age=%lums bpSince=%lums heap=%u wifi=%d r=%d l=%d\n",
-                    source, i, frozen ? "frozen40s" : "bpStuck20s",
+                    source, i, frozen ? "frozen12s" : "bpStuck4s",
                     age, bpSince ? (now - bpSince) : 0UL,
                     ESP.getFreeHeap(), WiFi.status(),
                     _boreProxy[i].connected(), _boreLocal[i].connected());
@@ -448,6 +448,26 @@ static bool _boreServe() {
     String uuid = _jStr(msg, "Connection");
     if (!uuid.length()) continue;
 
+    // Low heap guard: defer accepts under 35k free heap to protect WiFi stack
+    if (ESP.getFreeHeap() < 35000) {
+      Serial.printf("[Tunnel] Low heap (%u) — deferring accept to protect WiFi stack.\n",
+                    ESP.getFreeHeap());
+      continue;
+    }
+
+    // Defer speculative 2nd connection while a slot is actively streaming
+    bool anyStreaming = false;
+    for (int i = 0; i < BORE_MAX_PROXY; i++) {
+      if (_slotBusy[i] && _slotLastActive[i] != 0 && !_slotBackpressured[i]) {
+        anyStreaming = true;
+        break;
+      }
+    }
+    if (anyStreaming) {
+      Serial.printf("[Tunnel] Active stream in progress — deferring 2nd accept to save heap.\n");
+      continue;
+    }
+
     // Find a free proxy slot
     int slot = -1;
     for (int i = 0; i < BORE_MAX_PROXY; i++) {
@@ -457,9 +477,6 @@ static bool _boreServe() {
     }
     if (slot < 0) continue; // all slots busy
 
-    _slotBusy[slot] = true; // Mark busy immediately so concurrent connections don't steal it
-    
-    // Dispatch each proxy connection to its own FreeRTOS task (Bug #1)
     _slotBusy[slot] = true; // reserve immediately
 
     struct _ProxyArgs { String uuid; int slot; };

@@ -143,7 +143,7 @@ void handleTunnel() {
 
     // Only act after WiFi has been down continuously for >5s. A transient
     // status=6 blip caused by socket churn must NOT restart the tunnel.
-    if (now - wifiLostSince > 5000) {
+    if (now - wifiLostSince > 12000) {
       if (!tunnelStoppedForWifi) {
         tunnelStoppedForWifi = true;
         wasReady = false;
