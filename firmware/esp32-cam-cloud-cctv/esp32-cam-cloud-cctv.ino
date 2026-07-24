@@ -52,4 +52,12 @@ void loop() {
     
     // Handle PIR motion detection and cloud upload
     loopPIR();
+    
+    // Background autonomous CCTV upload (when no clients are watching)
+    static unsigned long lastIdleUpload = 0;
+    if (active_stream_clients == 0 && millis() - lastIdleUpload > 15000) {
+        lastIdleUpload = millis();
+        Serial.println("[Idle] No clients streaming. Performing autonomous background upload.");
+        uploadFrameToCloud();
+    }
 }

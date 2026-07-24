@@ -13,6 +13,7 @@ static const char* _STREAM_BOUNDARY = "\r\n--" PART_BOUNDARY "\r\n";
 static const char* _STREAM_PART = "Content-Type: image/jpeg\r\nContent-Length: %u\r\n\r\n";
 
 httpd_handle_t camera_httpd = NULL;
+int active_stream_clients = 0;
 
 static esp_err_t capture_handler(httpd_req_t *req) {
     Serial.printf("[/capture] Request from client. Heap: %u\n", ESP.getFreeHeap());
@@ -54,6 +55,8 @@ static esp_err_t stream_handler(httpd_req_t *req) {
         return httpSendUnauthorized(req);
     }
     Serial.println("[/stream] Auth OK — starting MJPEG stream loop");
+    
+    active_stream_clients++;
 
     camera_fb_t * fb = NULL;
     esp_err_t res = ESP_OK;
@@ -146,6 +149,8 @@ static esp_err_t stream_handler(httpd_req_t *req) {
             vTaskDelay(10 / portTICK_PERIOD_MS);
         }
     }
+    
+    active_stream_clients--;
     return res;
 }
 
