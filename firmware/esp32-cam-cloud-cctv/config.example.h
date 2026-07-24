@@ -12,11 +12,11 @@
 // -----------------------------------------------------------------------------
 // These credentials protect the camera feed from unauthorised access.
 //
-// The DEFAULT login path is an ENCRYPTED login: the browser fetches the device
-// X25519 public key from /pubkey, performs ECDH + HKDF-SHA256 to derive an
-// AES-256-GCM key, and encrypts your username/password before sending them to
-// /login. The ESP32 decrypts with its private key and issues a session token.
-// This avoids sending credentials in plaintext over the plain-HTTP BORE tunnel.
+// Login is ALWAYS an ENCRYPTED login: the browser fetches the device X25519
+// public key from /pubkey, performs ECDH + HKDF-SHA256 to derive an AES-256-GCM
+// key, and encrypts your username/password before sending them to /login. The
+// ESP32 decrypts with its private key and issues a session token. Credentials
+// are never sent in plaintext over the plain-HTTP BORE tunnel.
 //
 // See docs/SECURITY.md for the full threat model and the important caveat that
 // crypto.subtle may be unavailable over plain http:// — the HTTPS SELFHOST
@@ -29,11 +29,6 @@
 // -----------------------------------------------------------------------------
 #define CONFIG_HTTP_USER     "admin"
 #define CONFIG_HTTP_PASS     "changeme12345678"
-
-// Optional legacy fallback: allow plaintext HTTP Basic Auth in addition to the
-// encrypted /login flow. Keep 0 (OFF) — the secure encrypted path is default.
-// Only enable for debugging on a trusted LAN; it sends credentials in the clear.
-#define ENABLE_BASIC_AUTH_FALLBACK 0
 
 // -----------------------------------------------------------------------------
 // WIFI CREDENTIALS
