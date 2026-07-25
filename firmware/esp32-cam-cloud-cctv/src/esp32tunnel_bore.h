@@ -370,6 +370,16 @@ static void _boreAccept(const String &uuid, int slot) {
   Serial.printf("[Tunnel] Slot %d: Both sockets connected. Spawning proxy task on Core 0.\n", slot);
 
   // Spawn proxy on Core 0 so Core 1 (tunnel task) stays free to run the Watchdog!
+  //
+  // Stack sizing (heap-pressure / "FAILED to spawn proxy task" churn):
+  // A FreeRTOS task stack must be a single CONTIGUOUS internal-DRAM block, so
+  // under fragmentation this xTaskCreate can fail even when ESP.getFreeHeap()
+  // still reports 50-60KB free (exactly what the field log showed). The proxy
+  // loop keeps its 2KB copy buffer on the heap (malloc), not the stack, and the
+  // task's own logged Stack HWM stayed ~1.9KB used across every run. A 12KB
+  // stack was therefore ~6x over-provisioned; shrinking it to 6KB roughly halves
+  // the contiguous block this spawn needs (still >3x the observed peak usage),
+  // which markedly reduces the spawn-failure churn without risking overflow.
   _boreProxyArgs[slot] = {slot};
   BaseType_t taskOk = xTaskCreatePinnedToCore(
     [](void *arg) {
@@ -378,7 +388,7 @@ static void _boreAccept(const String &uuid, int slot) {
       _boreProxyTaskHandle[a->slot] = nullptr;
       vTaskDelete(nullptr);
     },
-    "bore_proxy", 12288, &_boreProxyArgs[slot], 5, &_boreProxyTaskHandle[slot], 0 // Core 0! Stack=12KB
+    "bore_proxy", 6144, &_boreProxyArgs[slot], 5, &_boreProxyTaskHandle[slot], 0 // Core 0! Stack=6KB
   );
   if (taskOk != pdPASS) {
     Serial.printf("[Tunnel] Slot %d: FAILED to spawn proxy task! Closing sockets. Heap=%u\n", slot, ESP.getFreeHeap());
