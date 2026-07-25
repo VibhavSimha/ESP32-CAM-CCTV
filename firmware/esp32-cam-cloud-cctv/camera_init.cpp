@@ -4,19 +4,6 @@
 
 #include "esp_camera.h"
 
-// The flash LED (LED_GPIO_NUM / GPIO4 on the AI-Thinker board) is driven with a
-// single, plain-digital mechanism throughout the firmware. An earlier version
-// attached this pin to an LEDC PWM channel here while stream_server.cpp drove
-// the very same pin with pinMode()/digitalWrite(); the two owners fought over
-// the pad, producing a glitchy LED and transient instability whenever the flash
-// was toggled during a stream. Using digital output everywhere removes that
-// contention.
-static void enableLed(bool on) {
-#if defined(LED_GPIO_NUM)
-  digitalWrite(LED_GPIO_NUM, on ? HIGH : LOW);
-#endif
-}
-
 esp_err_t initCamera() {
   Serial.println("[Camera] Initializing...");
   camera_config_t config = {};
@@ -79,15 +66,14 @@ esp_err_t initCamera() {
   return ESP_OK;
 }
 
+// The flash LED (LED_GPIO_NUM / GPIO4 on the AI-Thinker board) is driven with a
+// single, plain-digital mechanism throughout the firmware. An earlier version
+// attached this pin to an LEDC PWM channel here while stream_server.cpp drove
+// the very same pin with pinMode()/digitalWrite(); the two owners fought over
+// the pad, producing a glitchy LED and transient instability whenever the flash
+// was toggled during a stream. This just initializes the pad as a digital
+// output; the actual (global, NVS-persisted) flash state lives in stream_server.
 void setupLedFlash(int pin) {
   pinMode(pin, OUTPUT);
   digitalWrite(pin, LOW);
-}
-
-void cameraSetStreaming(bool streaming) {
-  (void)streaming;
-}
-
-void cameraLedForCapture(bool on) {
-  enableLed(on);
 }
