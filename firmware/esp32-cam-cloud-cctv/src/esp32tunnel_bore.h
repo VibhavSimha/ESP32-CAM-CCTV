@@ -219,6 +219,10 @@ static void _boreProxyConn(WiFiClient &remote, WiFiClient &local, int slot) {
                           slot, written, n, ESP.getFreeHeap());
             break;
           }
+          // Issue #23: pet the watchdog before every write attempt so the
+          // bpStuck detector sees recent activity even when write() blocks for
+          // its full SO_SNDTIMEO window (now capped at 3s, below the 4s threshold).
+          _slotLastActive[slot] = millis();
           size_t w = remote.write(buf + written, n - written);
           if (w == 0) {
             if (!backpressureWarning) {
@@ -367,6 +371,20 @@ static void _boreAccept(const String &uuid, int slot) {
   proxy.setNoDelay(true);
   local.setNoDelay(true);
   _setKeepAlive(proxy);
+  // Issue #23: _setKeepAlive() sets SO_SNDTIMEO=8s, which exceeds the 4-second
+  // bpStuck watchdog threshold. A single remote.write() blocked inside its TCP
+  // send-timeout window triggers a spurious tunnel kill mid-stream. Cap it at 3s
+  // (matching the proxy inner-write deadline) so writes always return before the
+  // watchdog fires.
+#ifdef ESP32
+  {
+    int _pfd = proxy.fd();
+    if (_pfd >= 0) {
+      struct timeval _tv = { 3, 0 };
+      setsockopt(_pfd, SOL_SOCKET, SO_SNDTIMEO, &_tv, sizeof(_tv));
+    }
+  }
+#endif
   Serial.printf("[Tunnel] Slot %d: Both sockets connected. Spawning proxy task on Core 0.\n", slot);
 
   // Spawn proxy on Core 0 so Core 1 (tunnel task) stays free to run the Watchdog!

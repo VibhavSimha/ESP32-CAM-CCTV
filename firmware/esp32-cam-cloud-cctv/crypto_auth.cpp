@@ -49,6 +49,14 @@ static inline void UNLOCK() { if (s_lock) xSemaphoreGiveRecursive(s_lock); }
 #define TOKEN_RAW_LEN     32
 #define LOGIN_FAIL_GAP_MS 500     // BUG2: backoff applied ONLY after a failed login
 
+// Issue #23: minimum free heap required before attempting ECDH.
+// mbedtls_ecdh_compute_shared + related MPI/ECP ops allocate ~8-12 KB of
+// short-lived heap. With two active tunnel proxy tasks (each holding ~8 KB of
+// socket buffers), the heap can drop to ~28 KB and those allocations fail,
+// producing a cryptic 500 "ecdh" error. 40 KB provides a comfortable margin
+// above the peak ECDH working-set on a heap with typical fragmentation.
+#define MIN_HEAP_FOR_ECDH 40000
+
 struct Session {
   char          token[45];   // base64 of 32 bytes + NUL (44 chars)
   unsigned long expiresAt;
@@ -546,6 +554,17 @@ static esp_err_t login_handler(httpd_req_t *req) {
 
     if (!okdec) { failReason = "bad-fields"; httpStatusFail = 400; break; }
 
+    // Issue #23: ECDH (mbedtls_ecdh_compute_shared) internally allocates several
+    // multi-precision-integer structures. Under heap pressure (e.g. two active
+    // tunnel proxy tasks), those allocations fail with a cryptic 500 "ecdh" error
+    // that the browser surfaces as a permanent login failure. Return 503 instead
+    // so the browser auto-retries once the tunnel releases its heap.
+    if (ESP.getFreeHeap() < MIN_HEAP_FOR_ECDH) {
+      Serial.printf("[Crypto] login rejected: low heap (%u) — retry after tunnel stabilises\n",
+                    ESP.getFreeHeap());
+      failReason = "low-heap"; httpStatusFail = 503; break;
+    }
+
     uint8_t shared[32], aesKey[32];
     LOCK();
     bool derived = ecdhShared(epk, shared) && deriveAesKey(shared, aesKey);
@@ -610,17 +629,22 @@ static esp_err_t login_handler(httpd_req_t *req) {
   } while (0);
 
   if (result != ESP_OK && httpStatusFail != 0) {
-    // BUG2: open the backoff window ONLY on failure.
-    LOCK(); s_lastFailedLogin = millis(); UNLOCK();
+    // Issue #23: a 503 (low-heap) is a transient resource condition, not a bad
+    // credential attempt — do NOT open the failed-login backoff window for it.
+    if (httpStatusFail != 503) {
+      LOCK(); s_lastFailedLogin = millis(); UNLOCK();
+    }
 
     const char *st = "400 Bad Request";
     if (httpStatusFail == 401) st = "401 Unauthorized";
     else if (httpStatusFail == 408) st = "408 Request Timeout";
     else if (httpStatusFail == 500) st = "500 Internal Server Error";
+    else if (httpStatusFail == 503) st = "503 Service Unavailable";
     Serial.printf("[Crypto] login rejected: %s (%lums, heap=%u)\n",
                   failReason, millis() - t0, ESP.getFreeHeap());
     httpd_resp_set_status(req, st);
     httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+    if (httpStatusFail == 503) httpd_resp_set_hdr(req, "Retry-After", "5");
     httpd_resp_send(req, failReason, HTTPD_RESP_USE_STRLEN);
   }
 

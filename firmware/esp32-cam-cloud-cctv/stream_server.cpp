@@ -382,6 +382,10 @@ static esp_err_t view_handler(httpd_req_t *req) {
         "const sealed=nobleCiphers.gcm(aesKey,iv).encrypt(pt);"
         "const tag=sealed.slice(sealed.length-16);const ct=sealed.slice(0,sealed.length-16);"
         "const r=await fetch('/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({epk:b64(ephPk),iv:b64(iv),ct:b64(ct),tag:b64(tag)})});"
+        // Issue #23: 503 = device busy (tunnel proxy consuming heap). Auto-retry
+        // after the Retry-After delay so the user doesn't see a spurious error.
+        // Parse the Retry-After header so the delay stays in sync with the server.
+        "if(r.status===503){le.textContent='Device busy \u2014 retrying...';const ra=parseInt(r.headers.get('Retry-After')||'5',10);setTimeout(doLogin,(isNaN(ra)?5:ra)*1000);return;}"
         "if(!r.ok){le.textContent='Login failed ('+r.status+' '+(await r.text())+')';return;}"
         "SID=(await r.json()).token;"
         "startApp();"
