@@ -20,6 +20,17 @@ static const char* _STREAM_PART = "Content-Type: image/jpeg\r\nContent-Length: %
 #define STORAGE_UPLOAD_MIN_GAP_MS 250
 #endif
 
+// Issue #10: the Supabase config macros expand to bare string *content*, so when
+// they are pasted directly into the emitted JS they produce invalid syntax like
+// `createClient(https://..., sb_...)`. Wrap each value in real JS quotes via the
+// preprocessor stringizer so the generated JS is `createClient("https://...",...)`.
+#ifndef STR
+#define STR_HELPER(x) #x
+#define STR(x) STR_HELPER(x)
+#endif
+// JSQ(macro) -> a quoted JS string literal of the macro's *value* (not its name).
+#define JSQ(x) "\"" x "\""
+
 httpd_handle_t camera_httpd = NULL;
 
 // M4: touched from stream tasks (inc/dec) and read from the main loop's idle
@@ -218,11 +229,6 @@ static esp_err_t health_handler(httpd_req_t *req) {
     return httpd_resp_send(req, buf, HTTPD_RESP_USE_STRLEN);
 }
 
-#ifndef STR
-#define STR_HELPER(x) #x
-#define STR(x) STR_HELPER(x)
-#endif
-
 // /flash — GLOBAL, persisted flash toggle.
 //   GET /flash          -> returns current state as JSON {"flash":0|1} (reader)
 //   GET /flash?s=1|0    -> sets, persists to NVS, and applies GPIO (setter)
@@ -329,14 +335,16 @@ static esp_err_t view_handler(httpd_req_t *req) {
         "}catch(e){le.textContent='Login error: '+e.message;console.error(e);}"
         "}"
         "function auth(u){return fetch(u,{headers:{'X-Session':SID}});}"
+        // Issue #10: an <img> can't send X-Session, so the MJPEG stream carries
+        // the session as a ?token= query param instead.
+        "function streamUrl(){return '/stream?token='+encodeURIComponent(SID);}"
         "function startApp(){"
         "document.getElementById('loginBox').style.display='none';"
         "document.getElementById('app').style.display='flex';"
         "const cam=document.getElementById('cam');"
-        // MJPEG <img> can't send headers; the sid cookie set by /login authorizes /stream.
-        "cam.src='/stream';"
+        "cam.src=streamUrl();"
         "cam.onload=()=>{document.getElementById('st').textContent='MJPEG LIVE \\u25cf';};"
-        "cam.onerror=()=>{document.getElementById('st').textContent='Stream error — retrying...';setTimeout(()=>cam.src='/stream?_='+Date.now(),1500);};"
+        "cam.onerror=()=>{document.getElementById('st').textContent='Stream error — retrying...';setTimeout(()=>cam.src=streamUrl()+'&_='+Date.now(),1500);};"
         "initFlash();initUpload();"
         "}"
         "async function initFlash(){"
@@ -347,8 +355,10 @@ static esp_err_t view_handler(httpd_req_t *req) {
         "btn.onclick=async()=>{const ns=(btn.dataset.s==='1')?0:1;try{const j=await (await auth('/flash?s='+ns)).json();sync(!!j.flash);}catch(e){console.error(e);}};"
         "}"
         "function initUpload(){"
-        "const sb=supabase.createClient(" SUPABASE_URL "," SUPABASE_ANON_KEY ");"
-        "const bkt=" SUPABASE_BUCKET ";const lim=" STR(STORAGE_FRAME_LIMIT) ";const minGap=" STR(STORAGE_UPLOAD_MIN_GAP_MS) ";"
+        // Issue #10: the Supabase values MUST be quoted JS strings. JSQ() wraps
+        // each macro's value in real quotes so createClient/bkt are valid JS.
+        "const sb=supabase.createClient(" JSQ(SUPABASE_URL) "," JSQ(SUPABASE_ANON_KEY) ");"
+        "const bkt=" JSQ(SUPABASE_BUCKET) ";const lim=" STR(STORAGE_FRAME_LIMIT) ";const minGap=" STR(STORAGE_UPLOAD_MIN_GAP_MS) ";"
         "let idx=0;let inflight=false;let lastDone=0;"
         "const cam=document.getElementById('cam');"
         // Best-effort: attempt to upload received frames. If an upload is still
