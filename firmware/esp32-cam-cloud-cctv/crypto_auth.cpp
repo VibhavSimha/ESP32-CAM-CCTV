@@ -84,6 +84,22 @@ static int b64dec(const char *in, size_t inlen, uint8_t *out, size_t outcap, siz
   return mbedtls_base64_decode(out, outcap, olen, (const unsigned char *)in, inlen);
 }
 
+// Convert standard base64 (from mbedtls) to URL-safe base64 IN PLACE:
+//   '+' -> '-', '/' -> '_', and drop '=' padding.
+// Session tokens are echoed back inside the MJPEG stream URL as ?token=<sid>.
+// The browser builds that URL with encodeURIComponent(), which percent-encodes
+// '+', '/' and '=' (e.g. '+' -> "%2B"). ESP-IDF's httpd_query_key_value() does
+// NOT percent-decode, so a standard-base64 token would never match on the
+// query-param auth path (while the header/cookie paths, sent verbatim, would).
+// Emitting URL-safe tokens keeps them byte-identical across all three paths.
+static void b64ToUrlSafe(char *s) {
+  for (char *p = s; *p; p++) {
+    if (*p == '+') *p = '-';
+    else if (*p == '/') *p = '_';
+    else if (*p == '=') { *p = '\0'; break; }
+  }
+}
+
 // Portable constant-time equality (fixed work regardless of where bytes differ).
 // Avoids mbedtls_ct_memcmp, which is absent on older mbedTLS. Length is compared
 // first; token/credential lengths are not secret.
@@ -304,6 +320,7 @@ static void issueSession(char *outToken, size_t cap) {
   mbedtls_ctr_drbg_random(&s_drbg, raw, sizeof(raw));
   char b64[45];
   b64enc(raw, sizeof(raw), b64, sizeof(b64));
+  b64ToUrlSafe(b64);   // token travels in the ?token= stream URL — keep it URL-safe
 
   // Find a free/expired slot (or overwrite the soonest-expiring).
   unsigned long now = millis();
