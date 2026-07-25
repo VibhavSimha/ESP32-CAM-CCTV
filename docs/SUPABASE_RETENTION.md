@@ -13,7 +13,7 @@ deletes the oldest objects beyond a fixed count.
   timestamped names, which is exactly what `order by created_at` needs.
 
 > Supabase has **no built-in "keep newest N / evict oldest"** bucket setting.
-> This is implemented with the `pg_cron` extension + a small SQL job.
+> This is implemented with the `pg_cron` + `pg_net` extensions + a small SQL job.
 
 ---
 
@@ -27,12 +27,42 @@ deletes the oldest objects beyond a fixed count.
 
 ---
 
-## Step 1 — Enable the `pg_cron` extension
-Supabase Dashboard → **Database → Extensions** → search `pg_cron` → **Enable**.
-(Equivalently: `create extension if not exists pg_cron;` in the SQL editor.)
+## Step 1 — Enable the `pg_cron` and `pg_net` extensions
+The sweep is scheduled with **`pg_cron`** and the actual file deletion is done by
+calling the **Storage REST API** over HTTP with **`pg_net`** (see the box below for
+why a plain SQL `DELETE` cannot work).
+
+Supabase Dashboard → **Database → Extensions**, then enable both:
+- `pg_cron` (scheduling)
+- `pg_net`  (async HTTP from Postgres)
+
+(Equivalently in the SQL editor:
+`create extension if not exists pg_cron;` and
+`create extension if not exists pg_net;`)
+
+> **Why HTTP and not `DELETE FROM storage.objects`?**
+> `storage.objects` is only the *metadata* table. Deleting a row there leaves the
+> real file orphaned in the storage backend, so Supabase blocks it with the
+> `storage.protect_delete()` trigger (see [Troubleshooting](#troubleshooting)).
+> There is **no** `storage.delete_object()` SQL function — the only supported way
+> to remove a file from SQL is to call the Storage API, which `pg_net` lets us do.
+
+## Step 1b — Store your `service_role` key in Vault
+Deleting objects requires the **`service_role`** key (it bypasses RLS). Never paste
+it in plain text into the job; store it once in Supabase Vault instead
+(**Project Settings → API** has the key; **SQL Editor** to store it):
+
+```sql
+-- Store the service_role key so the cron job can read it securely.
+select vault.create_secret(
+  'YOUR_SERVICE_ROLE_KEY',   -- paste the service_role key here (kept encrypted)
+  'service_role_key'         -- secret name referenced by the job below
+);
+```
 
 ## Step 2 — Schedule the FIFO eviction job
-Supabase Dashboard → **SQL Editor** → run:
+Supabase Dashboard → **SQL Editor** → run (replace `YOUR_PROJECT_REF` with your
+project ref, e.g. `abcd1234` from `https://abcd1234.supabase.co`):
 
 ```sql
 -- Keep the newest 200 frames in cctv-clips/events/, delete the rest.
@@ -42,7 +72,20 @@ select cron.schedule(
   'cctv-fifo-evict',        -- job name (unique)
   '* * * * *',              -- every minute
   $$
-  select storage.delete_object('cctv-clips', name)
+  -- For each object beyond the newest 200, issue an async HTTP DELETE to the
+  -- Storage API. This removes BOTH the file and its storage.objects row.
+  select net.http_delete(
+    url := 'https://YOUR_PROJECT_REF.supabase.co/storage/v1/object/cctv-clips/'
+           || name,
+    headers := jsonb_build_object(
+      'Authorization',
+      'Bearer ' || (select decrypted_secret from vault.decrypted_secrets
+                    where name = 'service_role_key'),
+      'apikey',
+      (select decrypted_secret from vault.decrypted_secrets
+       where name = 'service_role_key')
+    )
+  )
   from storage.objects
   where bucket_id = 'cctv-clips'
     and name like 'events/%'
@@ -57,32 +100,54 @@ select cron.schedule(
 );
 ```
 
-- `storage.delete_object(bucket_id, name)` is Supabase's Storage API wrapper — it
-  removes both the database row **and** the physical file in one call (see
-  [Troubleshooting](#troubleshooting) below for why a plain `DELETE` no longer works).
+- `net.http_delete(...)` calls the Storage API path
+  `/storage/v1/object/<bucket>/<name>`, which deletes the file **and** its metadata
+  row atomically — the supported alternative to a direct SQL delete.
 - `offset 200` keeps the newest 200 and removes everything older.
+- The `service_role` key is read from Vault at run time, so it is never stored in
+  the job definition in plain text.
+- The frame names (`events/frame_<UTC>_<seq>.jpg`, issue #11) are URL-safe, so no
+  extra encoding is needed. If you change the naming scheme to include characters
+  like spaces or `#`, wrap `name` accordingly.
 - The job name `cctv-fifo-evict` must be unique; re-running `cron.schedule` with the
   same name updates it.
 
-## Step 3 — Verify
-Check the schedule and recent runs:
+## Step 3 — Verify it works
+Run these checks a minute or two after scheduling (let the job fire at least once).
 
 ```sql
--- Is the job registered?
+-- 1. Is the job registered and active?
 select jobid, schedule, jobname, active from cron.job where jobname = 'cctv-fifo-evict';
 
--- Did it run? (most recent executions)
+-- 2. Did the cron job run without SQL errors?
+--    status should be 'succeeded'. A failure here means the SQL itself failed.
 select jobid, status, return_message, start_time, end_time
 from cron.job_run_details
 order by start_time desc
 limit 10;
 
--- How many frames are currently retained?
+-- 3. Did the Storage API actually accept the DELETEs?
+--    pg_net records each HTTP call's result here. status_code 200 = deleted OK.
+--    (401/403 => wrong/missing service_role key; 404 => object already gone.)
+select id, status_code, content, created
+from net._http_response
+order by created desc
+limit 10;
+
+-- 4. How many frames are currently retained?
 select count(*) from storage.objects
 where bucket_id = 'cctv-clips' and name like 'events/%';
 ```
 
-`count(*)` should settle at or near your limit after the buffer fills and the job runs.
+**What "working" looks like:**
+- Check 1 shows the job `active = true`.
+- Check 2 shows `status = 'succeeded'` (no `protect_delete` or other error).
+- Check 3 shows `status_code = 200` for the delete calls.
+- Check 4 `count(*)` settles at or near your limit (200) once the buffer fills.
+
+If check 3 shows `401`/`403`, the `service_role_key` secret is missing or wrong —
+re-run the `vault.create_secret` step. If check 2 shows an error mentioning
+`net` / `http_delete`, the `pg_net` extension is not enabled (Step 1).
 
 ## Changing the limit or interval
 - **Different size:** change both `offset N` (Step 2) and, for consistency, keep it in
@@ -103,9 +168,21 @@ create or replace function public.cctv_evict_old_frames()
 returns trigger language plpgsql security definer as $$
 begin
   if new.bucket_id = 'cctv-clips' and new.name like 'events/%' then
-    perform storage.delete_object(obj.bucket_id, obj.name)
+    -- Delete each object beyond the newest 200 via the Storage API (pg_net).
+    perform net.http_delete(
+      url := 'https://YOUR_PROJECT_REF.supabase.co/storage/v1/object/cctv-clips/'
+             || obj.name,
+      headers := jsonb_build_object(
+        'Authorization',
+        'Bearer ' || (select decrypted_secret from vault.decrypted_secrets
+                      where name = 'service_role_key'),
+        'apikey',
+        (select decrypted_secret from vault.decrypted_secrets
+         where name = 'service_role_key')
+      )
+    )
     from (
-      select bucket_id, name from storage.objects
+      select name from storage.objects
       where bucket_id = 'cctv-clips' and name like 'events/%'
       order by created_at desc
       offset 200            -- = STORAGE_FRAME_LIMIT
@@ -163,14 +240,21 @@ limit 10;
 ```
 
 If `status` is `failed` and `return_message` contains `protect_delete`, the cron job
-is using the old `DELETE FROM storage.objects` syntax.
+is using a direct `DELETE FROM storage.objects` (or an assumed `storage.delete_object()`
+helper — **which does not exist** in Supabase).
 
-**How to fix it.** Replace any `DELETE FROM storage.objects` statement with a call to
-`storage.delete_object(bucket_id, name)` as shown in Steps 2 and the trigger variant
-above. If you set up the job before this document was updated, drop and recreate it:
+**How to fix it.** You cannot delete storage files from raw SQL at all. Use the
+`pg_net` + Storage API approach shown in Steps 1–2: schedule the job so it calls
+`net.http_delete(...)` against `/storage/v1/object/<bucket>/<name>` with your
+`service_role` key. That endpoint removes the file and its metadata row together.
+If you set up the job before this document was updated, drop and recreate it:
 
 ```sql
--- Remove the old job and recreate it with storage.delete_object():
+-- Remove the old (broken) job and recreate it with the pg_net version:
 select cron.unschedule('cctv-fifo-evict');
 -- Then re-run the cron.schedule(...) block from Step 2 above.
 ```
+
+> The same rule applies to the Storage Dashboard/API: `.remove([...])` in a Supabase
+> client library, or a `DELETE /storage/v1/object/...` REST call, are the supported
+> ways to delete — never a SQL `DELETE` on `storage.objects`.
