@@ -49,6 +49,14 @@ static inline void UNLOCK() { if (s_lock) xSemaphoreGiveRecursive(s_lock); }
 #define TOKEN_RAW_LEN     32
 #define LOGIN_FAIL_GAP_MS 500     // BUG2: backoff applied ONLY after a failed login
 
+// Issue #23: minimum free heap required before attempting ECDH.
+// mbedtls_ecdh_compute_shared + related MPI/ECP ops allocate ~8-12 KB of
+// short-lived heap. With two active tunnel proxy tasks (each holding ~8 KB of
+// socket buffers), the heap can drop to ~28 KB and those allocations fail,
+// producing a cryptic 500 "ecdh" error. 40 KB provides a comfortable margin
+// above the peak ECDH working-set on a heap with typical fragmentation.
+#define MIN_HEAP_FOR_ECDH 40000
+
 struct Session {
   char          token[45];   // base64 of 32 bytes + NUL (44 chars)
   unsigned long expiresAt;
@@ -551,7 +559,7 @@ static esp_err_t login_handler(httpd_req_t *req) {
     // tunnel proxy tasks), those allocations fail with a cryptic 500 "ecdh" error
     // that the browser surfaces as a permanent login failure. Return 503 instead
     // so the browser auto-retries once the tunnel releases its heap.
-    if (ESP.getFreeHeap() < 40000) {
+    if (ESP.getFreeHeap() < MIN_HEAP_FOR_ECDH) {
       Serial.printf("[Crypto] login rejected: low heap (%u) — retry after tunnel stabilises\n",
                     ESP.getFreeHeap());
       failReason = "low-heap"; httpStatusFail = 503; break;
