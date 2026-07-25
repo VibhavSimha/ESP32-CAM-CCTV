@@ -213,3 +213,7 @@ void handleTunnel() {
     }
   }
 }
+
+bool isTunnelSlotBusy() {
+  return tunnelBusy();
+}

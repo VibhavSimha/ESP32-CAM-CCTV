@@ -63,8 +63,19 @@ void loop() {
     // Background autonomous CCTV upload (only when no clients are watching).
     // When a browser client connects it becomes the uploader (best-effort per
     // frame) and this stops via active_stream_clients.
+    //
+    // Issue #27: skip the upload when heap is below MIN_HEAP_FOR_UPLOAD or
+    // while the bore tunnel has an active proxy slot. An idle HTTPS upload
+    // takes ~20 KB of heap for the TLS connection; running it concurrently
+    // with a tunnel proxy (which holds its own socket buffers + 2 KB copy
+    // buffer + task stack) can collapse free heap to ~34 KB, causing crypto
+    // login rejections and tunnel write stalls. Deferring the upload when
+    // the tunnel is busy or heap is tight prevents these collisions.
     static unsigned long lastIdleUpload = 0;
-    if (active_stream_clients == 0 && millis() - lastIdleUpload > 3000) {
+    if (active_stream_clients == 0 &&
+        millis() - lastIdleUpload > 3000 &&
+        ESP.getFreeHeap() >= MIN_HEAP_FOR_UPLOAD &&
+        !isTunnelSlotBusy()) {
         lastIdleUpload = millis();
         Serial.println("[Idle] No clients streaming. Performing autonomous background upload.");
         uploadFrameToCloud();

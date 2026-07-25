@@ -69,6 +69,19 @@ static String buildFrameName() {
 }
 
 void uploadFrameToCloud() {
+  // Issue #27: defence-in-depth heap guard. The TLS handshake + HTTP body for
+  // an upload allocates ~20 KB of transient heap. If the bore tunnel proxy is
+  // also active (holding socket buffers + a 2 KB copy buffer) the combined
+  // pressure can collapse free heap to ~34 KB, triggering crypto login
+  // rejections and tunnel write stalls. The primary guard is in the main-loop
+  // caller (via isTunnelSlotBusy + MIN_HEAP_FOR_UPLOAD), but this inner check
+  // protects callers that bypass the main-loop guard.
+  if (ESP.getFreeHeap() < MIN_HEAP_FOR_UPLOAD) {
+    Serial.printf("[Supabase] Upload deferred: low heap (%u < %u)\n",
+                  ESP.getFreeHeap(), MIN_HEAP_FOR_UPLOAD);
+    return;
+  }
+
   Serial.printf("[Supabase] Capturing frame for cloud upload... heap: %u\n", ESP.getFreeHeap());
   camera_fb_t *fb = esp_camera_fb_get();
   if (!fb) {

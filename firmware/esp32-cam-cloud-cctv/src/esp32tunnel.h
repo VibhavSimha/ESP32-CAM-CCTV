@@ -490,6 +490,19 @@ inline void tunnelWatchdog() {
   if (_tunProvider == BORE) _boreWatchdog("loop");
 }
 
+// Returns true when any bore proxy slot is actively handling a connection.
+// Callers can use this to defer heap-intensive operations (e.g. cloud
+// uploads) while the tunnel is busy, preventing heap exhaustion from
+// concurrent TLS connections.
+inline bool tunnelBusy() {
+  if (_tunProvider == BORE) {
+    for (int i = 0; i < BORE_MAX_PROXY; i++) {
+      if (_slotBusy[i]) return true;
+    }
+  }
+  return false;
+}
+
 inline String tunnelLastIP() {
   if (_tunProvider == SELFHOST) return _sh.lastIP;
   if (_tunProvider == BORE)     return _bore.lastIP;
