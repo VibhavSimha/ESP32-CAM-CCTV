@@ -310,14 +310,19 @@ static void _boreWatchdog(const char *source) {
     unsigned long age = now - last;
 
     unsigned long bpSince = _slotBackpressureSince[i];
-    // "Stuck" = backpressured AND no forward byte progress for >4s.
-    // The age>4000 term is critical: a slot that petted the watchdog
-    // recently (age small) is by definition making progress and must
-    // NEVER be declared stuck (fixes bpStuck=1 age=0ms killing live streams).
+    // "Stuck" = backpressured AND no forward byte progress for >8s.
+    // Issue #27: the 4s threshold was too tight — SO_SNDTIMEO on ESP32 lwIP
+    // may not reliably cut off a blocking write() within 3s under WAN
+    // congestion. Raise both guards to 8s so transient network hiccups
+    // (bore.pub congestion, client buffer stall) do not kill live streams.
+    // With SO_SNDTIMEO=3s working correctly, each write returns within 3s,
+    // petting the watchdog (age resets), so age never exceeds ~3s and the
+    // 8s guard is never falsely triggered. The guard only fires when write()
+    // genuinely blocks for 8s with no progress — a real hang.
     bool bpStuck = _slotBackpressured[i] &&
                    bpSince > 0 &&
-                   (now - bpSince > 4000) &&
-                   (age > 4000);
+                   (now - bpSince > 8000) &&
+                   (age > 8000);
 
     // Normal freeze: task blocked inside write() with no progress for 12s,
     // and not currently in a (legitimate, short) backpressure spell.
@@ -325,7 +330,7 @@ static void _boreWatchdog(const char *source) {
 
     if (frozen || bpStuck) {
       Serial.printf("[Tunnel] WATCHDOG(%s): Slot %d KILL. reason=%s age=%lums bpSince=%lums heap=%u wifi=%d r=%d l=%d\n",
-                    source, i, frozen ? "frozen12s" : "bpStuck4s",
+                    source, i, frozen ? "frozen12s" : "bpStuck8s",
                     age, bpSince ? (now - bpSince) : 0UL,
                     ESP.getFreeHeap(), WiFi.status(),
                     _boreProxy[i].connected(), _boreLocal[i].connected());
@@ -371,11 +376,16 @@ static void _boreAccept(const String &uuid, int slot) {
   proxy.setNoDelay(true);
   local.setNoDelay(true);
   _setKeepAlive(proxy);
-  // Issue #23: _setKeepAlive() sets SO_SNDTIMEO=8s, which exceeds the 4-second
-  // bpStuck watchdog threshold. A single remote.write() blocked inside its TCP
-  // send-timeout window triggers a spurious tunnel kill mid-stream. Cap it at 3s
-  // (matching the proxy inner-write deadline) so writes always return before the
-  // watchdog fires.
+  // Issue #23: _setKeepAlive() sets SO_SNDTIMEO=8s, which exceeds the old
+  // 4-second bpStuck watchdog threshold.  Cap it at 3s (matching the proxy
+  // inner-write deadline) so that each blocking write() attempt times out
+  // well within the bpStuck window.
+  // Issue #27: bpStuck threshold raised to 8s, keeping SO_SNDTIMEO at 3s
+  // maintains the invariant: if SO_SNDTIMEO works, write() returns within 3s
+  // and the watchdog pet (age) resets — bpStuck never fires falsely. If
+  // SO_SNDTIMEO is unreliable (observed on some ESP32 lwIP configurations),
+  // the 8s bpStuck guard still catches a genuine hang without killing streams
+  // on transient congestion.
 #ifdef ESP32
   {
     int _pfd = proxy.fd();
