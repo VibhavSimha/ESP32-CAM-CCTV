@@ -462,7 +462,7 @@ static esp_err_t view_handler(httpd_req_t *req) {
         "const {data,error}=await sb.from('camera_status').select('url').order('created_at',{ascending:false}).limit(1);"
         // camera_status is scoped to a single-device Supabase project; no device-ID
         // filter is needed. The latest row is always this device's URL.
-        "if(!error&&Array.isArray(data)&&data.length>0&&data[0]){"
+        "if(!error&&Array.isArray(data)&&data.length>0&&data[0]&&data[0].url){"
         // Wrap URL parsing separately so a malformed value doesn't abort the
         // whole reconnect flow; just skip the redirect and try the stream again.
         // new URL() throws on relative URLs and on schemes like 'javascript:' so those
