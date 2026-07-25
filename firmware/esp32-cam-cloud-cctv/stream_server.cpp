@@ -452,7 +452,12 @@ static esp_err_t view_handler(httpd_req_t *req) {
         "async function reconnectWithUrlCheck(){"
         "try{"
         "const {data,error}=await sb.from('camera_status').select('url').order('created_at',{ascending:false}).limit(1);"
+        // camera_status is scoped to a single-device Supabase project; no device-ID
+        // filter is needed. The latest row is always this device's URL.
         "if(!error&&Array.isArray(data)&&data.length>0&&data[0]){"
+        // Wrap URL parsing separately so a malformed value doesn't abort the
+        // whole reconnect flow; just skip the redirect and try the stream again.
+        "try{"
         "const nu=new URL(data[0].url);"
         // Only redirect to http/https to prevent protocol-based attacks if the
         // Supabase database is ever compromised.
@@ -461,10 +466,14 @@ static esp_err_t view_handler(httpd_req_t *req) {
         "window.location.href=nu.origin+'/view';"
         "return;"
         "}"
+        "}catch(ue){console.warn('[reconnect] Bad URL in camera_status:',data[0].url,ue);}"
         "}"
         "}catch(e){console.warn('[reconnect] Supabase URL check failed:',e);}"
         // Tunnel URL unchanged — validate the session before retrying.
-        "if(SID){const rv=await checkSession();if(rv&&(rv.status===401||rv.status===403)){logout();return;}}"
+        "if(SID){"
+        "const rv=await checkSession();"
+        "if(rv&&(rv.status===401||rv.status===403)){logout();return;}"
+        "}"
         "connectStream();"
         "}"
         "function scheduleReconnect(){"
@@ -551,6 +560,7 @@ static esp_err_t view_handler(httpd_req_t *req) {
         "(async function init(){"
         "if(!SID)return;"
         "const rv=await checkSession();"
+        // rv.ok covers 2xx; /flash always returns 200 on success so this is exact.
         "if(rv&&rv.ok){startApp();return;}"
         // Explicit rejection (401/403): session genuinely expired — clear the cache
         // so the login form appears clean. On network error (rv===null) the device
