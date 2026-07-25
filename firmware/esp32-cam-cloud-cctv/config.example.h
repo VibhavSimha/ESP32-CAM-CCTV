@@ -5,6 +5,9 @@
 // =============================================================================
 //  Copy config.example.h to config.h and fill in your values.
 //  This is the ONLY file you need to edit before flashing.
+//
+//  See docs/CONFIG_SETUP.md for a step-by-step first-flash walkthrough,
+//  including the ONE-TIME device-pubkey pinning step (CONFIG_DEVICE_PUBKEY_B64).
 // =============================================================================
 
 // -----------------------------------------------------------------------------
@@ -12,15 +15,18 @@
 // -----------------------------------------------------------------------------
 // These credentials protect the camera feed from unauthorised access.
 //
-// Login is ALWAYS an ENCRYPTED login: the browser fetches the device X25519
-// public key from /pubkey, performs ECDH + HKDF-SHA256 to derive an AES-256-GCM
-// key, and encrypts your username/password before sending them to /login. The
-// ESP32 decrypts with its private key and issues a session token. Credentials
-// are never sent in plaintext over the plain-HTTP BORE tunnel.
+// Login is ALWAYS an ENCRYPTED login. The browser derives an AES-256-GCM key via
+// X25519 ECDH + HKDF-SHA256 with the device key, and encrypts your
+// username/password (plus a single-use /nonce) before sending them to /login.
+// The ESP32 decrypts with its private key and issues a session token.
+// Credentials are never sent in plaintext over the plain-HTTP BORE tunnel.
 //
-// See docs/SECURITY.md for the full threat model and the important caveat that
-// crypto.subtle may be unavailable over plain http:// — the HTTPS SELFHOST
-// tunnel is recommended for a fully-encrypted channel.
+// The login crypto is bundled (pure JS) in the /view page, so it works over
+// plain http:// as well — it does NOT depend on window.crypto.subtle.
+//
+// See docs/SECURITY.md for the full threat model, and docs/CONFIG_SETUP.md for
+// the one-time device-key pinning that hardens the login against a
+// pubkey-substitution MITM.
 //
 //   Username: CONFIG_HTTP_USER
 //   Password: CONFIG_HTTP_PASS
@@ -29,6 +35,32 @@
 // -----------------------------------------------------------------------------
 #define CONFIG_HTTP_USER     "admin"
 #define CONFIG_HTTP_PASS     "changeme12345678"
+
+// -----------------------------------------------------------------------------
+// DEVICE X25519 PUBLIC KEY — PINNED (one-time setup, see docs/CONFIG_SETUP.md)
+// -----------------------------------------------------------------------------
+// The device X25519 keypair is generated on first boot and PERSISTED in NVS, so
+// its public key is STABLE across reboots. Pinning that public key here lets the
+// browser encrypt the login DIRECTLY to the trusted device key instead of a key
+// fetched from /pubkey over the untrusted plain-HTTP tunnel — defeating an
+// attacker who would otherwise substitute their own key (MITM).
+//
+// ONE-TIME SETUP (per device — you only do this once):
+//   1. Leave this EMPTY ("") for the very first flash.
+//   2. Flash + open the Serial Monitor. Copy the value printed at boot:
+//        [Crypto] Device pubkey (b64): <VALUE>
+//      (The /view page also shows a ⚠ banner with this value while unpinned.)
+//   3. Paste <VALUE> below and re-flash ONCE:
+//        #define CONFIG_DEVICE_PUBKEY_B64 "<VALUE>"
+//   4. Done — permanent. The key only changes if you erase NVS / replace the board.
+//
+// While EMPTY: login still works (the page fetches /pubkey), but a prominent
+// warning banner is shown because the login is NOT MITM-protected.
+// When SET: the browser uses ONLY this pinned key; if it does not match the
+// device, login fails (the intended MITM-abort). The firmware logs at boot
+// whether this value matches the live device key.
+// -----------------------------------------------------------------------------
+#define CONFIG_DEVICE_PUBKEY_B64 ""
 
 // -----------------------------------------------------------------------------
 // WIFI CREDENTIALS
@@ -54,10 +86,11 @@
 //   http://bore.pub:<server-assigned-port>/view
 // The BORE port is assigned by the public server and can change on reboot.
 //
-// SECURITY: BORE is plain HTTP (no TLS). For a fully-encrypted channel and to
-// make browser crypto.subtle available for the encrypted login, use SELFHOST
-// mode, which is served over HTTPS at:
-//   https://esp32-tunnel.onrender.com/<CONFIG_SELFHOST_TUNNEL_ID>/view
+// SECURITY: BORE is plain HTTP (no TLS). The bundled JS login crypto works over
+// plain HTTP, and pinning CONFIG_DEVICE_PUBKEY_B64 hardens it against key
+// substitution. For FULL-channel confidentiality (including the MJPEG stream)
+// and server authentication, front BORE with an HTTPS reverse proxy, or use
+// SELFHOST/HTTPS where the hardware permits. See docs/SECURITY.md.
 // -----------------------------------------------------------------------------
 #define CONFIG_TUNNEL_MODE_BORE      1
 #define CONFIG_TUNNEL_MODE_SELFHOST  2
@@ -89,11 +122,14 @@
 //     frames best-effort, dropping frames while an upload is in flight AND
 //     honoring STORAGE_UPLOAD_MIN_GAP_MS between completed uploads so a fast
 //     client cannot hammer Supabase.
+//
+// Frames use unique timestamped names (issue #11); cap the bucket with the
+// server-side pg_cron FIFO job in docs/SUPABASE_RETENTION.md.
 // -----------------------------------------------------------------------------
 #define SUPABASE_URL         "https://xxxx.supabase.co"
 #define SUPABASE_ANON_KEY    "your-anon-key"
 #define SUPABASE_BUCKET      "cctv-clips"
-#define STORAGE_FRAME_LIMIT  200   // circular buffer: overwrites oldest frame
+#define STORAGE_FRAME_LIMIT  200   // retention target (see docs/SUPABASE_RETENTION.md)
 
 // Minimum spacing (ms) between browser best-effort uploads. Lower = more frames
 // uploaded (more Supabase writes/egress); higher = gentler. 0 disables the floor
