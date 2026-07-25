@@ -326,9 +326,10 @@ static esp_err_t view_handler(httpd_req_t *req) {
         // TweetNaCl -> global `nacl` (X25519 via nacl.scalarMult).
         "<script src='https://cdn.jsdelivr.net/npm/tweetnacl@1.0.3/nacl.min.js'></script>"
         // @noble UMD bundles -> globals `nobleHashes` (hkdf, sha256) and
-        // `nobleCiphers` (gcm). These specific bundle files define window globals.
-        "<script src='https://cdn.jsdelivr.net/npm/@noble/hashes@1.3.3/hashes.js'></script>"
-        "<script src='https://cdn.jsdelivr.net/npm/@noble/ciphers@0.4.1/cipher.js'></script>"
+        // `nobleCiphers` (gcm). bundled.js is the UMD entry point that defines
+        // window globals (hashes.js / cipher.js do not exist at these versions).
+        "<script src='https://cdn.jsdelivr.net/npm/@noble/hashes@1.3.3/bundled.js'></script>"
+        "<script src='https://cdn.jsdelivr.net/npm/@noble/ciphers@0.4.1/bundled.js'></script>"
         "<script src='https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2'></script>"
         "<script>"
         // Pinned device pubkey (b64), empty when not yet pinned (see config.h).
