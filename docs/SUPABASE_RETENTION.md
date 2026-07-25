@@ -165,7 +165,7 @@ limit 10;
 If `status` is `failed` and `return_message` contains `protect_delete`, the cron job
 is using the old `DELETE FROM storage.objects` syntax.
 
-**The fix.** Replace any `DELETE FROM storage.objects` statement with a call to
+**How to fix it.** Replace any `DELETE FROM storage.objects` statement with a call to
 `storage.delete_object(bucket_id, name)` as shown in Steps 2 and the trigger variant
 above. If you set up the job before this document was updated, drop and recreate it:
 
