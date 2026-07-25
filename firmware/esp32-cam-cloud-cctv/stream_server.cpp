@@ -498,9 +498,18 @@ static esp_err_t view_handler(httpd_req_t *req) {
         "console.warn('[reconnect] Supabase URL check failed:',e);"
         "}"
         // Tunnel URL unchanged — validate the session before retrying.
+        // Issue #31: retry the session check once (after a short gap) before
+        // concluding the session is invalid and forcing a logout. A transient bore
+        // reconnect can cause a single /flash request to fail with a network error
+        // that looks like a 401 at the OS level; a second attempt 1.5s later is
+        // almost always successful when the device is still running.
         "if(SID){"
-        "const rv=await checkSession();"
-        "if(isAuthError(rv)){logout();return;}"
+        "let rv=await checkSession();"
+        "if(isAuthError(rv)){"
+        "await new Promise(r=>setTimeout(r,1500));"
+        "rv=await checkSession();"
+        "if(isAuthError(rv)){logout('Device restarted \u2014 please log in again.');return;}"
+        "}"
         "}"
         "connectStream();"
         "}"
@@ -558,14 +567,19 @@ static esp_err_t view_handler(httpd_req_t *req) {
         // The button is latched busy for the duration so rapid double-clicks
         // can't stack overlapping pause/resume cycles (a source of instability).
         //
-        // Latency improvements:
-        // 1. Sync the button label optimistically on click (instant visual feedback).
-        // 2. After stopping the stream, wait 250ms before sending the /flash request.
-        //    This lets the ESP32 bore proxy task fully exit and release the slot so
-        //    the new bore Connection for the flash request isn't dropped by the
-        //    anyStreaming guard in _boreServe().
-        // 3. Reconnect delay reduced from 300ms to 100ms (smaller gap after toggle).
-        // 4. Revert button to original state on network error so the UI stays consistent.
+        // Issue #31: increase the post-stop pause from 250ms to 750ms. When
+        // streaming, the ESP32 heap can drop to 30-35KB. The bore proxy task needs
+        // time to detect the WAN disconnect (browser removes img src → TCP FIN →
+        // bore.pub → proxy socket → proxy task exit) AND for the freed heap to be
+        // reclaimed before the /flash request arrives. With 250ms the proxy task
+        // was still running when the flash UUID hit bore, causing the 35KB heap
+        // guard to drop it. 750ms is consistently past the point where the proxy
+        // task exits (~150-200ms) and heap fully recovers to ~70KB.
+        //
+        // Also wrap the /flash fetch in a retry loop (up to 3 attempts, 500ms
+        // apart) so a transient network glitch or lingering bore slot doesn't
+        // permanently fail the toggle. If all retries are exhausted the button
+        // reverts to its pre-click state so the UI stays consistent.
         "btn.onclick=async()=>{"
         "if(btn.dataset.busy==='1')return;"
         "btn.dataset.busy='1';btn.disabled=true;"
@@ -573,10 +587,15 @@ static esp_err_t view_handler(httpd_req_t *req) {
         "sync(!!ns);" // optimistic: update UI before async /flash request completes
         "const wasStreaming=!!cam.getAttribute('src');"
         "if(wasStreaming){streamPaused=true;cam.removeAttribute('src');"
-        "await new Promise(r=>setTimeout(r,250));}" // let bore proxy slot clean up
-        "try{const j=await (await auth('/flash?s='+ns)).json();sync(!!j.flash);}"
-        "catch(e){sync(!ns);console.error(e);}" // revert visual on error
-        "finally{btn.dataset.busy='0';btn.disabled=false;if(wasStreaming){streamPaused=false;setTimeout(connectStream,100);}}"
+        "await new Promise(r=>setTimeout(r,750));}" // wait for bore proxy slot + heap recovery
+        "let flashOk=false;"
+        "for(let ft=0;ft<3&&!flashOk;ft++){"
+        "try{const j=await (await auth('/flash?s='+ns)).json();sync(!!j.flash);flashOk=true;}"
+        "catch(e){if(ft<2)await new Promise(r=>setTimeout(r,500));else console.error(e);}"
+        "}"
+        "if(!flashOk)sync(!ns);" // revert visual when all retries exhausted
+        "btn.dataset.busy='0';btn.disabled=false;"
+        "if(wasStreaming){streamPaused=false;setTimeout(connectStream,150);}"
         "};"
         "}"
         "function initUpload(){"
@@ -617,26 +636,28 @@ static esp_err_t view_handler(httpd_req_t *req) {
         // live view. On failure (401/403 = device rebooted, 6 h TTL expired), wipe
         // the stale token and show the login form.
         // Network error (rv===null): device is temporarily unreachable (e.g. bore
-        // reconnecting after a reboot). Retry up to 3× at 3-second intervals before
-        // giving up and showing a manual "check your connection" message. This means
-        // the page auto-recovers within ~9 s when the device comes back online
-        // without needing a manual refresh.
+        // reconnecting after a reboot). Retry indefinitely with exponential backoff
+        // (3s → 4.5s → 6.75s … capped at 30s) so the page always self-heals when
+        // the device comes back online without needing a manual refresh.
+        // Issue #31: the previous fixed MAX_RETRIES=3 (9 s) was too short — a bore
+        // reconnect or device reboot can take longer, leaving the user stuck on
+        // "check your connection" with no auto-recovery path.
         "(async function init(){"
         "if(!SID)return;"
         "async function trySession(){"
         "const rv=await checkSession();"
         "if(rv&&rv.ok){startApp();return true;}"
-        "if(isAuthError(rv)){logout();return true;}"
-        "return false;" // null = unreachable, caller should retry
+        "if(isAuthError(rv)){logout('Device restarted \u2014 please log in again.');return true;}"
+        "return false;" // null = unreachable, caller should keep retrying
         "}"
         "if(await trySession())return;"
-        "const MAX_RETRIES=3;"
-        "for(let i=0;i<MAX_RETRIES;i++){"
-        "document.getElementById('lerr').textContent='Device unreachable \u2014 retrying ('+(i+1)+'/'+MAX_RETRIES+')...';"
-        "await new Promise(r=>setTimeout(r,3000));"
+        "let initDelay=3000;"
+        "while(true){"
+        "document.getElementById('lerr').textContent='Device unreachable \u2014 retrying...';"
+        "await new Promise(r=>setTimeout(r,initDelay));"
+        "initDelay=Math.min(Math.round(initDelay*1.5),30000);"
         "if(await trySession())return;"
         "}"
-        "document.getElementById('lerr').textContent='Device unreachable \u2014 check your connection.';"
         "})();"
         "</script>"
         "</body></html>";
