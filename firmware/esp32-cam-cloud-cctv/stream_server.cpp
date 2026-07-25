@@ -457,15 +457,21 @@ static esp_err_t view_handler(httpd_req_t *req) {
         "if(!error&&Array.isArray(data)&&data.length>0&&data[0]){"
         // Wrap URL parsing separately so a malformed value doesn't abort the
         // whole reconnect flow; just skip the redirect and try the stream again.
+        // new URL() throws on relative URLs and on schemes like 'javascript:' so those
+        // are rejected automatically before the protocol check below is even reached.
         "try{"
         "const nu=new URL(data[0].url);"
-        // Only redirect to http/https AND to the same hostname — bore.pub tunnels only
-        // change the port, never the host. Restricting to the same hostname prevents
-        // open-redirect attacks if the Supabase database is ever compromised (an attacker
-        // could not redirect users to a different domain, only to a different port on the
-        // same bore server they already trust).
+        // bore.pub tunnels only change the *port* on the same hostname, never the
+        // domain. Requiring same hostname prevents open-redirect to external domains
+        // even if the Supabase row is tampered with. Only http/https are accepted.
+        // The port must be >1024 so a crafted low-port URL (e.g. :80, :443) on the
+        // same hostname cannot redirect users to a different service.
+        // nu.host includes the port (e.g. 'bore.pub:60781'), so when the bore port
+        // changes, nu.host differs from window.location.host — this is the trigger.
+        "const nuPort=parseInt(nu.port||'0',10);"
         "if((nu.protocol==='http:'||nu.protocol==='https:')&&"
         "nu.hostname===window.location.hostname&&"
+        "nuPort>1024&&"
         "nu.host!==window.location.host){"
         "document.getElementById('st').textContent='Tunnel URL changed \u2014 redirecting...';"
         "window.location.href=nu.origin+'/view';"
@@ -473,7 +479,10 @@ static esp_err_t view_handler(httpd_req_t *req) {
         "}"
         "}catch(ue){console.warn('[reconnect] Bad URL in camera_status:',data[0].url,ue);}"
         "}"
-        "}catch(e){console.warn('[reconnect] Supabase URL check failed:',e);}"
+        "}catch(e){"
+        "document.getElementById('st').textContent='Stream error \u2014 DB unreachable, retrying...';"
+        "console.warn('[reconnect] Supabase URL check failed:',e);"
+        "}"
         // Tunnel URL unchanged — validate the session before retrying.
         "if(SID){"
         "const rv=await checkSession();"
