@@ -42,7 +42,8 @@ select cron.schedule(
   'cctv-fifo-evict',        -- job name (unique)
   '* * * * *',              -- every minute
   $$
-  delete from storage.objects
+  select storage.delete_object('cctv-clips', name)
+  from storage.objects
   where bucket_id = 'cctv-clips'
     and name like 'events/%'
     and id in (
@@ -56,7 +57,9 @@ select cron.schedule(
 );
 ```
 
-- Deleting the row in `storage.objects` deletes the underlying file.
+- `storage.delete_object(bucket_id, name)` is Supabase's Storage API wrapper — it
+  removes both the database row **and** the physical file in one call (see
+  [Troubleshooting](#troubleshooting) below for why a plain `DELETE` no longer works).
 - `offset 200` keeps the newest 200 and removes everything older.
 - The job name `cctv-fifo-evict` must be unique; re-running `cron.schedule` with the
   same name updates it.
@@ -100,15 +103,13 @@ create or replace function public.cctv_evict_old_frames()
 returns trigger language plpgsql security definer as $$
 begin
   if new.bucket_id = 'cctv-clips' and new.name like 'events/%' then
-    delete from storage.objects
-    where bucket_id = 'cctv-clips'
-      and name like 'events/%'
-      and id in (
-        select id from storage.objects
-        where bucket_id = 'cctv-clips' and name like 'events/%'
-        order by created_at desc
-        offset 200            -- = STORAGE_FRAME_LIMIT
-      );
+    perform storage.delete_object(obj.bucket_id, obj.name)
+    from (
+      select bucket_id, name from storage.objects
+      where bucket_id = 'cctv-clips' and name like 'events/%'
+      order by created_at desc
+      offset 200            -- = STORAGE_FRAME_LIMIT
+    ) obj;
   end if;
   return new;
 end;
@@ -132,3 +133,44 @@ Use **either** the cron job **or** the trigger, not both. The `pg_cron` sweep (S
   count — bursts can still spike the count.
 - **RLS:** the eviction runs as a scheduled/`security definer` server job, so it is not
   subject to the anon RLS policies your device uploads use.
+
+---
+
+## Troubleshooting
+
+### `storage.protect_delete()` — "Direct deletion from storage tables is not allowed"
+
+```
+ERROR: Direct deletion from storage tables is not allowed. Use the Storage API instead.
+HINT: This prevents accidental data loss from orphaned objects.
+CONTEXT: PL/pgSQL function storage.protect_delete() line 5 at RAISE
+```
+
+**What it means.** Supabase added a `BEFORE DELETE` trigger called `storage.protect_delete()`
+to the `storage.objects` table. A plain SQL `DELETE FROM storage.objects` only removes
+the metadata row from the database; the actual file in object storage (S3 / the Supabase
+storage backend) is **not** deleted, leaving an orphaned file that wastes space and
+can never be cleaned up. The trigger blocks the direct delete and forces you to use
+the Storage API, which deletes both the row and the physical file atomically.
+
+**How to spot it.** Run the verification query from Step 3:
+
+```sql
+select jobid, status, return_message, start_time, end_time
+from cron.job_run_details
+order by start_time desc
+limit 10;
+```
+
+If `status` is `failed` and `return_message` contains `protect_delete`, the cron job
+is using the old `DELETE FROM storage.objects` syntax.
+
+**The fix.** Replace any `DELETE FROM storage.objects` statement with a call to
+`storage.delete_object(bucket_id, name)` as shown in Steps 2 and the trigger variant
+above. If you set up the job before this document was updated, drop and recreate it:
+
+```sql
+-- Remove the old job and recreate it with storage.delete_object():
+select cron.unschedule('cctv-fifo-evict');
+-- Then re-run the cron.schedule(...) block from Step 2 above.
+```
