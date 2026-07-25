@@ -72,7 +72,6 @@ void loop() {
     // login rejections and tunnel write stalls. Deferring the upload when
     // the tunnel is busy or heap is tight prevents these collisions.
     static unsigned long lastIdleUpload = 0;
-    static const uint32_t MIN_HEAP_FOR_UPLOAD = 65000;
     if (active_stream_clients == 0 &&
         millis() - lastIdleUpload > 3000 &&
         ESP.getFreeHeap() >= MIN_HEAP_FOR_UPLOAD &&

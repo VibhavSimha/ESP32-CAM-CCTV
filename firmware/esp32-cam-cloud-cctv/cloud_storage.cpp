@@ -76,7 +76,6 @@ void uploadFrameToCloud() {
   // rejections and tunnel write stalls. The primary guard is in the main-loop
   // caller (via isTunnelSlotBusy + MIN_HEAP_FOR_UPLOAD), but this inner check
   // protects callers that bypass the main-loop guard.
-  static const uint32_t MIN_HEAP_FOR_UPLOAD = 65000;
   if (ESP.getFreeHeap() < MIN_HEAP_FOR_UPLOAD) {
     Serial.printf("[Supabase] Upload deferred: low heap (%u < %u)\n",
                   ESP.getFreeHeap(), MIN_HEAP_FOR_UPLOAD);
