@@ -33,8 +33,9 @@ static mbedtls_entropy_context  s_entropy;
 
 // -----------------------------------------------------------------------------
 // Concurrency: the ESP-IDF httpd services requests from multiple sockets, so the
-// session table, the DRBG (mbedTLS CTR_DRBG is NOT thread-safe on its own), and
-// login CPU-cost must all be serialized. One recursive mutex guards them.
+// session table, the nonce ring, the DRBG (mbedTLS CTR_DRBG is NOT thread-safe
+// on its own), and login CPU-cost must all be serialized. One recursive mutex
+// guards them all.
 // -----------------------------------------------------------------------------
 static SemaphoreHandle_t s_lock = NULL;
 static inline void LOCK()   { if (s_lock) xSemaphoreTakeRecursive(s_lock, portMAX_DELAY); }
@@ -54,6 +55,23 @@ struct Session {
 };
 static Session s_sessions[SESSION_SLOTS];
 static unsigned long s_lastFailedLogin = 0;   // BUG2: only FAILED attempts set this
+
+// -----------------------------------------------------------------------------
+// Issue #12: replay-protection nonce ring.
+// GET /nonce hands out a random 16-byte nonce (base64). The browser includes it
+// INSIDE the encrypted login plaintext. login_handler verifies the nonce is
+// known/unexpired/unused, then CONSUMES it, so a captured /login body can't be
+// replayed. Guarded by the same recursive mutex as the session table + DRBG.
+// -----------------------------------------------------------------------------
+#define NONCE_SLOTS    8
+#define NONCE_RAW_LEN  16
+#define NONCE_TTL_MS   60000UL     // 60s window to complete a login
+
+struct Nonce {
+  char          value[25];   // base64 of 16 bytes + NUL (24 chars)
+  unsigned long expiresAt;   // 0 == free slot
+};
+static Nonce s_nonces[NONCE_SLOTS];
 
 static size_t b64enc(const uint8_t *in, size_t inlen, char *out, size_t outcap) {
   size_t olen = 0;
@@ -124,6 +142,7 @@ static bool genKeypair() {
 
 void setupCryptoAuth() {
   memset(s_sessions, 0, sizeof(s_sessions));
+  memset(s_nonces, 0, sizeof(s_nonces));
 
   if (!s_lock) s_lock = xSemaphoreCreateRecursiveMutex();
   if (!s_lock) {
@@ -164,6 +183,18 @@ void setupCryptoAuth() {
   char pubb64[64];
   b64enc(s_pub, 32, pubb64, sizeof(pubb64));
   Serial.printf("[Crypto] Device pubkey (b64): %s\n", pubb64);
+#ifdef CONFIG_DEVICE_PUBKEY_B64
+  if (strlen(CONFIG_DEVICE_PUBKEY_B64) > 0) {
+    if (strcmp(CONFIG_DEVICE_PUBKEY_B64, pubb64) == 0) {
+      Serial.println("[Crypto] Pinned CONFIG_DEVICE_PUBKEY_B64 MATCHES device key. Good.");
+    } else {
+      Serial.println("[Crypto] WARNING: CONFIG_DEVICE_PUBKEY_B64 does NOT match this device's key!");
+      Serial.println("[Crypto]          Login will fail until you pin the value printed above.");
+    }
+  } else {
+    Serial.println("[Crypto] CONFIG_DEVICE_PUBKEY_B64 is empty — pin the value above and re-flash (see docs/CONFIG_SETUP.md).");
+  }
+#endif
   Serial.printf("[Crypto] setup took %lums, heap %u -> %u (delta %d)\n",
                 millis() - t0, h0, ESP.getFreeHeap(), (int)ESP.getFreeHeap() - (int)h0);
 }
@@ -224,6 +255,47 @@ static int aesGcmDecrypt(const uint8_t *key, const uint8_t *iv, size_t ivlen,
   }
   mbedtls_gcm_free(&gcm);
   return rc == 0 ? (int)ctlen : -1;
+}
+
+// -----------------------------------------------------------------------------
+// Nonce ring helpers. Caller MUST hold the lock (uses s_drbg + s_nonces).
+// -----------------------------------------------------------------------------
+static void issueNonce(char *out, size_t cap) {
+  uint8_t raw[NONCE_RAW_LEN];
+  mbedtls_ctr_drbg_random(&s_drbg, raw, sizeof(raw));
+  char b64[25];
+  b64enc(raw, sizeof(raw), b64, sizeof(b64));
+
+  unsigned long now = millis();
+  int slot = 0;
+  unsigned long soonest = (unsigned long)-1;
+  for (int i = 0; i < NONCE_SLOTS; i++) {
+    if (s_nonces[i].expiresAt == 0 || now > s_nonces[i].expiresAt) { slot = i; break; }
+    if (s_nonces[i].expiresAt < soonest) { soonest = s_nonces[i].expiresAt; slot = i; }
+  }
+  strncpy(s_nonces[slot].value, b64, sizeof(s_nonces[slot].value) - 1);
+  s_nonces[slot].value[sizeof(s_nonces[slot].value) - 1] = '\0';
+  s_nonces[slot].expiresAt = now + NONCE_TTL_MS;
+  strncpy(out, b64, cap - 1);
+  out[cap - 1] = '\0';
+}
+
+// Verify a nonce is known + unexpired, and CONSUME it (single use).
+// Caller MUST hold the lock. Returns true if valid.
+static bool consumeNonce(const char *candidate) {
+  if (!candidate || !candidate[0]) return false;
+  unsigned long now = millis();
+  for (int i = 0; i < NONCE_SLOTS; i++) {
+    if (s_nonces[i].expiresAt == 0) continue;
+    if (now > s_nonces[i].expiresAt) { s_nonces[i].expiresAt = 0; s_nonces[i].value[0] = '\0'; continue; }
+    if (ctEqual(s_nonces[i].value, candidate)) {
+      // consume
+      s_nonces[i].expiresAt = 0;
+      s_nonces[i].value[0] = '\0';
+      return true;
+    }
+  }
+  return false;
 }
 
 // Caller MUST hold the lock (uses s_drbg + s_sessions).
@@ -353,12 +425,31 @@ static esp_err_t pubkey_handler(httpd_req_t *req) {
   return httpd_resp_send(req, out, HTTPD_RESP_USE_STRLEN);
 }
 
+// GET /nonce (issue #12): single-use, short-lived replay nonce. Unauthenticated.
+static esp_err_t nonce_handler(httpd_req_t *req) {
+  if (!s_ready) { httpd_resp_send_500(req); return ESP_FAIL; }
+  char nb64[25];
+  LOCK();
+  issueNonce(nb64, sizeof(nb64));
+  UNLOCK();
+
+  StaticJsonDocument<64> doc;
+  doc["nonce"] = nb64;
+  char out[64];
+  serializeJson(doc, out);
+
+  httpd_resp_set_type(req, "application/json");
+  httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+  httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+  return httpd_resp_send(req, out, HTTPD_RESP_USE_STRLEN);
+}
+
 // POST /login body (JSON):
 //   { "epk": b64(32B browser ephemeral pub),
 //     "iv":  b64(12B),
 //     "ct":  b64(ciphertext),
 //     "tag": b64(16B GCM tag) }
-// Plaintext is JSON { "user":..., "pass":... }.
+// Plaintext is JSON { "user":..., "pass":..., "nonce":... }.  (nonce: issue #12)
 //
 // Memory: the big scratch buffers (ct/pt) and the request JSON are heap-
 // allocated, NOT stack, so this handler stays well within the httpd task stack.
@@ -454,13 +545,23 @@ static esp_err_t login_handler(httpd_req_t *req) {
     if (ptlen < 0 || ptlen >= 1024) { failReason = "decrypt"; httpStatusFail = 401; break; }
     ptbuf[ptlen] = '\0';
 
-    StaticJsonDocument<256> creds;
+    StaticJsonDocument<320> creds;
     if (deserializeJson(creds, (const char *)ptbuf)) {
       mbedtls_platform_zeroize(ptbuf, 1024);
       failReason = "bad-creds"; httpStatusFail = 400; break;
     }
-    const char *user = creds["user"] | "";
-    const char *pass = creds["pass"] | "";
+    const char *user  = creds["user"]  | "";
+    const char *pass  = creds["pass"]  | "";
+    const char *nonce = creds["nonce"] | "";
+
+    // Issue #12: verify + consume the replay nonce (inside the encrypted body).
+    LOCK();
+    bool nonceOk = consumeNonce(nonce);
+    UNLOCK();
+    if (!nonceOk) {
+      mbedtls_platform_zeroize(ptbuf, 1024);
+      failReason = "bad-nonce"; httpStatusFail = 401; break;
+    }
 
     bool credsOk = ctEqual(user, CONFIG_HTTP_USER) && ctEqual(pass, CONFIG_HTTP_PASS);
     mbedtls_platform_zeroize(ptbuf, 1024);   // wipe decrypted credentials ASAP
@@ -517,8 +618,10 @@ static esp_err_t login_handler(httpd_req_t *req) {
 
 void registerCryptoAuthHandlers(httpd_handle_t server) {
   httpd_uri_t pubkey_uri = { .uri = "/pubkey", .method = HTTP_GET,  .handler = pubkey_handler, .user_ctx = NULL };
+  httpd_uri_t nonce_uri  = { .uri = "/nonce",  .method = HTTP_GET,  .handler = nonce_handler,  .user_ctx = NULL };
   httpd_uri_t login_uri  = { .uri = "/login",  .method = HTTP_POST, .handler = login_handler,  .user_ctx = NULL };
   httpd_register_uri_handler(server, &pubkey_uri);
+  httpd_register_uri_handler(server, &nonce_uri);
   httpd_register_uri_handler(server, &login_uri);
-  Serial.println("[Crypto] Registered /pubkey (GET) and /login (POST)");
+  Serial.println("[Crypto] Registered /pubkey (GET), /nonce (GET) and /login (POST)");
 }
