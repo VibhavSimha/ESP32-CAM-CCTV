@@ -112,6 +112,9 @@ select cron.schedule(
 - The job name `cctv-fifo-evict` must be unique; re-running `cron.schedule` with the
   same name updates it.
 
+> **Note:** `YOUR_PROJECT_REF` appears here **and** in the trigger variant below. If
+> you use both or switch between them, update every occurrence to the same value.
+
 ## Step 3 — Verify it works
 Run these checks a minute or two after scheduling (let the job fire at least once).
 
@@ -166,19 +169,20 @@ cron sweep, but never exceeds N):
 ```sql
 create or replace function public.cctv_evict_old_frames()
 returns trigger language plpgsql security definer as $$
+declare
+  svc_key text;
 begin
   if new.bucket_id = 'cctv-clips' and new.name like 'events/%' then
+    -- Read the service_role key from Vault once per trigger execution.
+    select decrypted_secret into svc_key
+    from vault.decrypted_secrets where name = 'service_role_key';
     -- Delete each object beyond the newest 200 via the Storage API (pg_net).
     perform net.http_delete(
       url := 'https://YOUR_PROJECT_REF.supabase.co/storage/v1/object/cctv-clips/'
              || obj.name,
       headers := jsonb_build_object(
-        'Authorization',
-        'Bearer ' || (select decrypted_secret from vault.decrypted_secrets
-                      where name = 'service_role_key'),
-        'apikey',
-        (select decrypted_secret from vault.decrypted_secrets
-         where name = 'service_role_key')
+        'Authorization', 'Bearer ' || svc_key,
+        'apikey', svc_key
       )
     )
     from (
