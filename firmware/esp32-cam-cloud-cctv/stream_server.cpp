@@ -415,17 +415,19 @@ static esp_err_t view_handler(httpd_req_t *req) {
         "function streamUrl(){return '/stream?token='+encodeURIComponent(SID);}"
         // Issue #25: logout() clears the persisted session and shows the login form.
         // Called when a session proves invalid (e.g. device rebooted mid-stream).
-        "function logout(){"
+        // An optional msg overrides the default "Session expired" text so that an
+        // explicit user-initiated logout can show a more appropriate message.
+        "function logout(msg){"
         "SID=null;localStorage.removeItem('esp32_sid');"
         "document.getElementById('app').style.display='none';"
         "document.getElementById('loginBox').style.display='';"
-        "document.getElementById('lerr').textContent='Session expired \u2014 please log in again.';"
+        "document.getElementById('lerr').textContent=msg||'Session expired \u2014 please log in again.';"
         "}"
         // Issue #25: explicit logout triggered by the Logout button — stop the
         // stream first so no further /stream requests fire after clearing SID.
         "function handleLogout(){"
         "document.getElementById('cam').removeAttribute('src');"
-        "logout();"
+        "logout('Logged out.');"
         "}"
         // Issue #25: shared helper to validate the current SID against the device.
         // Returns the fetch Response on any HTTP reply, or null if the device is
@@ -509,6 +511,9 @@ static esp_err_t view_handler(httpd_req_t *req) {
         "document.getElementById('loginBox').style.display='none';"
         "document.getElementById('pinWarn').style.display='none';"
         "document.getElementById('app').style.display='flex';"
+        // Issue #25: reset counter so re-login after auth failure doesn't trigger an
+        // immediate URL check on the very first stream error.
+        "failedReconnects=0;"
         // Issue #25: logout button clears the persisted session and returns to login.
         "document.getElementById('logoutBtn').onclick=handleLogout;"
         "const cam=document.getElementById('cam');"
@@ -586,9 +591,11 @@ static esp_err_t view_handler(httpd_req_t *req) {
         "if(rv&&rv.ok){startApp();return;}"
         // Explicit rejection (401/403): session genuinely expired — call logout() to
         // clear SID + localStorage and show a helpful "Session expired" message.
-        // On network error (rv===null) the device may be temporarily unreachable;
-        // keep the token in localStorage so the next page load can try again.
-        "if(isAuthError(rv)){logout();}"
+        "if(isAuthError(rv)){logout();return;}"
+        // Network error (rv===null): device temporarily unreachable — keep the token
+        // in localStorage for the next load, but show a brief message in the login form
+        // so the user understands why they see it with an apparently still-valid session.
+        "if(!rv)document.getElementById('lerr').textContent='Device unreachable \u2014 check your connection.';"
         "})();"
         "</script>"
         "</body></html>";
