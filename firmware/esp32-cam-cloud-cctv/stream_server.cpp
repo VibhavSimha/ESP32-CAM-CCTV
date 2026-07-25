@@ -391,22 +391,52 @@ static esp_err_t view_handler(httpd_req_t *req) {
         // Issue #10: an <img> can't send X-Session, so the MJPEG stream carries
         // the session as a ?token= query param instead.
         "function streamUrl(){return '/stream?token='+encodeURIComponent(SID);}"
+        // A stream failure is transient (tunnel hiccup, socket purge, flash
+        // toggle). Reconnect with the SAME session instead of forcing the user
+        // back to the login screen ("logout on stream failure"). A single
+        // guarded, delayed reconnect avoids stacking many parallel /stream
+        // sockets when onerror fires repeatedly.
+        "let streamPaused=false;let reconnectPending=false;"
+        "function connectStream(){"
+        "reconnectPending=false;"
+        "if(streamPaused)return;"
+        "document.getElementById('cam').src=streamUrl()+'&_='+Date.now();"
+        "}"
+        "function scheduleReconnect(){"
+        "if(reconnectPending||streamPaused)return;"
+        "reconnectPending=true;"
+        "document.getElementById('st').textContent='Stream error \\u2014 reconnecting...';"
+        "setTimeout(connectStream,1500);"
+        "}"
         "function startApp(){"
         "document.getElementById('loginBox').style.display='none';"
         "document.getElementById('pinWarn').style.display='none';"
         "document.getElementById('app').style.display='flex';"
         "const cam=document.getElementById('cam');"
-        "cam.src=streamUrl();"
         "cam.onload=()=>{document.getElementById('st').textContent='MJPEG LIVE \\u25cf';};"
-        "cam.onerror=()=>{document.getElementById('st').textContent='Stream error — retrying...';setTimeout(()=>cam.src=streamUrl()+'&_='+Date.now(),1500);};"
+        "cam.onerror=()=>{scheduleReconnect();};"
+        "connectStream();"
         "initFlash();initUpload();"
         "}"
         "async function initFlash(){"
         "const btn=document.getElementById('flashBtn');"
+        "const cam=document.getElementById('cam');"
         "async function sync(state){btn.className=state?'on':'off';btn.textContent=(state?'\\u26A1 Flash: ON':'\\u26A1 Flash: OFF');btn.dataset.s=state?1:0;}"
         // Read current global flash state from firmware on load.
         "try{const j=await (await auth('/flash')).json();sync(!!j.flash);}catch(e){}"
-        "btn.onclick=async()=>{const ns=(btn.dataset.s==='1')?0:1;try{const j=await (await auth('/flash?s='+ns)).json();sync(!!j.flash);}catch(e){console.error(e);}};"
+        // The firmware HTTPD serves requests on a single task, so the long-lived
+        // MJPEG /stream handler blocks it. Issuing /flash while streaming forces
+        // the server to purge the live stream socket, dropping the stream
+        // ("stream failure on flash toggle"). Briefly pause the stream so the
+        // HTTPD task is free to answer /flash, then resume with the same session.
+        "btn.onclick=async()=>{"
+        "const ns=(btn.dataset.s==='1')?0:1;"
+        "const wasStreaming=!!cam.getAttribute('src');"
+        "if(wasStreaming){streamPaused=true;cam.removeAttribute('src');}"
+        "try{const j=await (await auth('/flash?s='+ns)).json();sync(!!j.flash);}"
+        "catch(e){console.error(e);}"
+        "finally{if(wasStreaming){streamPaused=false;setTimeout(connectStream,300);}}"
+        "};"
         "}"
         "function initUpload(){"
         // Issue #10: the Supabase values MUST be quoted JS strings. JSQ() wraps
