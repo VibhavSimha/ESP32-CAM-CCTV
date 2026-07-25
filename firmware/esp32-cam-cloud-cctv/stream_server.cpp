@@ -349,6 +349,12 @@ static esp_err_t view_handler(httpd_req_t *req) {
         // after a tunnel URL change) do not force re-login. SID starts as the cached
         // value; init() validates it against the device and calls startApp() directly
         // when the session is still live, skipping the login form entirely.
+        // Security note: localStorage is accessible to any same-origin JS. The device
+        // already sets an httpOnly Set-Cookie (sid=) which the browser sends on every
+        // request, but JS cannot read httpOnly cookies. Using localStorage means we can
+        // restore SID in JS. The tradeoff is acceptable for a LAN/tunnel CCTV device
+        // where XSS is not the primary threat vector, but operators should ensure the
+        // /view page is not served alongside untrusted third-party content.
         "let SID=localStorage.getItem('esp32_sid');"
         // Module-level Supabase client — needed both for the frame uploader (initUpload)
         // and the reconnect URL check (reconnectWithUrlCheck), so it is created once
@@ -430,6 +436,8 @@ static esp_err_t view_handler(httpd_req_t *req) {
         "return await fetch('/flash',{headers:{'X-Session':SID}});"
         "}catch(e){console.warn('[auth] Session check failed:',e);return null;}"
         "}"
+        // Helper: true when the device explicitly rejected the session token.
+        "function isAuthError(rv){return !!(rv&&(rv.status===401||rv.status===403));}"
         // A stream failure is transient (tunnel hiccup, socket purge, flash
         // toggle). Reconnect with the SAME session instead of forcing the user
         // back to the login screen ("logout on stream failure"). A single
@@ -468,7 +476,7 @@ static esp_err_t view_handler(httpd_req_t *req) {
         // same hostname cannot redirect users to a different service.
         // nu.host includes the port (e.g. 'bore.pub:60781'), so when the bore port
         // changes, nu.host differs from window.location.host — this is the trigger.
-        "const nuPort=parseInt(nu.port||'0',10);"
+        "const nuPort=parseInt(nu.port||(nu.protocol==='http:'?'80':'443'),10);"
         "if((nu.protocol==='http:'||nu.protocol==='https:')&&"
         "nu.hostname===window.location.hostname&&"
         "nuPort>1024&&"
@@ -486,7 +494,7 @@ static esp_err_t view_handler(httpd_req_t *req) {
         // Tunnel URL unchanged — validate the session before retrying.
         "if(SID){"
         "const rv=await checkSession();"
-        "if(rv&&(rv.status===401||rv.status===403)){logout();return;}"
+        "if(isAuthError(rv)){logout();return;}"
         "}"
         "connectStream();"
         "}"
@@ -580,7 +588,7 @@ static esp_err_t view_handler(httpd_req_t *req) {
         // clear SID + localStorage and show a helpful "Session expired" message.
         // On network error (rv===null) the device may be temporarily unreachable;
         // keep the token in localStorage so the next page load can try again.
-        "if(rv&&(rv.status===401||rv.status===403)){logout();}"
+        "if(isAuthError(rv)){logout();}"
         "})();"
         "</script>"
         "</body></html>";
