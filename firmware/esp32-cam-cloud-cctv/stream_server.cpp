@@ -459,9 +459,14 @@ static esp_err_t view_handler(httpd_req_t *req) {
         // whole reconnect flow; just skip the redirect and try the stream again.
         "try{"
         "const nu=new URL(data[0].url);"
-        // Only redirect to http/https to prevent protocol-based attacks if the
-        // Supabase database is ever compromised.
-        "if((nu.protocol==='http:'||nu.protocol==='https:')&&nu.host!==window.location.host){"
+        // Only redirect to http/https AND to the same hostname — bore.pub tunnels only
+        // change the port, never the host. Restricting to the same hostname prevents
+        // open-redirect attacks if the Supabase database is ever compromised (an attacker
+        // could not redirect users to a different domain, only to a different port on the
+        // same bore server they already trust).
+        "if((nu.protocol==='http:'||nu.protocol==='https:')&&"
+        "nu.hostname===window.location.hostname&&"
+        "nu.host!==window.location.host){"
         "document.getElementById('st').textContent='Tunnel URL changed \u2014 redirecting...';"
         "window.location.href=nu.origin+'/view';"
         "return;"
@@ -562,10 +567,11 @@ static esp_err_t view_handler(httpd_req_t *req) {
         "const rv=await checkSession();"
         // rv.ok covers 2xx; /flash always returns 200 on success so this is exact.
         "if(rv&&rv.ok){startApp();return;}"
-        // Explicit rejection (401/403): session genuinely expired — clear the cache
-        // so the login form appears clean. On network error (rv===null) the device
-        // may just be temporarily unreachable; keep the token for the next load.
-        "if(rv&&(rv.status===401||rv.status===403)){localStorage.removeItem('esp32_sid');SID=null;}"
+        // Explicit rejection (401/403): session genuinely expired — call logout() to
+        // clear SID + localStorage and show a helpful "Session expired" message.
+        // On network error (rv===null) the device may be temporarily unreachable;
+        // keep the token in localStorage so the next page load can try again.
+        "if(rv&&(rv.status===401||rv.status===403)){logout();}"
         "})();"
         "</script>"
         "</body></html>";
