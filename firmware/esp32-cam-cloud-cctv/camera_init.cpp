@@ -2,19 +2,18 @@
 #include <Arduino.h>
 #include "camera_pins.h"
 
-#include "esp32-hal-ledc.h"
 #include "esp_camera.h"
 
-static int ledDuty = 0;
-static bool ledStreaming = false;
-
+// The flash LED (LED_GPIO_NUM / GPIO4 on the AI-Thinker board) is driven with a
+// single, plain-digital mechanism throughout the firmware. An earlier version
+// attached this pin to an LEDC PWM channel here while stream_server.cpp drove
+// the very same pin with pinMode()/digitalWrite(); the two owners fought over
+// the pad, producing a glitchy LED and transient instability whenever the flash
+// was toggled during a stream. Using digital output everywhere removes that
+// contention.
 static void enableLed(bool on) {
 #if defined(LED_GPIO_NUM)
-  int duty = on ? ledDuty : 0;
-  if (on && ledStreaming && ledDuty > 255) {
-    duty = 255;
-  }
-  ledcWrite(LED_GPIO_NUM, duty);
+  digitalWrite(LED_GPIO_NUM, on ? HIGH : LOW);
 #endif
 }
 
@@ -81,12 +80,12 @@ esp_err_t initCamera() {
 }
 
 void setupLedFlash(int pin) {
-  ledcAttach(pin, 5000, 8);
-  ledDuty = 0;
+  pinMode(pin, OUTPUT);
+  digitalWrite(pin, LOW);
 }
 
 void cameraSetStreaming(bool streaming) {
-  ledStreaming = streaming;
+  (void)streaming;
 }
 
 void cameraLedForCapture(bool on) {
