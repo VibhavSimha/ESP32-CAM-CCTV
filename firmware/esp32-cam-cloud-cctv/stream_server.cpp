@@ -275,8 +275,9 @@ static esp_err_t view_handler(httpd_req_t *req) {
     //
     // Issue #12: the login crypto no longer depends on window.crypto.subtle
     // (undefined over plain http://). It uses TweetNaCl for X25519 and the
-    // @noble/ciphers + @noble/hashes UMD *bundles*, which expose the browser
-    // globals `nobleCiphers` and `nobleHashes` and run in ANY context.
+    // @noble/ciphers + @noble/hashes ES modules (loaded via jsDelivr's `+esm`
+    // endpoint and re-exposed as the browser globals `nobleCiphers` and
+    // `nobleHashes`), which run in ANY context.
     // crypto.getRandomValues (available without a secure context) supplies the IV
     // and the ephemeral private key.
     //
@@ -325,11 +326,19 @@ static esp_err_t view_handler(httpd_req_t *req) {
         "</div>"
         // TweetNaCl -> global `nacl` (X25519 via nacl.scalarMult).
         "<script src='https://cdn.jsdelivr.net/npm/tweetnacl@1.0.3/nacl.min.js'></script>"
-        // @noble UMD bundles -> globals `nobleHashes` (hkdf, sha256) and
-        // `nobleCiphers` (gcm). bundled.js is the UMD entry point that defines
-        // window globals (hashes.js / cipher.js do not exist at these versions).
-        "<script src='https://cdn.jsdelivr.net/npm/@noble/hashes@1.3.3/bundled.js'></script>"
-        "<script src='https://cdn.jsdelivr.net/npm/@noble/ciphers@0.4.1/bundled.js'></script>"
+        // @noble/hashes and @noble/ciphers ship NO UMD/global bundle (there is no
+        // bundled.js), and their package roots have no entry-point, so a classic
+        // <script src> can't create window globals. Load the exact primitives we
+        // need as ES modules from jsDelivr's `+esm` endpoint (self-contained,
+        // dependency-inlined) and expose them as the globals `nobleHashes`
+        // (hkdf, sha256) and `nobleCiphers` (gcm) that the login code expects.
+        // ESM works over plain http:// (no secure context required).
+        "<script type='module'>"
+        "import { gcm } from 'https://cdn.jsdelivr.net/npm/@noble/ciphers@0.4.1/aes/+esm';"
+        "import { hkdf } from 'https://cdn.jsdelivr.net/npm/@noble/hashes@1.3.3/hkdf/+esm';"
+        "import { sha256 } from 'https://cdn.jsdelivr.net/npm/@noble/hashes@1.3.3/sha256/+esm';"
+        "window.nobleCiphers={gcm};window.nobleHashes={hkdf,sha256};"
+        "</script>"
         "<script src='https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2'></script>"
         "<script>"
         // Pinned device pubkey (b64), empty when not yet pinned (see config.h).
@@ -337,8 +346,9 @@ static esp_err_t view_handler(httpd_req_t *req) {
         "let SID=null;"
         "const b64=b=>btoa(String.fromCharCode(...new Uint8Array(b)));"
         "const ub64=s=>Uint8Array.from(atob(s),c=>c.charCodeAt(0));"
-        // Resolve crypto primitives from the @noble UMD globals. If any are
-        // missing we abort with a clear message (no silent broken login).
+        // Resolve crypto primitives from the @noble globals set by the ESM loader
+        // above. If any are missing we abort with a clear message (no silent
+        // broken login).
         "function nobleReady(){return (typeof nobleHashes!=='undefined')&&(typeof nobleCiphers!=='undefined')&&nobleHashes.hkdf&&nobleHashes.sha256&&nobleCiphers.gcm;}"
         "function deriveAes(shared){"
         "const info=new TextEncoder().encode('esp32cam-ecdh-aes256gcm');"
