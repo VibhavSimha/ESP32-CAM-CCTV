@@ -306,6 +306,7 @@ static esp_err_t view_handler(httpd_req_t *req) {
         "#st{margin-top:12px;font-size:14px;font-family:monospace;color:#3fb950}"
         "button{margin-top:16px;padding:10px 20px;color:white;border:none;border-radius:6px;cursor:pointer;font-weight:bold;font-size:14px;transition:0.2s}"
         "#flashBtn.on{background:#d29922}#flashBtn.off{background:#30363d}"
+        "#logoutBtn{background:#b62324;margin-top:8px;font-size:12px;padding:6px 14px}"
         "#loginBox{background:#161b22;padding:24px;border-radius:8px;border:1px solid #30363d;display:flex;flex-direction:column;gap:10px}"
         "#loginBox input{padding:8px;border-radius:6px;border:1px solid #30363d;background:#0d1117;color:#c9d1d9}"
         "#loginBtn{background:#238636}#app{display:none;flex-direction:column;align-items:center}"
@@ -323,6 +324,7 @@ static esp_err_t view_handler(httpd_req_t *req) {
         "<img id='cam' width='640' height='480' alt='Loading stream...'>"
         "<div id='st'>Connecting to stream...</div>"
         "<button id='flashBtn' class='off'>\u26A1 Flash: OFF</button>"
+        "<button id='logoutBtn'>\u274C Logout</button>"
         "</div>"
         // TweetNaCl -> global `nacl` (X25519 via nacl.scalarMult).
         "<script src='https://cdn.jsdelivr.net/npm/tweetnacl@1.0.3/nacl.min.js'></script>"
@@ -343,7 +345,21 @@ static esp_err_t view_handler(httpd_req_t *req) {
         "<script>"
         // Pinned device pubkey (b64), empty when not yet pinned (see config.h).
         "const PIN=" JSQ(CONFIG_DEVICE_PUBKEY_B64) ";"
-        "let SID=null;"
+        // Issue #25: session token persisted in localStorage so page reloads (e.g.
+        // after a tunnel URL change) do not force re-login. SID starts as the cached
+        // value; init() validates it against the device and calls startApp() directly
+        // when the session is still live, skipping the login form entirely.
+        // Security note: localStorage is accessible to any same-origin JS. The device
+        // already sets an httpOnly Set-Cookie (sid=) which the browser sends on every
+        // request, but JS cannot read httpOnly cookies. Using localStorage means we can
+        // restore SID in JS. The tradeoff is acceptable for a LAN/tunnel CCTV device
+        // where XSS is not the primary threat vector, but operators should ensure the
+        // /view page is not served alongside untrusted third-party content.
+        "let SID=localStorage.getItem('esp32_sid');"
+        // Module-level Supabase client — needed both for the frame uploader (initUpload)
+        // and the reconnect URL check (reconnectWithUrlCheck), so it is created once
+        // here rather than inside initUpload().
+        "const sb=supabase.createClient(" JSQ(SUPABASE_URL) "," JSQ(SUPABASE_ANON_KEY) ");"
         "const b64=b=>btoa(String.fromCharCode(...new Uint8Array(b)));"
         "const ub64=s=>Uint8Array.from(atob(s),c=>c.charCodeAt(0));"
         // Resolve crypto primitives from the @noble globals set by the ESM loader
@@ -388,6 +404,8 @@ static esp_err_t view_handler(httpd_req_t *req) {
         "if(r.status===503){le.textContent='Device busy \u2014 retrying...';const ra=parseInt(r.headers.get('Retry-After')||'5',10);setTimeout(doLogin,(isNaN(ra)?5:ra)*1000);return;}"
         "if(!r.ok){le.textContent='Login failed ('+r.status+' '+(await r.text())+')';return;}"
         "SID=(await r.json()).token;"
+        // Issue #25: persist token so the next page load restores the session.
+        "localStorage.setItem('esp32_sid',SID);"
         "startApp();"
         "}catch(e){le.textContent='Login error: '+e.message;console.error(e);}"
         "}"
@@ -395,29 +413,112 @@ static esp_err_t view_handler(httpd_req_t *req) {
         // Issue #10: an <img> can't send X-Session, so the MJPEG stream carries
         // the session as a ?token= query param instead.
         "function streamUrl(){return '/stream?token='+encodeURIComponent(SID);}"
+        // Issue #25: logout() clears the persisted session and shows the login form.
+        // Called when a session proves invalid (e.g. device rebooted mid-stream).
+        // An optional msg overrides the default "Session expired" text so that an
+        // explicit user-initiated logout can show a more appropriate message.
+        "function logout(msg){"
+        "SID=null;localStorage.removeItem('esp32_sid');"
+        "document.getElementById('app').style.display='none';"
+        "document.getElementById('loginBox').style.display='';"
+        "document.getElementById('lerr').textContent=msg||'Session expired \u2014 please log in again.';"
+        "}"
+        // Issue #25: explicit logout triggered by the Logout button — stop the
+        // stream first so no further /stream requests fire after clearing SID.
+        "function handleLogout(){"
+        "document.getElementById('cam').removeAttribute('src');"
+        "logout('Logged out.');"
+        "}"
+        // Issue #25: shared helper to validate the current SID against the device.
+        // Returns the fetch Response on any HTTP reply, or null if the device is
+        // unreachable (network/TLS error). Callers decide how to react to each case.
+        "async function checkSession(){"
+        "if(!SID)return null;"
+        "try{"
+        "return await fetch('/flash',{headers:{'X-Session':SID}});"
+        "}catch(e){console.warn('[auth] Session check failed:',e);return null;}"
+        "}"
+        // Helper: true when the device explicitly rejected the session token.
+        "function isAuthError(rv){return !!(rv&&(rv.status===401||rv.status===403));}"
         // A stream failure is transient (tunnel hiccup, socket purge, flash
         // toggle). Reconnect with the SAME session instead of forcing the user
         // back to the login screen ("logout on stream failure"). A single
         // guarded, delayed reconnect avoids stacking many parallel /stream
         // sockets when onerror fires repeatedly.
-        "let streamPaused=false;let reconnectPending=false;"
+        // Issue #25: track consecutive failures so after 3 we check whether the
+        // tunnel URL has changed in Supabase and redirect if so, and also validate
+        // the session (device reboot invalidates in-RAM sessions).
+        "let streamPaused=false;let reconnectPending=false;let failedReconnects=0;"
         "function connectStream(){"
         "reconnectPending=false;"
         "if(streamPaused)return;"
         "document.getElementById('cam').src=streamUrl()+'&_='+Date.now();"
         "}"
+        // Issue #25: after 3 consecutive failures, query Supabase for the latest
+        // tunnel URL. If the bore port changed, redirect there (session survives
+        // because it is now in localStorage). Also do a quick session check so a
+        // device reboot (which wipes in-RAM sessions) triggers a prompt to re-login
+        // rather than silently looping forever.
+        "async function reconnectWithUrlCheck(){"
+        "try{"
+        "const {data,error}=await sb.from('camera_status').select('url').order('created_at',{ascending:false}).limit(1);"
+        // camera_status is scoped to a single-device Supabase project; no device-ID
+        // filter is needed. The latest row is always this device's URL.
+        "if(!error&&Array.isArray(data)&&data.length>0&&data[0]&&data[0].url){"
+        // Wrap URL parsing separately so a malformed value doesn't abort the
+        // whole reconnect flow; just skip the redirect and try the stream again.
+        // new URL() throws on relative URLs and on schemes like 'javascript:' so those
+        // are rejected automatically before the protocol check below is even reached.
+        "try{"
+        "const nu=new URL(data[0].url);"
+        // bore.pub tunnels only change the *port* on the same hostname, never the
+        // domain. Requiring same hostname prevents open-redirect to external domains
+        // even if the Supabase row is tampered with. Only http/https are accepted.
+        // The port must be >1024 so a crafted low-port URL (e.g. :80, :443) on the
+        // same hostname cannot redirect users to a different service.
+        // nu.host includes the port (e.g. 'bore.pub:60781'), so when the bore port
+        // changes, nu.host differs from window.location.host — this is the trigger.
+        "const nuPort=parseInt(nu.port||(nu.protocol==='http:'?'80':'443'),10);"
+        "if((nu.protocol==='http:'||nu.protocol==='https:')&&"
+        "nu.hostname===window.location.hostname&&"
+        "nuPort>1024&&"
+        "nu.host!==window.location.host){"
+        "document.getElementById('st').textContent='Tunnel URL changed \u2014 redirecting...';"
+        "window.location.href=nu.origin+'/view';"
+        "return;"
+        "}"
+        "}catch(ue){console.warn('[reconnect] Bad URL in camera_status:',data[0].url,ue);}"
+        "}"
+        "}catch(e){"
+        "document.getElementById('st').textContent='Stream error \u2014 DB unreachable, retrying...';"
+        "console.warn('[reconnect] Supabase URL check failed:',e);"
+        "}"
+        // Tunnel URL unchanged — validate the session before retrying.
+        "if(SID){"
+        "const rv=await checkSession();"
+        "if(isAuthError(rv)){logout();return;}"
+        "}"
+        "connectStream();"
+        "}"
         "function scheduleReconnect(){"
         "if(reconnectPending||streamPaused)return;"
         "reconnectPending=true;"
-        "document.getElementById('st').textContent='Stream error \\u2014 reconnecting...';"
-        "setTimeout(connectStream,1500);"
+        "failedReconnects++;"
+        "document.getElementById('st').textContent='Stream error \u2014 reconnecting...';"
+        "setTimeout(failedReconnects>=3?reconnectWithUrlCheck:connectStream,1500);"
         "}"
         "function startApp(){"
         "document.getElementById('loginBox').style.display='none';"
         "document.getElementById('pinWarn').style.display='none';"
         "document.getElementById('app').style.display='flex';"
+        // Issue #25: reset counter so re-login after auth failure doesn't trigger an
+        // immediate URL check on the very first stream error.
+        "failedReconnects=0;"
+        // Issue #25: logout button clears the persisted session and returns to login.
+        "document.getElementById('logoutBtn').onclick=handleLogout;"
         "const cam=document.getElementById('cam');"
-        "cam.onload=()=>{document.getElementById('st').textContent='MJPEG LIVE \\u25cf';};"
+        // Issue #25: reset the failure counter each time a frame loads successfully.
+        "cam.onload=()=>{failedReconnects=0;document.getElementById('st').textContent='MJPEG LIVE \\u25cf';};"
         "cam.onerror=()=>{scheduleReconnect();};"
         "connectStream();"
         "initFlash();initUpload();"
@@ -449,7 +550,8 @@ static esp_err_t view_handler(httpd_req_t *req) {
         "function initUpload(){"
         // Issue #10: the Supabase values MUST be quoted JS strings. JSQ() wraps
         // each macro's value in real quotes so createClient/bkt are valid JS.
-        "const sb=supabase.createClient(" JSQ(SUPABASE_URL) "," JSQ(SUPABASE_ANON_KEY) ");"
+        // Issue #25: use the module-level sb client (created at page load) rather
+        // than allocating a second client here.
         "const bkt=" JSQ(SUPABASE_BUCKET) ";const minGap=" STR(STORAGE_UPLOAD_MIN_GAP_MS) ";"
         "let idx=0;let inflight=false;let lastDone=0;"
         "const cam=document.getElementById('cam');"
@@ -477,6 +579,24 @@ static esp_err_t view_handler(httpd_req_t *req) {
         "requestAnimationFrame(tick);"
         "}"
         "document.getElementById('loginBtn').onclick=doLogin;"
+        // Issue #25: on page load, if a cached session token exists in localStorage,
+        // validate it with a lightweight authenticated request (/flash GET, no side
+        // effects). On success, skip the login form entirely and go straight to the
+        // live view. On failure (401/403 = device rebooted, 6 h TTL expired, or any
+        // network error), wipe the stale token and leave the login form visible.
+        "(async function init(){"
+        "if(!SID)return;"
+        "const rv=await checkSession();"
+        // rv.ok covers 2xx; /flash always returns 200 on success so this is exact.
+        "if(rv&&rv.ok){startApp();return;}"
+        // Explicit rejection (401/403): session genuinely expired — call logout() to
+        // clear SID + localStorage and show a helpful "Session expired" message.
+        "if(isAuthError(rv)){logout();return;}"
+        // Network error (rv===null): device temporarily unreachable — keep the token
+        // in localStorage for the next load, but show a brief message in the login form
+        // so the user understands why they see it with an apparently still-valid session.
+        "if(!rv)document.getElementById('lerr').textContent='Device unreachable \u2014 check your connection.';"
+        "})();"
         "</script>"
         "</body></html>";
 
