@@ -541,10 +541,19 @@ static bool _boreServe() {
     String uuid = _jStr(msg, "Connection");
     if (!uuid.length()) continue;
 
-    // Low heap guard: defer accepts under 35k free heap to protect WiFi stack
+    // Low heap guard: defer accepts under 35k free heap to protect WiFi stack.
+    // Issue #31: previously used `continue` (silently drops the UUID). Changed to
+    // buffer the UUID in _boreDeferredUUID so it is retried on the next
+    // _boreServe() call once heap recovers. Without this, a flash-toggle request
+    // that arrives while the stream holds heap at 30-35KB was permanently lost —
+    // bore.pub issues a UUID, ESP32 drops it, the browser's /flash fetch times out,
+    // and the LED never changes state. The deferred path retries up to bore.pub's
+    // UUID timeout window (~10s), by which time the stream proxy task has exited
+    // and heap has fully recovered to ~70KB.
     if (ESP.getFreeHeap() < 35000) {
-      Serial.printf("[Tunnel] Low heap (%u) — deferring accept to protect WiFi stack.\n",
+      Serial.printf("[Tunnel] Low heap (%u) — deferring accept (will retry).\n",
                     ESP.getFreeHeap());
+      _boreDeferredUUID = uuid; // buffer for retry once heap recovers
       continue;
     }
 
