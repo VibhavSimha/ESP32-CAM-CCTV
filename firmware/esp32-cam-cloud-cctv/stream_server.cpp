@@ -419,6 +419,10 @@ static esp_err_t view_handler(httpd_req_t *req) {
         // explicit user-initiated logout can show a more appropriate message.
         "function logout(msg){"
         "SID=null;localStorage.removeItem('esp32_sid');"
+        // Stop any lingering stream request and clear the retry guard so a
+        // subsequent login can immediately trigger scheduleReconnect if needed.
+        "document.getElementById('cam').removeAttribute('src');"
+        "reconnectPending=false;"
         "document.getElementById('app').style.display='none';"
         "document.getElementById('loginBox').style.display='';"
         "document.getElementById('lerr').textContent=msg||'Session expired \u2014 please log in again.';"
@@ -504,8 +508,25 @@ static esp_err_t view_handler(httpd_req_t *req) {
         "if(reconnectPending||streamPaused)return;"
         "reconnectPending=true;"
         "failedReconnects++;"
+        // After many consecutive failures show a manual refresh affordance so
+        // the user is never left with an endlessly spinning "reconnecting..." that
+        // never self-heals (e.g. bore port stuck on old URL).
+        // Build the link element programmatically (no innerHTML) to avoid any
+        // XSS risk and to keep CSP-friendly output.
+        "if(failedReconnects>12){"
+        "const st=document.getElementById('st');"
+        "st.textContent='Stream error \u2014 ';"
+        "const a=document.createElement('a');"
+        "a.href='#';a.style.color='#58a6ff';a.textContent='Refresh page';"
+        "a.onclick=function(e){e.preventDefault();location.reload();};"
+        "st.appendChild(a);"
+        "}else{"
         "document.getElementById('st').textContent='Stream error \u2014 reconnecting...';"
-        "setTimeout(failedReconnects>=3?reconnectWithUrlCheck:connectStream,1500);"
+        "}"
+        // 800ms is short enough to feel responsive after a tunnel drop yet long
+        // enough for the ESP32 proxy task to fully exit before the browser retries.
+        // (Was 1500ms — halving it visibly reduces the black-screen gap on reconnect.)
+        "setTimeout(failedReconnects>=3?reconnectWithUrlCheck:connectStream,800);"
         "}"
         "function startApp(){"
         "document.getElementById('loginBox').style.display='none';"
@@ -536,15 +557,26 @@ static esp_err_t view_handler(httpd_req_t *req) {
         // HTTPD task is free to answer /flash, then resume with the same session.
         // The button is latched busy for the duration so rapid double-clicks
         // can't stack overlapping pause/resume cycles (a source of instability).
+        //
+        // Latency improvements:
+        // 1. Sync the button label optimistically on click (instant visual feedback).
+        // 2. After stopping the stream, wait 250ms before sending the /flash request.
+        //    This lets the ESP32 bore proxy task fully exit and release the slot so
+        //    the new bore Connection for the flash request isn't dropped by the
+        //    anyStreaming guard in _boreServe().
+        // 3. Reconnect delay reduced from 300ms to 100ms (smaller gap after toggle).
+        // 4. Revert button to original state on network error so the UI stays consistent.
         "btn.onclick=async()=>{"
         "if(btn.dataset.busy==='1')return;"
         "btn.dataset.busy='1';btn.disabled=true;"
         "const ns=(btn.dataset.s==='1')?0:1;"
+        "sync(!!ns);" // optimistic: update UI before async /flash request completes
         "const wasStreaming=!!cam.getAttribute('src');"
-        "if(wasStreaming){streamPaused=true;cam.removeAttribute('src');}"
+        "if(wasStreaming){streamPaused=true;cam.removeAttribute('src');"
+        "await new Promise(r=>setTimeout(r,250));}" // let bore proxy slot clean up
         "try{const j=await (await auth('/flash?s='+ns)).json();sync(!!j.flash);}"
-        "catch(e){console.error(e);}"
-        "finally{btn.dataset.busy='0';btn.disabled=false;if(wasStreaming){streamPaused=false;setTimeout(connectStream,300);}}"
+        "catch(e){sync(!ns);console.error(e);}" // revert visual on error
+        "finally{btn.dataset.busy='0';btn.disabled=false;if(wasStreaming){streamPaused=false;setTimeout(connectStream,100);}}"
         "};"
         "}"
         "function initUpload(){"
@@ -582,20 +614,29 @@ static esp_err_t view_handler(httpd_req_t *req) {
         // Issue #25: on page load, if a cached session token exists in localStorage,
         // validate it with a lightweight authenticated request (/flash GET, no side
         // effects). On success, skip the login form entirely and go straight to the
-        // live view. On failure (401/403 = device rebooted, 6 h TTL expired, or any
-        // network error), wipe the stale token and leave the login form visible.
+        // live view. On failure (401/403 = device rebooted, 6 h TTL expired), wipe
+        // the stale token and show the login form.
+        // Network error (rv===null): device is temporarily unreachable (e.g. bore
+        // reconnecting after a reboot). Retry up to 3× at 3-second intervals before
+        // giving up and showing a manual "check your connection" message. This means
+        // the page auto-recovers within ~9 s when the device comes back online
+        // without needing a manual refresh.
         "(async function init(){"
         "if(!SID)return;"
+        "async function trySession(){"
         "const rv=await checkSession();"
-        // rv.ok covers 2xx; /flash always returns 200 on success so this is exact.
-        "if(rv&&rv.ok){startApp();return;}"
-        // Explicit rejection (401/403): session genuinely expired — call logout() to
-        // clear SID + localStorage and show a helpful "Session expired" message.
-        "if(isAuthError(rv)){logout();return;}"
-        // Network error (rv===null): device temporarily unreachable — keep the token
-        // in localStorage for the next load, but show a brief message in the login form
-        // so the user understands why they see it with an apparently still-valid session.
-        "if(!rv)document.getElementById('lerr').textContent='Device unreachable \u2014 check your connection.';"
+        "if(rv&&rv.ok){startApp();return true;}"
+        "if(isAuthError(rv)){logout();return true;}"
+        "return false;" // null = unreachable, caller should retry
+        "}"
+        "if(await trySession())return;"
+        "const MAX_RETRIES=3;"
+        "for(let i=0;i<MAX_RETRIES;i++){"
+        "document.getElementById('lerr').textContent='Device unreachable \u2014 retrying ('+(i+1)+'/'+MAX_RETRIES+')...';"
+        "await new Promise(r=>setTimeout(r,3000));"
+        "if(await trySession())return;"
+        "}"
+        "document.getElementById('lerr').textContent='Device unreachable \u2014 check your connection.';"
         "})();"
         "</script>"
         "</body></html>";

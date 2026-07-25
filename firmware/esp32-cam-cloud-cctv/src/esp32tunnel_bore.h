@@ -56,6 +56,14 @@ static TaskHandle_t _boreProxyTaskHandle[BORE_MAX_PROXY] = {nullptr};
 struct _BoreProxyArg { int slot; };
 static _BoreProxyArg _boreProxyArgs[BORE_MAX_PROXY];
 
+// When a Connection arrives while streaming is active we defer it rather than
+// drop it.  Saving the UUID here means the *next* _boreServe() iteration —
+// which runs on every main-loop tick — can accept it as soon as the streaming
+// slot is released.  Without buffering, a flash-toggle request sent right
+// after the browser closes the stream src races with the proxy-task exit and
+// the Connection message gets dropped, causing the request to time out.
+static String _boreDeferredUUID = "";
+
 // ---------------------------------------------------------------------------
 // MARK: Null-delimited JSON read — reads until \0 or timeout
 // ---------------------------------------------------------------------------
@@ -461,6 +469,35 @@ static bool _boreInit() {
 
 static unsigned long _lastBorePing = 0;
 
+// Helper: try to spawn an accept task for a given UUID on any free slot.
+// Returns true when the task was successfully enqueued, false otherwise.
+static bool _boreAcceptDeferred(const String &uuid) {
+  if (ESP.getFreeHeap() < 35000) return false;
+  int slot = -1;
+  for (int i = 0; i < BORE_MAX_PROXY; i++) {
+    if (!_slotBusy[i]) { slot = i; break; }
+  }
+  if (slot < 0) return false;
+  _slotBusy[slot] = true;
+  struct _BoreDeferredAcceptArgs { String uuid; int slot; };
+  auto *dargs = new (std::nothrow) _BoreDeferredAcceptArgs{uuid, slot};
+  if (!dargs) { _slotBusy[slot] = false; return false; }
+  BaseType_t ok = xTaskCreatePinnedToCore([](void *p) {
+    auto *a = (_BoreDeferredAcceptArgs*)p;
+    _boreAccept(a->uuid, a->slot);
+    delete a;
+    vTaskDelete(nullptr);
+  }, "boreProxy", 6144, dargs, 1, nullptr, TUN_TASK_CORE);
+  if (ok != pdPASS) {
+    Serial.printf("[Tunnel] Slot %d: FAILED to spawn deferred accept (heap=%u). Releasing.\n",
+                  slot, ESP.getFreeHeap());
+    delete dargs;
+    _slotBusy[slot] = false;
+    return false;
+  }
+  return true;
+}
+
 static bool _boreServe() {
   if (!_boreCtrl.connected()) return false;
 
@@ -471,6 +508,24 @@ static bool _boreServe() {
     if (_boreCtrl.getWriteError()) {
       Serial.printf("[Tunnel] ERROR: Control socket write failed (silent drop detected)!\n");
       return false;
+    }
+  }
+
+  // Process any previously buffered Connection (deferred because a slot was
+  // streaming).  Now that we're back in the main loop, check whether the slot
+  // has been released and accept the request if so.
+  if (_boreDeferredUUID.length() > 0) {
+    bool anyActive = false;
+    for (int i = 0; i < BORE_MAX_PROXY; i++) {
+      if (_slotBusy[i] && _slotLastActive[i] != 0 && !_slotBackpressured[i]) {
+        anyActive = true; break;
+      }
+    }
+    if (!anyActive) {
+      Serial.printf("[Tunnel] Processing deferred UUID=%s\n", _boreDeferredUUID.c_str());
+      String deferred = _boreDeferredUUID;
+      _boreDeferredUUID = "";
+      _boreAcceptDeferred(deferred); // best-effort; ignore failure (bore will retry)
     }
   }
 
@@ -493,7 +548,12 @@ static bool _boreServe() {
       continue;
     }
 
-    // Defer speculative 2nd connection while a slot is actively streaming
+    // Defer speculative 2nd connection while a slot is actively streaming.
+    // Instead of dropping the UUID, save it so the next _boreServe() iteration
+    // can accept it once the stream slot is released.  This prevents the race
+    // where a flash-toggle request arrives just before the proxy task exits —
+    // without buffering the Connection message would be silently lost and the
+    // /flash fetch would time out.
     bool anyStreaming = false;
     for (int i = 0; i < BORE_MAX_PROXY; i++) {
       if (_slotBusy[i] && _slotLastActive[i] != 0 && !_slotBackpressured[i]) {
@@ -502,7 +562,8 @@ static bool _boreServe() {
       }
     }
     if (anyStreaming) {
-      Serial.printf("[Tunnel] Active stream in progress — deferring 2nd accept to save heap.\n");
+      Serial.printf("[Tunnel] Active stream in progress — buffering 2nd accept UUID for retry.\n");
+      _boreDeferredUUID = uuid; // overwrite: only the most-recent pending request matters
       continue;
     }
 
