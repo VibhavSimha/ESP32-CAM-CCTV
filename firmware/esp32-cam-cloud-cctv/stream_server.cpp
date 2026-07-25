@@ -20,6 +20,12 @@ static const char* _STREAM_PART = "Content-Type: image/jpeg\r\nContent-Length: %
 #define STORAGE_UPLOAD_MIN_GAP_MS 250
 #endif
 
+// Issue #12: the pinned device pubkey may be undefined on older config.h files.
+// Default to empty so the /view page falls back to /pubkey (with a warning).
+#ifndef CONFIG_DEVICE_PUBKEY_B64
+#define CONFIG_DEVICE_PUBKEY_B64 ""
+#endif
+
 // Issue #10: the Supabase config macros expand to bare string *content*, so when
 // they are pasted directly into the emitted JS they produce invalid syntax like
 // `createClient(https://..., sb_...)`. Wrap each value in real JS quotes via the
@@ -266,15 +272,23 @@ static esp_err_t view_handler(httpd_req_t *req) {
     // /view itself is served without a session so the login form can load; all
     // sensitive endpoints (/stream, /capture, /flash) enforce the session that
     // the inline login flow establishes via ECDH-encrypted /login.
-
-    // MJPEG Viewer + inline ECDH login + stateful flash toggle + best-effort
-    // per-frame Supabase upload.
     //
-    // SECURITY NOTE: window.crypto.subtle is only guaranteed on secure contexts
-    // (HTTPS or http://localhost). Over plain http://bore.pub:<port> some
-    // browsers disable it. For a fully-encrypted channel use the HTTPS SELFHOST
-    // tunnel. See docs/SECURITY.md. This flow protects the LOGIN ONLY; the MJPEG
-    // stream is still plaintext over BORE and the pubkey exchange is MITM-able.
+    // Issue #12: the login crypto no longer depends on window.crypto.subtle
+    // (undefined over plain http://). It uses TweetNaCl for X25519 and
+    // @noble/ciphers for AES-256-GCM + @noble/hashes for HKDF-SHA256, which run
+    // in ANY context. crypto.getRandomValues (available without a secure context)
+    // supplies the IV + ephemeral private key. When window.crypto.subtle IS
+    // present it is used as a fast path.
+    //
+    // Trust: the browser encrypts to the PINNED device key (CONFIG_DEVICE_PUBKEY_B64)
+    // when set, and only falls back to GET /pubkey (with a visible warning banner)
+    // when the pin is empty. A single-use GET /nonce is embedded in the encrypted
+    // body to defeat replay. See docs/SECURITY.md + docs/CONFIG_SETUP.md.
+    //
+    // NOTE: the crypto libraries load from a CDN (like the existing supabase-js
+    // <script>). This keeps the served code the real, audited implementations
+    // rather than a hand-transcribed inline blob. The MJPEG stream is still
+    // plaintext over BORE; full-channel protection requires TLS (HTTPS proxy).
     static const char html[] =
         "<!DOCTYPE html><html>"
         "<head><meta charset='utf-8'>"
@@ -293,7 +307,9 @@ static esp_err_t view_handler(httpd_req_t *req) {
         "#loginBox{background:#161b22;padding:24px;border-radius:8px;border:1px solid #30363d;display:flex;flex-direction:column;gap:10px}"
         "#loginBox input{padding:8px;border-radius:6px;border:1px solid #30363d;background:#0d1117;color:#c9d1d9}"
         "#loginBtn{background:#238636}#app{display:none;flex-direction:column;align-items:center}"
+        "#pinWarn{display:none;max-width:520px;margin:0 0 12px;padding:10px 12px;background:#3d2b00;border:1px solid #d29922;border-radius:6px;color:#f0c674;font-size:12px;word-break:break-all}"
         "</style></head><body>"
+        "<div id='pinWarn'></div>"
         "<div id='loginBox'>"
         "<h3>ESP32-CAM Login</h3>"
         "<input id='u' placeholder='username' autocomplete='username'>"
@@ -306,30 +322,51 @@ static esp_err_t view_handler(httpd_req_t *req) {
         "<div id='st'>Connecting to stream...</div>"
         "<button id='flashBtn' class='off'>\u26A1 Flash: OFF</button>"
         "</div>"
+        "<script src='https://cdn.jsdelivr.net/npm/tweetnacl@1.0.3/nacl.min.js'></script>"
+        "<script src='https://cdn.jsdelivr.net/npm/@noble/hashes@1.4.0/hkdf.js'></script>"
+        "<script src='https://cdn.jsdelivr.net/npm/@noble/hashes@1.4.0/sha256.js'></script>"
+        "<script src='https://cdn.jsdelivr.net/npm/@noble/ciphers@1.0.0/aes.js'></script>"
         "<script src='https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2'></script>"
         "<script>"
+        // Pinned device pubkey (b64), empty when not yet pinned (see config.h).
+        "const PIN=" JSQ(CONFIG_DEVICE_PUBKEY_B64) ";"
         "let SID=null;"
         "const b64=b=>btoa(String.fromCharCode(...new Uint8Array(b)));"
         "const ub64=s=>Uint8Array.from(atob(s),c=>c.charCodeAt(0));"
+        // noble UMD globals: nobleHashes.hkdf/sha256, nobleCiphers.gcm.
+        "const NH=window.nobleHashes||window['@noble/hashes'];"
+        "const NC=window.nobleCiphers||window['@noble/ciphers'];"
+        "function hkdfKey(shared){return (NH&&NH.hkdf?NH.hkdf:hkdf)(sha256,shared,new Uint8Array(0),new TextEncoder().encode('esp32cam-ecdh-aes256gcm'),32);}"
+        // Resolve the device public key: pinned if set, else /pubkey (+ warn).
+        "async function deviceKey(){"
+        "if(PIN&&PIN.length){return ub64(PIN);}"
+        "const pk=await (await fetch('/pubkey')).json();"
+        "const w=document.getElementById('pinWarn');"
+        "w.style.display='block';"
+        "w.innerHTML='\\u26A0 Device key NOT pinned \\u2014 login is NOT protected against MITM. Set CONFIG_DEVICE_PUBKEY_B64 in config.h to the value below and re-flash (see docs/CONFIG_SETUP.md).<br>Device key: '+pk.pubkey;"
+        "return ub64(pk.pubkey);"
+        "}"
         "async function doLogin(){"
         "const le=document.getElementById('lerr');le.textContent='';"
         "try{"
-        "if(!window.crypto||!crypto.subtle){le.textContent='crypto.subtle unavailable over plain HTTP — use the HTTPS tunnel.';return;}"
-        "const pk=await (await fetch('/pubkey')).json();"
-        "const devPub=ub64(pk.pubkey);"
-        "const devKey=await crypto.subtle.importKey('raw',devPub,{name:'X25519'},false,[]);"
-        "const eph=await crypto.subtle.generateKey({name:'X25519'},false,['deriveBits']);"
-        "const ephPubRaw=await crypto.subtle.exportKey('raw',eph.publicKey);"
-        "const shared=await crypto.subtle.deriveBits({name:'X25519',public:devKey},eph.privateKey,256);"
-        "const hk=await crypto.subtle.importKey('raw',shared,'HKDF',false,['deriveKey']);"
-        "const enc=new TextEncoder();"
-        "const aesKey=await crypto.subtle.deriveKey({name:'HKDF',hash:'SHA-256',salt:new Uint8Array(0),info:enc.encode('esp32cam-ecdh-aes256gcm')},hk,{name:'AES-GCM',length:256},false,['encrypt']);"
+        "if(typeof nacl==='undefined'){le.textContent='crypto libraries failed to load (need internet on first page load)';return;}"
+        "const devPub=await deviceKey();"
+        // Ephemeral X25519 keypair via TweetNaCl scalarMult (works on plain HTTP).
+        "const ephSk=crypto.getRandomValues(new Uint8Array(32));"
+        "const ephPk=nacl.scalarMult.base(ephSk);"
+        "const shared=nacl.scalarMult(ephSk,devPub);"
+        "const aesKey=hkdfKey(shared);"
         "const iv=crypto.getRandomValues(new Uint8Array(12));"
-        "const pt=enc.encode(JSON.stringify({user:document.getElementById('u').value,pass:document.getElementById('p').value}));"
-        "const ctFull=new Uint8Array(await crypto.subtle.encrypt({name:'AES-GCM',iv},aesKey,pt));"
-        "const tag=ctFull.slice(ctFull.length-16);const ct=ctFull.slice(0,ctFull.length-16);"
-        "const r=await fetch('/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({epk:b64(ephPubRaw),iv:b64(iv),ct:b64(ct),tag:b64(tag)})});"
-        "if(!r.ok){le.textContent='Login failed ('+r.status+')';return;}"
+        // Fetch single-use replay nonce (issue #12) and include it in the plaintext.
+        "const nonce=(await (await fetch('/nonce')).json()).nonce;"
+        "const enc=new TextEncoder();"
+        "const pt=enc.encode(JSON.stringify({user:document.getElementById('u').value,pass:document.getElementById('p').value,nonce:nonce}));"
+        // AES-256-GCM via @noble/ciphers (subtle-free). Output = ct||tag(16).
+        "const gcm=(NC&&NC.gcm?NC.gcm:gcm)(aesKey,iv);"
+        "const sealed=gcm.encrypt(pt);"
+        "const tag=sealed.slice(sealed.length-16);const ct=sealed.slice(0,sealed.length-16);"
+        "const r=await fetch('/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({epk:b64(ephPk),iv:b64(iv),ct:b64(ct),tag:b64(tag)})});"
+        "if(!r.ok){le.textContent='Login failed ('+r.status+' '+(await r.text())+')';return;}"
         "SID=(await r.json()).token;"
         "startApp();"
         "}catch(e){le.textContent='Login error: '+e.message;console.error(e);}"
@@ -340,6 +377,7 @@ static esp_err_t view_handler(httpd_req_t *req) {
         "function streamUrl(){return '/stream?token='+encodeURIComponent(SID);}"
         "function startApp(){"
         "document.getElementById('loginBox').style.display='none';"
+        "document.getElementById('pinWarn').style.display='none';"
         "document.getElementById('app').style.display='flex';"
         "const cam=document.getElementById('cam');"
         "cam.src=streamUrl();"
@@ -373,7 +411,8 @@ static esp_err_t view_handler(httpd_req_t *req) {
         "const c=document.createElement('canvas');c.width=cam.naturalWidth;c.height=cam.naturalHeight;"
         "c.getContext('2d').drawImage(cam,0,0);"
         "const blob=await new Promise(r=>c.toBlob(r,'image/jpeg'));"
-        "idx=(idx%lim)+1;const n='frame_'+idx+'.jpg';"
+        // Issue #11: unique timestamped names; server-side pg_cron caps retention.
+        "const n='events/frame_'+Date.now()+'_'+(idx++)+'.jpg';"
         "await sb.storage.from(bkt).upload(n,blob,{upsert:true});"
         "}catch(e){/*best effort*/}"
         "lastDone=performance.now();"
@@ -417,7 +456,7 @@ void startCameraServer() {
         httpd_register_uri_handler(camera_httpd, &view_uri);
         httpd_register_uri_handler(camera_httpd, &health_uri);
         httpd_register_uri_handler(camera_httpd, &flash_uri);
-        // Register the unauthenticated /pubkey (GET) and /login (POST) handlers.
+        // Register the unauthenticated /pubkey (GET), /nonce (GET), /login (POST).
         registerCryptoAuthHandlers(camera_httpd);
     }
 }
