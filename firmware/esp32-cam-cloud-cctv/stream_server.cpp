@@ -587,7 +587,7 @@ static esp_err_t view_handler(httpd_req_t *req) {
         "sync(!!ns);" // optimistic: update UI before async /flash request completes
         "const wasStreaming=!!cam.getAttribute('src');"
         "if(wasStreaming){streamPaused=true;cam.removeAttribute('src');"
-        "await new Promise(r=>setTimeout(r,750));}" // wait for bore proxy slot + heap recovery
+        "await new Promise(r=>setTimeout(r,750));}" // proxy exits ~150-200ms after FIN; heap recovers to ~70KB by ~300ms; 750ms is well clear of both
         "let flashOk=false;"
         "for(let ft=0;ft<3&&!flashOk;ft++){"
         "try{const j=await (await auth('/flash?s='+ns)).json();sync(!!j.flash);flashOk=true;}"
@@ -595,7 +595,7 @@ static esp_err_t view_handler(httpd_req_t *req) {
         "}"
         "if(!flashOk)sync(!ns);" // revert visual when all retries exhausted
         "btn.dataset.busy='0';btn.disabled=false;"
-        "if(wasStreaming){streamPaused=false;setTimeout(connectStream,150);}"
+        "if(wasStreaming){streamPaused=false;setTimeout(connectStream,150);}" // 150ms (was 100ms): slight extra margin after flash completes before img.src triggers a new bore accept
         "};"
         "}"
         "function initUpload(){"
