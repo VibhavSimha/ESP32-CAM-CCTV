@@ -388,7 +388,7 @@ static void _boreAccept(const String &uuid, int slot) {
       _boreProxyTaskHandle[a->slot] = nullptr;
       vTaskDelete(nullptr);
     },
-    "bore_proxy", 6144, &_boreProxyArgs[slot], 5, &_boreProxyTaskHandle[slot], 0 // Core 0! Stack=6KB
+    "bore_proxy", 6144, &_boreProxyArgs[slot], 5, &_boreProxyTaskHandle[slot], 0 // Core 0! Stack=6144 bytes
   );
   if (taskOk != pdPASS) {
     Serial.printf("[Tunnel] Slot %d: FAILED to spawn proxy task! Closing sockets. Heap=%u\n", slot, ESP.getFreeHeap());
