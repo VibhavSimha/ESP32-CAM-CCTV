@@ -353,7 +353,7 @@ static esp_err_t view_handler(httpd_req_t *req) {
         // Module-level Supabase client — needed both for the frame uploader (initUpload)
         // and the reconnect URL check (reconnectWithUrlCheck), so it is created once
         // here rather than inside initUpload().
-        "const _sb=supabase.createClient(" JSQ(SUPABASE_URL) "," JSQ(SUPABASE_ANON_KEY) ");"
+        "const sb=supabase.createClient(" JSQ(SUPABASE_URL) "," JSQ(SUPABASE_ANON_KEY) ");"
         "const b64=b=>btoa(String.fromCharCode(...new Uint8Array(b)));"
         "const ub64=s=>Uint8Array.from(atob(s),c=>c.charCodeAt(0));"
         // Resolve crypto primitives from the @noble globals set by the ESM loader
@@ -436,8 +436,8 @@ static esp_err_t view_handler(httpd_req_t *req) {
         // rather than silently looping forever.
         "async function reconnectWithUrlCheck(){"
         "try{"
-        "const {data}=await _sb.from('camera_status').select('url').order('created_at',{ascending:false}).limit(1);"
-        "if(data&&data[0]){"
+        "const {data,error}=await sb.from('camera_status').select('url').order('created_at',{ascending:false}).limit(1);"
+        "if(!error&&data&&data[0]){"
         "const nu=new URL(data[0].url);"
         "if(nu.host!==window.location.host){"
         "document.getElementById('st').textContent='Tunnel URL changed \u2014 redirecting...';"
@@ -445,12 +445,12 @@ static esp_err_t view_handler(httpd_req_t *req) {
         "return;"
         "}"
         "}"
-        "}catch(e){}"
+        "}catch(e){console.warn('[reconnect] Supabase URL check failed:',e);}"
         // Tunnel URL unchanged — validate the session before retrying.
         "if(SID){try{"
         "const rv=await fetch('/flash',{headers:{'X-Session':SID}});"
         "if(rv.status===401||rv.status===403){logout();return;}"
-        "}catch(e){}}"
+        "}catch(e){console.warn('[reconnect] Session check failed:',e);}}"
         "connectStream();"
         "}"
         "function scheduleReconnect(){"
@@ -500,7 +500,7 @@ static esp_err_t view_handler(httpd_req_t *req) {
         "function initUpload(){"
         // Issue #10: the Supabase values MUST be quoted JS strings. JSQ() wraps
         // each macro's value in real quotes so createClient/bkt are valid JS.
-        // Issue #25: use the module-level _sb client (created at page load) rather
+        // Issue #25: use the module-level sb client (created at page load) rather
         // than allocating a second client here.
         "const bkt=" JSQ(SUPABASE_BUCKET) ";const minGap=" STR(STORAGE_UPLOAD_MIN_GAP_MS) ";"
         "let idx=0;let inflight=false;let lastDone=0;"
@@ -519,7 +519,7 @@ static esp_err_t view_handler(httpd_req_t *req) {
         "const blob=await new Promise(r=>c.toBlob(r,'image/jpeg'));"
         // Issue #11: unique timestamped names; server-side pg_cron caps retention.
         "const n='events/frame_'+Date.now()+'_'+(idx++)+'.jpg';"
-        "await _sb.storage.from(bkt).upload(n,blob,{upsert:true});"
+        "await sb.storage.from(bkt).upload(n,blob,{upsert:true});"
         "}catch(e){/*best effort*/}"
         "lastDone=performance.now();"
         "inflight=false;"
@@ -539,7 +539,7 @@ static esp_err_t view_handler(httpd_req_t *req) {
         "try{"
         "const rv=await fetch('/flash',{headers:{'X-Session':SID}});"
         "if(rv.ok){startApp();return;}"
-        "}catch(e){}"
+        "}catch(e){console.warn('[init] Session validation failed:',e);}"
         // Session invalid or unreachable — clear cache so the login form appears clean.
         "localStorage.removeItem('esp32_sid');SID=null;"
         "})();"
