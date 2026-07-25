@@ -266,15 +266,39 @@ static bool extractCookieToken(const char *cookie, char *out, size_t cap) {
   return false;
 }
 
+// Issue #10: an MJPEG <img> cannot send custom headers, so /stream (and /capture
+// when loaded as an <img>) authenticate via a ?token=<sid> query param. Extract
+// it from the request URL query string. token/sid are URL-safe base64 so no
+// percent-decoding is needed here.
+static bool extractQueryToken(httpd_req_t *req, char *out, size_t cap) {
+  size_t qlen = httpd_req_get_url_query_len(req);
+  if (qlen == 0 || qlen >= 512) return false;
+  char *q = (char *)malloc(qlen + 1);
+  if (!q) return false;
+  bool got = false;
+  if (httpd_req_get_url_query_str(req, q, qlen + 1) == ESP_OK) {
+    if (httpd_query_key_value(q, "token", out, cap) == ESP_OK && out[0] != '\0') {
+      got = true;
+    }
+  }
+  free(q);
+  return got;
+}
+
 bool cryptoAuthCheckSession(httpd_req_t *req) {
   char token[64] = {0};
   bool have = false;
 
-  // Prefer explicit header, fall back to Cookie: sid=...
+  // 1) Prefer explicit header (used by fetch()).
   size_t hl = httpd_req_get_hdr_value_len(req, "X-Session");
   if (hl > 0 && hl < sizeof(token)) {
     if (httpd_req_get_hdr_value_str(req, "X-Session", token, sizeof(token)) == ESP_OK) have = true;
   }
+  // 2) Issue #10: ?token=<sid> query param (used by the MJPEG <img> stream).
+  if (!have) {
+    have = extractQueryToken(req, token, sizeof(token));
+  }
+  // 3) Fall back to Cookie: sid=...
   if (!have) {
     size_t cl = httpd_req_get_hdr_value_len(req, "Cookie");
     if (cl > 0 && cl < 512) {
