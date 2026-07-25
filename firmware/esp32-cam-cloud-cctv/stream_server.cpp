@@ -415,6 +415,21 @@ static esp_err_t view_handler(httpd_req_t *req) {
         "document.getElementById('loginBox').style.display='';"
         "document.getElementById('lerr').textContent='Session expired \u2014 please log in again.';"
         "}"
+        // Issue #25: explicit logout triggered by the Logout button — stop the
+        // stream first so no further /stream requests fire after clearing SID.
+        "function handleLogout(){"
+        "document.getElementById('cam').removeAttribute('src');"
+        "logout();"
+        "}"
+        // Issue #25: shared helper to validate the current SID against the device.
+        // Returns the fetch Response on any HTTP reply, or null if the device is
+        // unreachable (network/TLS error). Callers decide how to react to each case.
+        "async function checkSession(){"
+        "if(!SID)return null;"
+        "try{"
+        "return await fetch('/flash',{headers:{'X-Session':SID}});"
+        "}catch(e){console.warn('[auth] Session check failed:',e);return null;}"
+        "}"
         // A stream failure is transient (tunnel hiccup, socket purge, flash
         // toggle). Reconnect with the SAME session instead of forcing the user
         // back to the login screen ("logout on stream failure"). A single
@@ -437,9 +452,11 @@ static esp_err_t view_handler(httpd_req_t *req) {
         "async function reconnectWithUrlCheck(){"
         "try{"
         "const {data,error}=await sb.from('camera_status').select('url').order('created_at',{ascending:false}).limit(1);"
-        "if(!error&&data&&data[0]){"
+        "if(!error&&Array.isArray(data)&&data.length>0&&data[0]){"
         "const nu=new URL(data[0].url);"
-        "if(nu.host!==window.location.host){"
+        // Only redirect to http/https to prevent protocol-based attacks if the
+        // Supabase database is ever compromised.
+        "if((nu.protocol==='http:'||nu.protocol==='https:')&&nu.host!==window.location.host){"
         "document.getElementById('st').textContent='Tunnel URL changed \u2014 redirecting...';"
         "window.location.href=nu.origin+'/view';"
         "return;"
@@ -447,10 +464,7 @@ static esp_err_t view_handler(httpd_req_t *req) {
         "}"
         "}catch(e){console.warn('[reconnect] Supabase URL check failed:',e);}"
         // Tunnel URL unchanged — validate the session before retrying.
-        "if(SID){try{"
-        "const rv=await fetch('/flash',{headers:{'X-Session':SID}});"
-        "if(rv.status===401||rv.status===403){logout();return;}"
-        "}catch(e){console.warn('[reconnect] Session check failed:',e);}}"
+        "if(SID){const rv=await checkSession();if(rv&&(rv.status===401||rv.status===403)){logout();return;}}"
         "connectStream();"
         "}"
         "function scheduleReconnect(){"
@@ -465,7 +479,7 @@ static esp_err_t view_handler(httpd_req_t *req) {
         "document.getElementById('pinWarn').style.display='none';"
         "document.getElementById('app').style.display='flex';"
         // Issue #25: logout button clears the persisted session and returns to login.
-        "document.getElementById('logoutBtn').onclick=()=>{const c=document.getElementById('cam');c.removeAttribute('src');logout();};"
+        "document.getElementById('logoutBtn').onclick=handleLogout;"
         "const cam=document.getElementById('cam');"
         // Issue #25: reset the failure counter each time a frame loads successfully.
         "cam.onload=()=>{failedReconnects=0;document.getElementById('st').textContent='MJPEG LIVE \\u25cf';};"
@@ -536,12 +550,12 @@ static esp_err_t view_handler(httpd_req_t *req) {
         // network error), wipe the stale token and leave the login form visible.
         "(async function init(){"
         "if(!SID)return;"
-        "try{"
-        "const rv=await fetch('/flash',{headers:{'X-Session':SID}});"
-        "if(rv.ok){startApp();return;}"
-        "}catch(e){console.warn('[init] Session validation failed:',e);}"
-        // Session invalid or unreachable — clear cache so the login form appears clean.
-        "localStorage.removeItem('esp32_sid');SID=null;"
+        "const rv=await checkSession();"
+        "if(rv&&rv.ok){startApp();return;}"
+        // Explicit rejection (401/403): session genuinely expired — clear the cache
+        // so the login form appears clean. On network error (rv===null) the device
+        // may just be temporarily unreachable; keep the token for the next load.
+        "if(rv&&(rv.status===401||rv.status===403)){localStorage.removeItem('esp32_sid');SID=null;}"
         "})();"
         "</script>"
         "</body></html>";
