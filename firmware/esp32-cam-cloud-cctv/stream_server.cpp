@@ -429,13 +429,17 @@ static esp_err_t view_handler(httpd_req_t *req) {
         // the server to purge the live stream socket, dropping the stream
         // ("stream failure on flash toggle"). Briefly pause the stream so the
         // HTTPD task is free to answer /flash, then resume with the same session.
+        // The button is latched busy for the duration so rapid double-clicks
+        // can't stack overlapping pause/resume cycles (a source of instability).
         "btn.onclick=async()=>{"
+        "if(btn.dataset.busy==='1')return;"
+        "btn.dataset.busy='1';btn.disabled=true;"
         "const ns=(btn.dataset.s==='1')?0:1;"
         "const wasStreaming=!!cam.getAttribute('src');"
         "if(wasStreaming){streamPaused=true;cam.removeAttribute('src');}"
         "try{const j=await (await auth('/flash?s='+ns)).json();sync(!!j.flash);}"
         "catch(e){console.error(e);}"
-        "finally{if(wasStreaming){streamPaused=false;setTimeout(connectStream,300);}}"
+        "finally{btn.dataset.busy='0';btn.disabled=false;if(wasStreaming){streamPaused=false;setTimeout(connectStream,300);}}"
         "};"
         "}"
         "function initUpload(){"

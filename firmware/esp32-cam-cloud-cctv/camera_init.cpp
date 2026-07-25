@@ -2,21 +2,7 @@
 #include <Arduino.h>
 #include "camera_pins.h"
 
-#include "esp32-hal-ledc.h"
 #include "esp_camera.h"
-
-static int ledDuty = 0;
-static bool ledStreaming = false;
-
-static void enableLed(bool on) {
-#if defined(LED_GPIO_NUM)
-  int duty = on ? ledDuty : 0;
-  if (on && ledStreaming && ledDuty > 255) {
-    duty = 255;
-  }
-  ledcWrite(LED_GPIO_NUM, duty);
-#endif
-}
 
 esp_err_t initCamera() {
   Serial.println("[Camera] Initializing...");
@@ -80,15 +66,14 @@ esp_err_t initCamera() {
   return ESP_OK;
 }
 
+// The flash LED (LED_GPIO_NUM / GPIO4 on the AI-Thinker board) is driven with a
+// single, plain-digital mechanism throughout the firmware. An earlier version
+// attached this pin to an LEDC PWM channel here while stream_server.cpp drove
+// the very same pin with pinMode()/digitalWrite(); the two owners fought over
+// the pad, producing a glitchy LED and transient instability whenever the flash
+// was toggled during a stream. This just initializes the pad as a digital
+// output; the actual (global, NVS-persisted) flash state lives in stream_server.
 void setupLedFlash(int pin) {
-  ledcAttach(pin, 5000, 8);
-  ledDuty = 0;
-}
-
-void cameraSetStreaming(bool streaming) {
-  ledStreaming = streaming;
-}
-
-void cameraLedForCapture(bool on) {
-  enableLed(on);
+  pinMode(pin, OUTPUT);
+  digitalWrite(pin, LOW);
 }
