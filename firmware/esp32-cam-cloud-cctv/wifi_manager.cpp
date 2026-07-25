@@ -5,7 +5,7 @@
 
 void setupWiFiManager() {
     WiFiManager wm;
-    WiFi.persistent(false);
+    WiFi.persistent(true);
     WiFi.setAutoReconnect(true);
     Serial.println("[WiFi] Auto-reconnect enabled; flash persistence disabled.");
     
