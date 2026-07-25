@@ -274,11 +274,11 @@ static esp_err_t view_handler(httpd_req_t *req) {
     // the inline login flow establishes via ECDH-encrypted /login.
     //
     // Issue #12: the login crypto no longer depends on window.crypto.subtle
-    // (undefined over plain http://). It uses TweetNaCl for X25519 and
-    // @noble/ciphers for AES-256-GCM + @noble/hashes for HKDF-SHA256, which run
-    // in ANY context. crypto.getRandomValues (available without a secure context)
-    // supplies the IV + ephemeral private key. When window.crypto.subtle IS
-    // present it is used as a fast path.
+    // (undefined over plain http://). It uses TweetNaCl for X25519 and the
+    // @noble/ciphers + @noble/hashes UMD *bundles*, which expose the browser
+    // globals `nobleCiphers` and `nobleHashes` and run in ANY context.
+    // crypto.getRandomValues (available without a secure context) supplies the IV
+    // and the ephemeral private key.
     //
     // Trust: the browser encrypts to the PINNED device key (CONFIG_DEVICE_PUBKEY_B64)
     // when set, and only falls back to GET /pubkey (with a visible warning banner)
@@ -286,9 +286,10 @@ static esp_err_t view_handler(httpd_req_t *req) {
     // body to defeat replay. See docs/SECURITY.md + docs/CONFIG_SETUP.md.
     //
     // NOTE: the crypto libraries load from a CDN (like the existing supabase-js
-    // <script>). This keeps the served code the real, audited implementations
-    // rather than a hand-transcribed inline blob. The MJPEG stream is still
-    // plaintext over BORE; full-channel protection requires TLS (HTTPS proxy).
+    // <script>) as real, audited implementations rather than a hand-transcribed
+    // inline blob. This needs internet at first page load (then cached). The
+    // MJPEG stream is still plaintext over BORE; full-channel protection requires
+    // TLS (HTTPS proxy).
     static const char html[] =
         "<!DOCTYPE html><html>"
         "<head><meta charset='utf-8'>"
@@ -322,10 +323,12 @@ static esp_err_t view_handler(httpd_req_t *req) {
         "<div id='st'>Connecting to stream...</div>"
         "<button id='flashBtn' class='off'>\u26A1 Flash: OFF</button>"
         "</div>"
+        // TweetNaCl -> global `nacl` (X25519 via nacl.scalarMult).
         "<script src='https://cdn.jsdelivr.net/npm/tweetnacl@1.0.3/nacl.min.js'></script>"
-        "<script src='https://cdn.jsdelivr.net/npm/@noble/hashes@1.4.0/hkdf.js'></script>"
-        "<script src='https://cdn.jsdelivr.net/npm/@noble/hashes@1.4.0/sha256.js'></script>"
-        "<script src='https://cdn.jsdelivr.net/npm/@noble/ciphers@1.0.0/aes.js'></script>"
+        // @noble UMD bundles -> globals `nobleHashes` (hkdf, sha256) and
+        // `nobleCiphers` (gcm). These specific bundle files define window globals.
+        "<script src='https://cdn.jsdelivr.net/npm/@noble/hashes@1.3.3/hashes.js'></script>"
+        "<script src='https://cdn.jsdelivr.net/npm/@noble/ciphers@0.4.1/cipher.js'></script>"
         "<script src='https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2'></script>"
         "<script>"
         // Pinned device pubkey (b64), empty when not yet pinned (see config.h).
@@ -333,10 +336,13 @@ static esp_err_t view_handler(httpd_req_t *req) {
         "let SID=null;"
         "const b64=b=>btoa(String.fromCharCode(...new Uint8Array(b)));"
         "const ub64=s=>Uint8Array.from(atob(s),c=>c.charCodeAt(0));"
-        // noble UMD globals: nobleHashes.hkdf/sha256, nobleCiphers.gcm.
-        "const NH=window.nobleHashes||window['@noble/hashes'];"
-        "const NC=window.nobleCiphers||window['@noble/ciphers'];"
-        "function hkdfKey(shared){return (NH&&NH.hkdf?NH.hkdf:hkdf)(sha256,shared,new Uint8Array(0),new TextEncoder().encode('esp32cam-ecdh-aes256gcm'),32);}"
+        // Resolve crypto primitives from the @noble UMD globals. If any are
+        // missing we abort with a clear message (no silent broken login).
+        "function nobleReady(){return (typeof nobleHashes!=='undefined')&&(typeof nobleCiphers!=='undefined')&&nobleHashes.hkdf&&nobleHashes.sha256&&nobleCiphers.gcm;}"
+        "function deriveAes(shared){"
+        "const info=new TextEncoder().encode('esp32cam-ecdh-aes256gcm');"
+        "return nobleHashes.hkdf(nobleHashes.sha256,shared,new Uint8Array(0),info,32);"
+        "}"
         // Resolve the device public key: pinned if set, else /pubkey (+ warn).
         "async function deviceKey(){"
         "if(PIN&&PIN.length){return ub64(PIN);}"
@@ -349,21 +355,20 @@ static esp_err_t view_handler(httpd_req_t *req) {
         "async function doLogin(){"
         "const le=document.getElementById('lerr');le.textContent='';"
         "try{"
-        "if(typeof nacl==='undefined'){le.textContent='crypto libraries failed to load (need internet on first page load)';return;}"
+        "if(typeof nacl==='undefined'||!nobleReady()){le.textContent='crypto libraries failed to load (need internet on first page load)';return;}"
         "const devPub=await deviceKey();"
         // Ephemeral X25519 keypair via TweetNaCl scalarMult (works on plain HTTP).
         "const ephSk=crypto.getRandomValues(new Uint8Array(32));"
         "const ephPk=nacl.scalarMult.base(ephSk);"
         "const shared=nacl.scalarMult(ephSk,devPub);"
-        "const aesKey=hkdfKey(shared);"
+        "const aesKey=deriveAes(shared);"
         "const iv=crypto.getRandomValues(new Uint8Array(12));"
         // Fetch single-use replay nonce (issue #12) and include it in the plaintext.
         "const nonce=(await (await fetch('/nonce')).json()).nonce;"
         "const enc=new TextEncoder();"
         "const pt=enc.encode(JSON.stringify({user:document.getElementById('u').value,pass:document.getElementById('p').value,nonce:nonce}));"
         // AES-256-GCM via @noble/ciphers (subtle-free). Output = ct||tag(16).
-        "const gcm=(NC&&NC.gcm?NC.gcm:gcm)(aesKey,iv);"
-        "const sealed=gcm.encrypt(pt);"
+        "const sealed=nobleCiphers.gcm(aesKey,iv).encrypt(pt);"
         "const tag=sealed.slice(sealed.length-16);const ct=sealed.slice(0,sealed.length-16);"
         "const r=await fetch('/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({epk:b64(ephPk),iv:b64(iv),ct:b64(ct),tag:b64(tag)})});"
         "if(!r.ok){le.textContent='Login failed ('+r.status+' '+(await r.text())+')';return;}"
@@ -396,7 +401,7 @@ static esp_err_t view_handler(httpd_req_t *req) {
         // Issue #10: the Supabase values MUST be quoted JS strings. JSQ() wraps
         // each macro's value in real quotes so createClient/bkt are valid JS.
         "const sb=supabase.createClient(" JSQ(SUPABASE_URL) "," JSQ(SUPABASE_ANON_KEY) ");"
-        "const bkt=" JSQ(SUPABASE_BUCKET) ";const lim=" STR(STORAGE_FRAME_LIMIT) ";const minGap=" STR(STORAGE_UPLOAD_MIN_GAP_MS) ";"
+        "const bkt=" JSQ(SUPABASE_BUCKET) ";const minGap=" STR(STORAGE_UPLOAD_MIN_GAP_MS) ";"
         "let idx=0;let inflight=false;let lastDone=0;"
         "const cam=document.getElementById('cam');"
         // Best-effort: attempt to upload received frames. If an upload is still
