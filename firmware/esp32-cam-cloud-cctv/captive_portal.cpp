@@ -45,6 +45,12 @@ static String      s_lastMessage;      // human-readable status for the UI
 static int         s_attempts = 0;
 static bool        s_reprobePending = false;
 static unsigned long s_reprobeAt = 0;
+// Periodic re-probe interval when in UNSUPPORTED/FAILED state so that we
+// automatically detect when the user manually logs in via their browser.
+#ifndef CAPTIVE_PERIODIC_REPROBE_MS
+#define CAPTIVE_PERIODIC_REPROBE_MS 30000UL
+#endif
+static unsigned long s_periodicReprobeAt = 0;
 
 PortalState captivePortalGetState() { return s_state; }
 
@@ -343,6 +349,32 @@ static esp_err_t portal_status_handler(httpd_req_t* req) {
     return ESP_OK;
 }
 
+// Immediate re-probe triggered by the user clicking "Check again" after they
+// have manually logged into a challenge/CHAP portal via their browser.
+static void doReprobe() {
+    String body, location;
+    int code = probeInternet(body, location);
+    Serial.printf("[CaptivePortal] Re-probe %s -> HTTP %d\n", CAPTIVE_PROBE_URL, code);
+    std::string b(body.c_str(), body.length());
+    if (code > 0 && !looksLikeCaptivePortal(code, b)) {
+        setStatus(PORTAL_STATE_SUCCESS, "Portal login succeeded — you are online.");
+        persistSeen(WiFi.SSID());
+        Serial.println("[CaptivePortal] Re-probe: internet reachable — portal unlocked.");
+    } else if (code <= 0) {
+        setStatus(s_state, "Could not reach the internet. If you have logged in via your browser, try again in a moment.");
+    } else {
+        setStatus(s_state, "Still behind the captive portal. Please complete the login in your browser, then tap Check again.");
+    }
+    // Schedule the next periodic re-probe from now.
+    s_periodicReprobeAt = millis() + CAPTIVE_PERIODIC_REPROBE_MS;
+}
+
+static esp_err_t portal_reprobe_handler(httpd_req_t* req) {
+    doReprobe();
+    sendStatusJson(req);
+    return ESP_OK;
+}
+
 static esp_err_t portal_login_handler(httpd_req_t* req) {
     int total = req->content_len;
     if (total <= 0 || total > 1024) {
@@ -436,16 +468,20 @@ static esp_err_t portal_page_handler(httpd_req_t* req) {
         "<button type='submit'>Log in</button></form>"
         "<p id='manual' class='hide'>This portal can't be logged in automatically. "
         "<a id='plink' href='#' target='_blank' rel='noopener'>Open the portal page</a> and finish there, "
-        "then reload this page.</p>"
+        "then tap <strong>Check again</strong> below.</p>"
+        "<button id='rprobe' class='hide' type='button'>Check again</button>"
         "</div><script>(function(){"
         "var msg=document.getElementById('msg'),f=document.getElementById('f'),"
-        "manual=document.getElementById('manual'),plink=document.getElementById('plink');"
+        "manual=document.getElementById('manual'),plink=document.getElementById('plink'),"
+        "rprobe=document.getElementById('rprobe');"
         "function render(s){msg.textContent=s.message||'';"
-        "if(s.automatable){f.classList.remove('hide');manual.classList.add('hide');}"
+        "if(s.automatable){f.classList.remove('hide');manual.classList.add('hide');rprobe.classList.add('hide');}"
         "else{f.classList.add('hide');}"
-        "if(s.state==='unsupported'||s.state==='failed'){if(s.portalUrl){plink.href=s.portalUrl;}manual.classList.remove('hide');}"
-        "else{manual.classList.add('hide');}}"
+        "if(s.state==='unsupported'||s.state==='failed'){if(s.portalUrl){plink.href=s.portalUrl;}manual.classList.remove('hide');rprobe.classList.remove('hide');}"
+        "else{manual.classList.add('hide');rprobe.classList.add('hide');}}"
         "function poll(){fetch('/portal/status').then(r=>r.json()).then(render).catch(()=>{});}"
+        "rprobe.addEventListener('click',function(){msg.textContent='Checking…';"
+        "fetch('/portal/reprobe',{method:'POST'}).then(r=>r.json()).then(render).catch(()=>{msg.textContent='Network error.';});});"
         "f.addEventListener('submit',function(e){e.preventDefault();"
         "var b='user='+encodeURIComponent(document.getElementById('u').value)+"
         "'&pass='+encodeURIComponent(document.getElementById('p').value);"
@@ -465,10 +501,12 @@ void registerCaptivePortalHandlers(httpd_handle_t server) {
     httpd_uri_t portal_uri  = { .uri = "/portal",        .method = HTTP_GET,  .handler = portal_page_handler,   .user_ctx = NULL };
     httpd_uri_t status_uri  = { .uri = "/portal/status", .method = HTTP_GET,  .handler = portal_status_handler, .user_ctx = NULL };
     httpd_uri_t login_uri   = { .uri = "/portal/login",  .method = HTTP_POST, .handler = portal_login_handler,  .user_ctx = NULL };
+    httpd_uri_t reprobe_uri = { .uri = "/portal/reprobe", .method = HTTP_POST, .handler = portal_reprobe_handler, .user_ctx = NULL };
     httpd_register_uri_handler(server, &portal_uri);
     httpd_register_uri_handler(server, &status_uri);
     httpd_register_uri_handler(server, &login_uri);
-    Serial.println("[CaptivePortal] Registered /portal, /portal/status, /portal/login");
+    httpd_register_uri_handler(server, &reprobe_uri);
+    Serial.println("[CaptivePortal] Registered /portal, /portal/status, /portal/login, /portal/reprobe");
 #else
     (void)server;
 #endif
@@ -479,26 +517,44 @@ void registerCaptivePortalHandlers(httpd_handle_t server) {
 // -----------------------------------------------------------------------------
 void captivePortalLoop() {
 #if ENABLE_CAPTIVE_PORTAL_LOGIN
-    if (!s_reprobePending) return;
-    if ((long)(millis() - s_reprobeAt) < 0) return;
-    s_reprobePending = false;
+    // Post-submit re-probe (after automated credential submission).
+    if (s_reprobePending) {
+        if ((long)(millis() - s_reprobeAt) >= 0) {
+            s_reprobePending = false;
 
-    String body, location;
-    int code = probeInternet(body, location);
-    std::string b(body.c_str(), body.length());
-    if (code > 0 && !looksLikeCaptivePortal(code, b)) {
-        setStatus(PORTAL_STATE_SUCCESS, "Portal login succeeded — you are online.");
-        persistSeen(WiFi.SSID());
-        Serial.println("[CaptivePortal] Login verified — internet reachable.");
-    } else {
-        if (s_attempts >= CAPTIVE_MAX_LOGIN_ATTEMPTS) {
-            setStatus(PORTAL_STATE_FAILED,
-                      "Login did not unlock the internet. Please log in from your browser.");
-        } else {
-            setStatus(PORTAL_STATE_FAILED,
-                      "Login did not unlock the internet — check your credentials and try again.");
+            String body, location;
+            int code = probeInternet(body, location);
+            std::string b(body.c_str(), body.length());
+            if (code > 0 && !looksLikeCaptivePortal(code, b)) {
+                setStatus(PORTAL_STATE_SUCCESS, "Portal login succeeded — you are online.");
+                persistSeen(WiFi.SSID());
+                Serial.println("[CaptivePortal] Login verified — internet reachable.");
+            } else {
+                if (s_attempts >= CAPTIVE_MAX_LOGIN_ATTEMPTS) {
+                    setStatus(PORTAL_STATE_FAILED,
+                              "Login did not unlock the internet. Please log in from your browser.");
+                } else {
+                    setStatus(PORTAL_STATE_FAILED,
+                              "Login did not unlock the internet — check your credentials and try again.");
+                }
+                Serial.println("[CaptivePortal] Re-probe still captive — login failed.");
+            }
+            // Schedule first periodic re-probe from now.
+            s_periodicReprobeAt = millis() + CAPTIVE_PERIODIC_REPROBE_MS;
         }
-        Serial.println("[CaptivePortal] Re-probe still captive — login failed.");
+        return;
+    }
+
+    // Periodic re-probe when behind an unsupported/failed portal so the device
+    // detects when the user has manually logged in via their browser.
+    if (s_state == PORTAL_STATE_UNSUPPORTED || s_state == PORTAL_STATE_FAILED) {
+        if (s_periodicReprobeAt == 0) {
+            s_periodicReprobeAt = millis() + CAPTIVE_PERIODIC_REPROBE_MS;
+        }
+        if ((long)(millis() - s_periodicReprobeAt) >= 0) {
+            Serial.println("[CaptivePortal] Periodic re-probe (waiting for manual browser login).");
+            doReprobe();
+        }
     }
 #endif
 }
