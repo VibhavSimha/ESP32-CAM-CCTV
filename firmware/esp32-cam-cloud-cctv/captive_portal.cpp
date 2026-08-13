@@ -135,8 +135,13 @@ static void persistSeen(const String& ssid) {
 static int probeInternet(String& body, String& location) {
     body = "";
     location = "";
-    HTTPClient http;
+    // Declare the WiFiClient BEFORE the HTTPClient. Locals are destroyed in
+    // reverse order, so this guarantees the HTTPClient (which holds a pointer to
+    // the client via http.begin()) is torn down first, while the client is still
+    // alive. The reverse order is a use-after-free that corrupts lwIP's pbuf
+    // refcounts and later trips "assert failed: pbuf_free: p->ref > 0".
     WiFiClient client;
+    HTTPClient http;
     http.setConnectTimeout(CAPTIVE_PROBE_TIMEOUT_MS);
     http.setTimeout(CAPTIVE_PROBE_TIMEOUT_MS);
     http.setFollowRedirects(HTTPC_DISABLE_FOLLOW_REDIRECTS);
@@ -164,8 +169,9 @@ static int probeInternet(String& body, String& location) {
 // and fills `html`.
 static int fetchPortalPage(const String& url, String& html) {
     html = "";
-    HTTPClient http;
+    // WiFiClient must outlive the HTTPClient (see probeInternet for details).
     WiFiClient client;
+    HTTPClient http;
     http.setConnectTimeout(CAPTIVE_PROBE_TIMEOUT_MS);
     http.setTimeout(CAPTIVE_PROBE_TIMEOUT_MS);
     http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
@@ -282,8 +288,9 @@ static bool submitPortalLogin(const String& username, const String& password, St
     Serial.printf("[CaptivePortal] Submitting login to %s (method %s)\n",
                   actionUrl.c_str(), s_form.method.c_str());
 
-    HTTPClient http;
+    // WiFiClient must outlive the HTTPClient (see probeInternet for details).
     WiFiClient client;
+    HTTPClient http;
     http.setConnectTimeout(CAPTIVE_PROBE_TIMEOUT_MS);
     http.setTimeout(CAPTIVE_PROBE_TIMEOUT_MS);
     http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
