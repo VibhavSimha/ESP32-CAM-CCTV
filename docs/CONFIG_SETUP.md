@@ -84,6 +84,43 @@ re-copy the printed value into `config.h` and re-flash.
   [docs/SECURITY.md](SECURITY.md) for the full threat model and the HTTPS
   reverse-proxy recommendation.
 
+## Post-connect captive-portal login (issue #33)
+This is **separate** from the `ESP32-CAM-Setup` onboarding above (which chooses
+your router SSID/password and is unchanged). Some networks let the board join
+Wi-Fi but still gate the *internet* behind a one-time browser login page (hotel /
+hostel / campus / ISP hotspots). When `ENABLE_CAPTIVE_PORTAL_LOGIN` is `1`
+(default), the firmware handles this **after** Wi-Fi is already connected:
+
+1. It probes `CAPTIVE_PROBE_URL` (a plain-HTTP `generate_204` endpoint). A clean
+   network returns `204` and nothing happens.
+2. If a captive portal intercepts the probe, the firmware fetches the portal
+   login page and **auto-detects** the username and password fields — the field
+   names are **not** hardcoded, so it adapts to different ISPs (it uses the first
+   text-like input as the username and the `type=password` input as the
+   password, echoing any hidden fields on submit).
+3. Open `http://<device-ip>/portal` in a browser on the same network. Enter the
+   ISP portal username/password; the board submits the login for you and
+   re-checks connectivity.
+
+### Configuration knobs (`config.h`)
+| Macro | Default | Purpose |
+| --- | --- | --- |
+| `ENABLE_CAPTIVE_PORTAL_LOGIN` | `1` | Set to `0` to disable the whole feature. |
+| `CAPTIVE_PROBE_URL` | `http://connectivitycheck.gstatic.com/generate_204` | Plain-HTTP 204 probe used to detect interception. |
+| `CAPTIVE_PROBE_TIMEOUT_MS` | `6000` | Per-request timeout for the probe/submit. |
+| `CAPTIVE_MAX_LOGIN_ATTEMPTS` | `3` | Attempts before steering the user to the manual browser fallback. |
+
+### Scope & fallback
+- **Persistence:** only the Wi-Fi credentials (WiFiManager/NVS) plus a lightweight
+  "portal seen" marker are stored. The ISP portal username/password are used once
+  and **never** persisted.
+- **Unsupported portals:** challenge/response logins (e.g. MikroTik CHAP), pages
+  with no `<form>`, or JavaScript-only portals are detected and the device shows
+  a link to open the real portal page and finish the login manually.
+- **Recovery:** if login fails or the network changes, the device stays reachable
+  through its own `ESP32-CAM-Setup` AP and `/portal` page so you can retry
+  without re-flashing.
+
 ## Related
 - [docs/SECURITY.md](SECURITY.md) — encrypted-login threat model.
 - [docs/SUPABASE_SETUP.md](SUPABASE_SETUP.md) — bucket + credentials.

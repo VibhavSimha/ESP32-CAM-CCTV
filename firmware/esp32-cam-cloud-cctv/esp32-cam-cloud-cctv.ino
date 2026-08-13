@@ -2,6 +2,7 @@
 #include "config.h"
 #include "camera_init.h"
 #include "wifi_manager.h"
+#include "captive_portal.h"
 #include "stream_server.h"
 #include "tunnel_client.h"
 #include "cloud_storage.h"
@@ -25,6 +26,11 @@ void setup() {
 
     // 3. Initialize WiFi via WiFiManager
     setupWiFiManager();
+
+    // 3b. Post-connect captive-portal probe/login (issue #33). Runs ONLY after
+    //     Wi-Fi is already joined; a no-op on open networks. The local helper
+    //     page is served by the camera web server started in step 6.
+    captivePortalBegin();
 
     // 4. Initialize Cloud Storage (Supabase)
     setupCloudStorage();
@@ -53,6 +59,10 @@ void loop() {
 
     // Keep localtunnel alive
     handleTunnel();
+
+    // Post-connect captive-portal state machine tick (verify/recover). No-op
+    // unless a portal login was just submitted.
+    captivePortalLoop();
 
     // Retry best-effort cloud status updates without blocking local serving
     loopCloudStorage();
