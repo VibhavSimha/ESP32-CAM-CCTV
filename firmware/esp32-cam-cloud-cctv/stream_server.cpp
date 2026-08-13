@@ -4,6 +4,7 @@
 #include "camera_init.h"
 #include "http_auth.h"
 #include "crypto_auth.h"
+#include "captive_portal.h"
 #include "config.h"
 #include <Arduino.h>
 #include <ArduinoJson.h>
@@ -671,7 +672,8 @@ static esp_err_t view_handler(httpd_req_t *req) {
 void startCameraServer() {
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.server_port = 80;
-    config.max_uri_handlers = 8;
+    // 5 camera endpoints + 3 crypto-auth + 3 captive-portal handlers.
+    config.max_uri_handlers = 12;
     config.max_open_sockets = 7;
     config.recv_wait_timeout = 15;
     config.send_wait_timeout = 10;
@@ -694,5 +696,8 @@ void startCameraServer() {
         httpd_register_uri_handler(camera_httpd, &flash_uri);
         // Register the unauthenticated /pubkey (GET), /nonce (GET), /login (POST).
         registerCryptoAuthHandlers(camera_httpd);
+        // Register the post-connect captive-portal helper endpoints (issue #33):
+        // /portal (GET), /portal/status (GET), /portal/login (POST).
+        registerCaptivePortalHandlers(camera_httpd);
     }
 }

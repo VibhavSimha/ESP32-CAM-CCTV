@@ -158,3 +158,38 @@
 // WIFI AP NAME (captive portal hotspot name shown on your phone)
 // -----------------------------------------------------------------------------
 #define WIFI_AP_NAME         "ESP32-CAM-Setup"
+
+// -----------------------------------------------------------------------------
+// POST-CONNECT CAPTIVE-PORTAL LOGIN (issue #33)
+// -----------------------------------------------------------------------------
+// SEPARATE from the WiFiManager SSID/password onboarding above. After the board
+// has ALREADY joined your router's Wi-Fi, some networks (hotels, hostels, campus
+// / ISP hotspots) still require a one-time browser login on a "captive portal"
+// page before the internet works. When ENABLE_CAPTIVE_PORTAL_LOGIN is 1 the
+// firmware:
+//   1. Probes for internet right after Wi-Fi connects (CAPTIVE_PROBE_URL).
+//   2. If a portal intercepts the probe, it fetches the portal login page and
+//      AUTO-DETECTS the username/password fields — no field names are hardcoded.
+//   3. Serves a local helper page at http://<device-ip>/portal where you enter
+//      the ISP portal username/password; the board submits the login for you.
+//   4. Falls back to "open the portal in your browser" for challenge/JS portals
+//      (e.g. MikroTik CHAP) that cannot be automated safely.
+//
+// Only your Wi-Fi credentials (via WiFiManager/NVS) are persisted — the ISP
+// portal username/password are used once and never stored. Set to 0 to disable
+// the whole feature (the firmware then behaves exactly as before). See
+// docs/CONFIG_SETUP.md for details.
+// -----------------------------------------------------------------------------
+#define ENABLE_CAPTIVE_PORTAL_LOGIN 1
+
+// Plain-HTTP endpoint that returns "204 No Content" on an open network. A
+// captive portal intercepts it with a redirect or a login page, which is how we
+// detect the portal. Keep it HTTP (not HTTPS) so interception is observable.
+#define CAPTIVE_PROBE_URL           "http://connectivitycheck.gstatic.com/generate_204"
+
+// Per-request timeout (ms) for the probe and portal submit.
+#define CAPTIVE_PROBE_TIMEOUT_MS    6000
+
+// Give up automated submission after this many failed attempts and steer the
+// user to the manual browser fallback.
+#define CAPTIVE_MAX_LOGIN_ATTEMPTS  3

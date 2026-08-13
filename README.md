@@ -95,6 +95,8 @@ The minimum you must change before going live:
 
 > **Already connected?** If your board was previously used with other firmware on the same WiFi network, it may remember the credentials and skip straight to connecting — you'll see `AutoConnect: SUCCESS` in the Serial Monitor.
 
+> **Behind a captive portal?** On networks that require a one-time browser login *after* joining Wi-Fi (hotel/hostel/campus/ISP hotspots), the firmware auto-detects the portal and serves a helper page at `http://<device-ip>/portal`. Enter the ISP portal username/password there and it logs in for you (field names are auto-detected, never hardcoded). Portals that use JavaScript-only or challenge/response logins fall back to a "finish in your browser" link. See [docs/CONFIG_SETUP.md](docs/CONFIG_SETUP.md#post-connect-captive-portal-login-issue-33).
+
 ---
 
 ## Viewing the Live Feed
