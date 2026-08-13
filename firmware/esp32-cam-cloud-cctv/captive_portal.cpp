@@ -361,7 +361,7 @@ static esp_err_t portal_login_handler(httpd_req_t* req) {
             httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Recv error");
             return ESP_FAIL;
         }
-        for (int i = 0; i < r; i++) raw += buf[i];
+        raw.concat(buf, r);
         received += r;
     }
 

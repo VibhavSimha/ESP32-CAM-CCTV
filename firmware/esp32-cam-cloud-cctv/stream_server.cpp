@@ -672,7 +672,7 @@ static esp_err_t view_handler(httpd_req_t *req) {
 void startCameraServer() {
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.server_port = 80;
-    // 5 camera endpoints + 3 crypto-auth + 3 captive-portal handlers.
+    // 5 camera + 3 crypto-auth + 3 captive-portal = 11 handlers (12 for headroom).
     config.max_uri_handlers = 12;
     config.max_open_sockets = 7;
     config.recv_wait_timeout = 15;

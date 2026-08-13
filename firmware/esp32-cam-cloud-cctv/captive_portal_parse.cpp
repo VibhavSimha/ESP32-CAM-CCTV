@@ -14,13 +14,27 @@ static std::string toLowerCopy(const std::string& s) {
     return out;
 }
 
-// Case-insensitive search for `needle` in `hay` starting at `from`.
+// Case-insensitive equality for a single char.
+static inline bool ciEqualChar(char a, char b) {
+    return std::tolower((unsigned char)a) == std::tolower((unsigned char)b);
+}
+
+// Case-insensitive search for `needle` in `hay` starting at `from`. Allocation-
+// free (does not copy `hay`), which matters when scanning a multi-KB portal page
+// on a heap-constrained ESP32.
 static size_t ifind(const std::string& hay, const std::string& needle, size_t from = 0) {
     if (needle.empty()) return from <= hay.size() ? from : std::string::npos;
     if (from >= hay.size()) return std::string::npos;
-    const std::string lh = toLowerCopy(hay);
-    const std::string ln = toLowerCopy(needle);
-    return lh.find(ln, from);
+    const size_t n = needle.size();
+    if (hay.size() < n) return std::string::npos;
+    for (size_t i = from; i + n <= hay.size(); i++) {
+        size_t j = 0;
+        for (; j < n; j++) {
+            if (!ciEqualChar(hay[i + j], needle[j])) break;
+        }
+        if (j == n) return i;
+    }
+    return std::string::npos;
 }
 
 // Extract the value of attribute `attr` from a single tag's text (e.g. the text
