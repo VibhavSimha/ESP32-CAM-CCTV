@@ -88,3 +88,25 @@ re-copy the printed value into `config.h` and re-flash.
 - [docs/SECURITY.md](SECURITY.md) — encrypted-login threat model.
 - [docs/SUPABASE_SETUP.md](SUPABASE_SETUP.md) — bucket + credentials.
 - [docs/SUPABASE_RETENTION.md](SUPABASE_RETENTION.md) — server-side FIFO cap.
+
+---
+
+## ISP captive-portal login (post-connect, optional)
+
+This is separate from both the WiFiManager SSID/password step and the encrypted
+`/view` viewer login. Some networks join Wi-Fi successfully but still hold
+internet access behind an ISP/venue browser login page.
+
+- **When it runs:** only *after* Wi-Fi is connected. On boot the firmware probes
+  `http://connectivitycheck.gstatic.com/generate_204`. A `204` means real
+  internet (no portal → step skipped). A `200`/`3xx` interception means a captive
+  portal is present. A transport error is treated as *offline*, **not** captive,
+  so a temporarily-offline device is never falsely trapped.
+- **How the user logs in:** while a portal is pending, opening the device root
+  (`http://<device-ip>/`) redirects the browser to the built-in `/portal` helper
+  page **once**. For a simple HTML form the ESP32 submits the entered
+  username/password itself; portals needing JavaScript/tokens/device binding must
+  be completed manually in the browser.
+- **One-time behavior:** after login restores connectivity, the root link stops
+  redirecting to `/portal` and forwards to `/view` for the rest of the session.
+  Only the Wi-Fi credentials persist — ISP portal credentials are **not** stored.

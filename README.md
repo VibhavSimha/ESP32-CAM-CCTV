@@ -95,6 +95,18 @@ The minimum you must change before going live:
 
 > **Already connected?** If your board was previously used with other firmware on the same WiFi network, it may remember the credentials and skip straight to connecting — you'll see `AutoConnect: SUCCESS` in the Serial Monitor.
 
+### Step 3b — ISP captive-portal login (only on networks that require it)
+
+Some networks (hostels, campuses, some ISPs) join Wi-Fi fine but still gate
+internet access behind a browser login page. After Wi-Fi connects, the firmware
+probes for this and, if a captive portal is detected, opening the device's local
+link (`http://<device-ip>/`) automatically forwards your browser to the built-in
+`/portal` helper page **once**. Enter the ISP portal username/password there; for
+a simple HTML form the board submits it for you, and once internet is restored
+the root link goes back to the normal `/view` camera page. If the portal needs
+JavaScript, tokens, or device binding, complete it manually in the browser. On a
+normal network with no portal, this step is skipped automatically.
+
 ---
 
 ## Viewing the Live Feed
