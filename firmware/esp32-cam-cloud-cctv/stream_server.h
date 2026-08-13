@@ -6,5 +6,8 @@ extern volatile int active_stream_clients;
 
 void startCameraServer();
 
+// Register the local ISP captive-portal helper page on the main web server.
+void registerCaptivePortalHandlers(httpd_handle_t server);
+
 // Restore + apply the NVS-persisted global flash (LED) state at boot.
 void setupFlashState();

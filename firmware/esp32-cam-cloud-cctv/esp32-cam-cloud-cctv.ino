@@ -2,6 +2,7 @@
 #include "config.h"
 #include "camera_init.h"
 #include "wifi_manager.h"
+#include "captive_portal.h"
 #include "stream_server.h"
 #include "tunnel_client.h"
 #include "cloud_storage.h"
@@ -25,6 +26,9 @@ void setup() {
 
     // 3. Initialize WiFi via WiFiManager
     setupWiFiManager();
+
+    // 3b. Probe for ISP captive-portal behavior after joining Wi-Fi.
+    setupCaptivePortal();
 
     // 4. Initialize Cloud Storage (Supabase)
     setupCloudStorage();
