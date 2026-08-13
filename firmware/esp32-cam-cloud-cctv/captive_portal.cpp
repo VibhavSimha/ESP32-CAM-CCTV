@@ -13,8 +13,15 @@ static const char* kDefaultUserField = "username";
 static const char* kDefaultPassField = "password";
 
 static bool s_captiveDetected = false;
+static bool s_portalCompleted = false;
 static String s_detectedPortalUrl;
 static String s_probeStatus;
+
+// HTTPClient stores response headers only when explicitly asked to via
+// collectHeaders(); otherwise header("Location") always returns "". The captive
+// probe and the redirect after login both rely on the Location header, so this
+// list must be registered before every request that reads it.
+static const char* kCollectedHeaders[] = { "Location" };
 
 static String urlDecode(const String& value) {
     String out;
@@ -128,6 +135,7 @@ static bool submitPortalLogin(const String& loginUrl,
             return false;
         }
         http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
+        http.collectHeaders(kCollectedHeaders, 1);
         http.addHeader("Content-Type", "application/x-www-form-urlencoded");
         code = http.POST(body);
     } else {
@@ -137,6 +145,7 @@ static bool submitPortalLogin(const String& loginUrl,
             return false;
         }
         http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
+        http.collectHeaders(kCollectedHeaders, 1);
         http.addHeader("Content-Type", "application/x-www-form-urlencoded");
         code = http.POST(body);
     }
@@ -172,16 +181,29 @@ static void probeCaptivePortal() {
         return;
     }
     http.setFollowRedirects(HTTPC_DISABLE_FOLLOW_REDIRECTS);
+    http.collectHeaders(kCollectedHeaders, 1);
     int code = http.GET();
     String location = http.header("Location");
     String body = http.getString();
     http.end();
 
     if (code == 204) {
+        // generate_204 answered as expected: real internet, no portal.
         s_probeStatus = "No captive portal detected.";
+        s_portalCompleted = true;
         return;
     }
 
+    if (code <= 0) {
+        // Transport-level failure (timeout / DNS / no route). This means the
+        // probe could not complete, not that a captive portal is present.
+        // Flagging captive here would falsely trap a merely-offline device.
+        s_probeStatus = String("Connectivity probe failed (offline?). Error ") + code;
+        return;
+    }
+
+    // Any other HTTP status to a generate_204 endpoint (a 200 login page or a
+    // 3xx redirect to the ISP portal) indicates the response was intercepted.
     s_captiveDetected = true;
     if (location.length() > 0) {
         s_detectedPortalUrl = location;
@@ -260,6 +282,9 @@ static esp_err_t portalPostHandler(httpd_req_t* req) {
         if (s_captiveDetected) {
             s_probeStatus = "Portal login submitted; connectivity still looks captive.";
         } else {
+            // Internet reachable again: mark the one-time flow complete so the
+            // root helper stops auto-opening the portal page for this session.
+            s_portalCompleted = true;
             s_probeStatus = "Portal login submitted; internet access restored.";
         }
     } else {
@@ -270,6 +295,18 @@ static esp_err_t portalPostHandler(httpd_req_t* req) {
     httpd_resp_set_type(req, "text/html");
     httpd_resp_set_hdr(req, "Cache-Control", "no-store, no-cache, must-revalidate, max-age=0");
     return httpd_resp_send(req, html.c_str(), html.length());
+}
+
+// Root helper so that simply opening the device's local link lands the browser
+// on the ISP portal login exactly once. While a captive portal is pending it
+// redirects "/" to "/portal"; after the one-time login (or when no portal is
+// present) it forwards to the normal "/view" camera UI.
+static esp_err_t rootRedirectHandler(httpd_req_t* req) {
+    const bool portalPending = s_captiveDetected && !s_portalCompleted;
+    httpd_resp_set_status(req, "302 Found");
+    httpd_resp_set_hdr(req, "Location", portalPending ? "/portal" : "/view");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store, no-cache, must-revalidate, max-age=0");
+    return httpd_resp_send(req, NULL, 0);
 }
 
 } // namespace
@@ -283,8 +320,10 @@ void setupCaptivePortal() {
 }
 
 void registerCaptivePortalHandlers(httpd_handle_t server) {
+    httpd_uri_t root_get = { .uri = "/", .method = HTTP_GET, .handler = rootRedirectHandler, .user_ctx = NULL };
     httpd_uri_t portal_get = { .uri = "/portal", .method = HTTP_GET, .handler = portalGetHandler, .user_ctx = NULL };
     httpd_uri_t portal_post = { .uri = "/portal", .method = HTTP_POST, .handler = portalPostHandler, .user_ctx = NULL };
+    httpd_register_uri_handler(server, &root_get);
     httpd_register_uri_handler(server, &portal_get);
     httpd_register_uri_handler(server, &portal_post);
 }

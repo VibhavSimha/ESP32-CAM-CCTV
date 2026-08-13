@@ -672,7 +672,7 @@ static esp_err_t view_handler(httpd_req_t *req) {
 void startCameraServer() {
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.server_port = 80;
-    config.max_uri_handlers = 10;
+    config.max_uri_handlers = 11;
     config.max_open_sockets = 7;
     config.recv_wait_timeout = 15;
     config.send_wait_timeout = 10;
