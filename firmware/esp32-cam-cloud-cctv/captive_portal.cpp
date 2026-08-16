@@ -476,11 +476,15 @@ static void onlineHeartbeat() {
         // printed STEP 3 instructions — match the portal that is actually present.
         handleCaptiveDetected(body, location);
     } else {
-        // The probe endpoint was unreachable (network/DNS). This is not a portal
-        // we can log into, so mark it FAILED and point the operator at /portal.
+        // The probe endpoint was unreachable (network/DNS). We cannot tell whether
+        // a captive portal is present, so don't claim one (that would print a stale
+        // portal URL). Report the drop concisely and point the operator at /portal,
+        // matching captivePortalBegin()'s unreachable path.
         setStatus(PORTAL_STATE_FAILED,
-                  "Lost internet connectivity — a portal login may be required again. Cloud uploads paused.");
-        printPortalInstructions();
+                  "Lost internet connectivity — cloud uploads paused. If a login "
+                  "page appears, open it in your browser.");
+        Serial.printf("[CaptivePortal] Cloud uploads paused. Open http://%s/portal on "
+                      "another device to check/retry.\n", WiFi.localIP().toString().c_str());
     }
 }
 
