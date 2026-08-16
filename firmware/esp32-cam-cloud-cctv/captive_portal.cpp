@@ -51,6 +51,14 @@ static unsigned long s_reprobeAt = 0;
 #define CAPTIVE_PERIODIC_REPROBE_MS 30000UL
 #endif
 static unsigned long s_periodicReprobeAt = 0;
+// Heartbeat interval while the internet IS confirmed reachable. We keep probing
+// (more gently than the offline re-probe) so a captive portal that re-appears
+// mid-operation — e.g. a time-limited ISP session that expires — is detected and
+// cloud uploads are paused again instead of silently failing (issue #40).
+#ifndef CAPTIVE_ONLINE_HEARTBEAT_MS
+#define CAPTIVE_ONLINE_HEARTBEAT_MS 60000UL
+#endif
+static unsigned long s_onlineHeartbeatAt = 0;
 
 PortalState captivePortalGetState() { return s_state; }
 
@@ -429,6 +437,30 @@ static void doReprobe() {
     s_periodicReprobeAt = millis() + CAPTIVE_PERIODIC_REPROBE_MS;
 }
 
+// Online heartbeat: called periodically while connectivity is CONFIRMED. It
+// re-verifies the internet is still reachable so that a captive portal which
+// re-appears mid-operation (e.g. an ISP session that times out) is detected and
+// cloud uploads are paused again — keeping the "always heartbeat before Supabase"
+// guarantee true over the whole uptime, not just at boot (issue #40).
+static void onlineHeartbeat() {
+    String body, location;
+    int code = probeInternet(body, location);
+    std::string b(body.c_str(), body.length());
+    if (code > 0 && !looksLikeCaptivePortal(code, b)) {
+        return; // still online — stay quiet to avoid log noise
+    }
+    // Connectivity lost. Pause cloud uploads (captivePortalIsOnline() flips to
+    // false via PORTAL_STATE_FAILED) and steer the operator back to /portal. The
+    // offline heartbeat in captivePortalLoop() then re-probes until access is
+    // restored, at which point uploads resume automatically.
+    Serial.printf("[CaptivePortal] Online heartbeat lost connectivity (HTTP %d) — pausing cloud uploads.\n", code);
+    if (location.length()) s_portalUrl = location;
+    setStatus(PORTAL_STATE_FAILED,
+              "Lost internet connectivity — a portal login may be required again. Cloud uploads paused.");
+    s_periodicReprobeAt = millis() + CAPTIVE_PERIODIC_REPROBE_MS;
+    printPortalInstructions();
+}
+
 static esp_err_t portal_reprobe_handler(httpd_req_t* req) {
     doReprobe();
     sendStatusJson(req);
@@ -612,6 +644,7 @@ void captivePortalLoop() {
     // uploads without a reboot. Cloud uploads stay paused via captivePortalIsOnline()
     // until this heartbeat confirms connectivity (issue #40).
     if (!captivePortalIsOnline() && WiFi.status() == WL_CONNECTED) {
+        s_onlineHeartbeatAt = 0;   // restart the online timer once we recover
         if (s_periodicReprobeAt == 0) {
             s_periodicReprobeAt = millis() + CAPTIVE_PERIODIC_REPROBE_MS;
         }
@@ -625,6 +658,17 @@ void captivePortalLoop() {
                               "phone/laptop on this Wi-Fi to log in.\n",
                               WiFi.localIP().toString().c_str());
             }
+        }
+    } else if (captivePortalIsOnline() && WiFi.status() == WL_CONNECTED) {
+        // Online: keep a gentle heartbeat so a captive portal that re-appears
+        // mid-operation is caught and uploads are paused again (issue #40).
+        s_periodicReprobeAt = 0;   // restart the offline timer if a portal returns
+        if (s_onlineHeartbeatAt == 0) {
+            s_onlineHeartbeatAt = millis() + CAPTIVE_ONLINE_HEARTBEAT_MS;
+        }
+        if ((long)(millis() - s_onlineHeartbeatAt) >= 0) {
+            s_onlineHeartbeatAt = millis() + CAPTIVE_ONLINE_HEARTBEAT_MS;
+            onlineHeartbeat();
         }
     }
 #endif

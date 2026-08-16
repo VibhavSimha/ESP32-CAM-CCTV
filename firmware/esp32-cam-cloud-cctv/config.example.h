@@ -199,3 +199,11 @@
 // Give up automated submission after this many failed attempts and steer the
 // user to the manual browser fallback.
 #define CAPTIVE_MAX_LOGIN_ATTEMPTS  3
+
+// Connectivity-heartbeat cadence (ms). While OFFLINE (behind a portal) the
+// firmware re-probes every CAPTIVE_PERIODIC_REPROBE_MS so it notices as soon as
+// you log in. While ONLINE it re-probes every CAPTIVE_ONLINE_HEARTBEAT_MS so a
+// portal that re-appears (e.g. an expiring ISP session) is caught and cloud
+// uploads are paused again (issue #40).
+#define CAPTIVE_PERIODIC_REPROBE_MS  30000UL
+#define CAPTIVE_ONLINE_HEARTBEAT_MS  60000UL
