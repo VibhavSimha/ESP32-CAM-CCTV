@@ -54,6 +54,16 @@ static unsigned long s_periodicReprobeAt = 0;
 
 PortalState captivePortalGetState() { return s_state; }
 
+bool captivePortalIsOnline() {
+#if !ENABLE_CAPTIVE_PORTAL_LOGIN
+    return true;
+#else
+    // Only OPEN (clean network) and SUCCESS (portal cleared) mean the internet
+    // has been positively confirmed reachable by the connectivity heartbeat.
+    return s_state == PORTAL_STATE_OPEN || s_state == PORTAL_STATE_SUCCESS;
+#endif
+}
+
 static void setStatus(PortalState st, const String& msg) {
     s_state = st;
     s_lastMessage = msg;
@@ -124,6 +134,41 @@ static void persistSeen(const String& ssid) {
         p.putBool("done", true);
         p.end();
     }
+}
+
+// -----------------------------------------------------------------------------
+// Operator guidance
+// -----------------------------------------------------------------------------
+
+// Print a clear, step-by-step banner telling the operator EXACTLY which URL to
+// open (on any phone/laptop joined to the same Wi-Fi) to clear the captive
+// portal. This replaces the previous terse one-line "manual browser fallback"
+// note so the required action is unmistakable in the serial log, instead of the
+// log filling up with repeated upload failures (issue #40).
+static void printPortalInstructions() {
+    String ip = WiFi.localIP().toString();
+    Serial.println();
+    Serial.println("========= ACTION REQUIRED: Wi-Fi captive-portal login =========");
+    Serial.println("[CaptivePortal] This network needs a one-time login before the camera");
+    Serial.println("[CaptivePortal] can reach the internet. Cloud uploads and the remote");
+    Serial.println("[CaptivePortal] tunnel are PAUSED until you complete it.");
+    Serial.println("[CaptivePortal]");
+    Serial.println("[CaptivePortal]   STEP 1  Join the SAME Wi-Fi on a phone or laptop.");
+    Serial.printf ("[CaptivePortal]   STEP 2  Open in a browser:  http://%s/portal\n", ip.c_str());
+    if (s_state == PORTAL_STATE_CAPTIVE) {
+        Serial.println("[CaptivePortal]   STEP 3  Enter your ISP portal username & password there;");
+        Serial.println("[CaptivePortal]           the camera submits the login for you.");
+    } else {
+        Serial.println("[CaptivePortal]   STEP 3  Tap the portal link on that page, finish the login");
+        Serial.println("[CaptivePortal]           in your browser, then tap 'Check again'.");
+        if (s_portalUrl.length()) {
+            Serial.printf("[CaptivePortal]           (ISP portal: %s )\n", s_portalUrl.c_str());
+        }
+    }
+    Serial.println("[CaptivePortal]   STEP 4  The camera re-checks connectivity every 30s and");
+    Serial.println("[CaptivePortal]           resumes uploads automatically once you are online.");
+    Serial.println("===============================================================");
+    Serial.println();
 }
 
 // -----------------------------------------------------------------------------
@@ -247,11 +292,15 @@ void captivePortalBegin() {
     }
     if (code <= 0) {
         // Could not reach the probe endpoint at all. Treat as recoverable: the
-        // camera server still starts so the user stays in control.
+        // camera server still starts so the user stays in control. Cloud uploads
+        // stay paused (captivePortalIsOnline() is false) until the heartbeat
+        // confirms connectivity.
         setStatus(PORTAL_STATE_FAILED,
                   "Could not reach the internet probe. If this network has a "
                   "login page, open it in your browser.");
         Serial.println("[CaptivePortal] Probe failed (network/DNS). Staying recoverable.");
+        Serial.printf("[CaptivePortal] Cloud uploads paused. Open http://%s/portal on another "
+                      "device to check/retry.\n", WiFi.localIP().toString().c_str());
         return;
     }
 
@@ -268,6 +317,9 @@ void captivePortalBegin() {
         if (page.length()) html = page;
     }
     analyzePortalPage(html);
+    // A captive portal is confirmed at this point — tell the operator, in clear
+    // step-by-step form, exactly which URL to open to clear it.
+    printPortalInstructions();
 #endif
 }
 
@@ -357,16 +409,17 @@ static esp_err_t portal_status_handler(httpd_req_t* req) {
 }
 
 // Immediate re-probe triggered by the user clicking "Check again" after they
-// have manually logged into a challenge/CHAP portal via their browser.
+// have manually logged into a challenge/CHAP portal via their browser, and also
+// the periodic connectivity heartbeat driven from captivePortalLoop().
 static void doReprobe() {
     String body, location;
     int code = probeInternet(body, location);
-    Serial.printf("[CaptivePortal] Re-probe %s -> HTTP %d\n", CAPTIVE_PROBE_URL, code);
+    Serial.printf("[CaptivePortal] Heartbeat re-probe %s -> HTTP %d\n", CAPTIVE_PROBE_URL, code);
     std::string b(body.c_str(), body.length());
     if (code > 0 && !looksLikeCaptivePortal(code, b)) {
         setStatus(PORTAL_STATE_SUCCESS, "Portal login succeeded — you are online.");
         persistSeen(WiFi.SSID());
-        Serial.println("[CaptivePortal] Re-probe: internet reachable — portal unlocked.");
+        Serial.println("[CaptivePortal] Internet reachable — portal cleared. Cloud uploads resume.");
     } else if (code <= 0) {
         setStatus(s_state, "Could not reach the internet. If you have logged in via your browser, try again in a moment.");
     } else {
@@ -552,15 +605,26 @@ void captivePortalLoop() {
         return;
     }
 
-    // Periodic re-probe when behind an unsupported/failed portal so the device
-    // detects when the user has manually logged in via their browser.
-    if (s_state == PORTAL_STATE_UNSUPPORTED || s_state == PORTAL_STATE_FAILED) {
+    // Periodic connectivity heartbeat while the internet is NOT confirmed
+    // reachable (any captive / failed / login-pending state). This lets the
+    // device automatically detect when the user has cleared the portal — via the
+    // /portal helper OR a manual browser login on any device — and resume cloud
+    // uploads without a reboot. Cloud uploads stay paused via captivePortalIsOnline()
+    // until this heartbeat confirms connectivity (issue #40).
+    if (!captivePortalIsOnline() && WiFi.status() == WL_CONNECTED) {
         if (s_periodicReprobeAt == 0) {
             s_periodicReprobeAt = millis() + CAPTIVE_PERIODIC_REPROBE_MS;
         }
         if ((long)(millis() - s_periodicReprobeAt) >= 0) {
-            Serial.println("[CaptivePortal] Periodic re-probe (waiting for manual browser login).");
+            Serial.println("[CaptivePortal] Connectivity heartbeat (waiting for portal login)...");
             doReprobe();
+            if (!captivePortalIsOnline()) {
+                // Still offline — remind the operator, with the exact URL, how to
+                // clear the portal from another device.
+                Serial.printf("[CaptivePortal] Still offline. Open http://%s/portal on a "
+                              "phone/laptop on this Wi-Fi to log in.\n",
+                              WiFi.localIP().toString().c_str());
+            }
         }
     }
 #endif

@@ -175,10 +175,16 @@
 //   4. Falls back to "open the portal in your browser" for challenge/JS portals
 //      (e.g. MikroTik CHAP) that cannot be automated safely.
 //
+// While a captive portal is blocking the internet, background Supabase uploads
+// and the remote tunnel are PAUSED and the serial log prints a clear step-by-step
+// banner with the exact URL to open (http://<device-ip>/portal). A connectivity
+// heartbeat re-probes every 30s and resumes cloud uploads automatically once you
+// have logged in — via the /portal helper or a manual browser login (issue #40).
+//
 // Only your Wi-Fi credentials (via WiFiManager/NVS) are persisted — the ISP
 // portal username/password are used once and never stored. Set to 0 to disable
-// the whole feature (the firmware then behaves exactly as before). See
-// docs/CONFIG_SETUP.md for details.
+// the whole feature (the firmware then behaves exactly as before, with cloud
+// uploads never gated on connectivity). See docs/CONFIG_SETUP.md for details.
 // -----------------------------------------------------------------------------
 #define ENABLE_CAPTIVE_PORTAL_LOGIN 1
 

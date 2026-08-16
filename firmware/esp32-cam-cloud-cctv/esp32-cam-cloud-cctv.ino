@@ -81,11 +81,19 @@ void loop() {
     // buffer + task stack) can collapse free heap to ~34 KB, causing crypto
     // login rejections and tunnel write stalls. Deferring the upload when
     // the tunnel is busy or heap is tight prevents these collisions.
+    //
+    // Issue #40: only attempt Supabase once the internet-connectivity heartbeat
+    // has CONFIRMED reachability (captivePortalIsOnline()). Behind an ISP captive
+    // portal the network is joined but the internet is blocked, so every upload
+    // fails with HTTP 0 and floods the log; pausing here keeps the device quiet
+    // and lets the operator see the /portal login instructions instead. Uploads
+    // resume automatically once the captive-portal heartbeat clears.
     static unsigned long lastIdleUpload = 0;
     if (active_stream_clients == 0 &&
         millis() - lastIdleUpload > 3000 &&
         ESP.getFreeHeap() >= MIN_HEAP_FOR_UPLOAD &&
-        !isTunnelSlotBusy()) {
+        !isTunnelSlotBusy() &&
+        captivePortalIsOnline()) {
         lastIdleUpload = millis();
         Serial.println("[Idle] No clients streaming. Performing autonomous background upload.");
         uploadFrameToCloud();

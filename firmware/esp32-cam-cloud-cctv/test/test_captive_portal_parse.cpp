@@ -142,6 +142,36 @@ static void test_captive_detection() {
     CHECK(!looksLikeCaptivePortal(200, ""));            // empty 200, no redirect
 }
 
+// Issue #40: the exact field-report scenario — the generate_204 probe is
+// intercepted with an HTTP 302 to a MikroTik ISP portal, whose login page is a
+// CHAP challenge that cannot be automated. This is the detection path that must
+// mark the device offline (captivePortalIsOnline() == false on the firmware)
+// so that cloud uploads are paused and the operator is steered to /portal.
+static void test_issue40_isp_captive_redirect() {
+    std::printf("test_issue40_isp_captive_redirect\n");
+    // 1. The probe response looks like a captive portal (302 redirect).
+    CHECK(looksLikeCaptivePortal(302, ""));
+
+    // 2. The fetched MikroTik portal page is a CHAP challenge -> not automatable,
+    //    so the firmware falls back to the browser/manual path (uploads paused).
+    const std::string portalHtml =
+        "<html><head><title>ISP Login</title></head><body>"
+        "<form name='login' action='http://10.201.125.1/login' method='post'>"
+        "<input type='hidden' name='dst' value='http://connectivitycheck.gstatic.com/generate_204'>"
+        "<input type='hidden' name='popup' value='true'>"
+        "<input type='hidden' name='chap-id' value='\\37'>"
+        "<input type='hidden' name='chap-challenge' value='deadbeef'>"
+        "<input name='username' type='text'>"
+        "<input name='password' type='password'>"
+        "</form></body></html>";
+    PortalForm f;
+    bool ok = parseLoginForm(portalHtml, f);
+    CHECK(!ok);            // cannot be automated
+    CHECK(f.formFound);
+    CHECK(f.challenge);    // challenge portal -> manual browser fallback
+    CHECK(!f.valid);
+}
+
 int main() {
     test_generic_user_pass();
     test_email_field();
@@ -150,6 +180,7 @@ int main() {
     test_no_form_fallback();
     test_attribute_order();
     test_captive_detection();
+    test_issue40_isp_captive_redirect();
 
     if (g_failures == 0) {
         std::printf("\nAll captive-portal parser tests passed.\n");
