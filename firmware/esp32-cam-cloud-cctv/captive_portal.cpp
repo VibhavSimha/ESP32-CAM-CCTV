@@ -59,6 +59,10 @@ static unsigned long s_periodicReprobeAt = 0;
 #define CAPTIVE_ONLINE_HEARTBEAT_MS 60000UL
 #endif
 static unsigned long s_onlineHeartbeatAt = 0;
+// Tracks the previous connectivity state so captivePortalLoop() can reset the
+// heartbeat timers exactly once on an offline<->online transition, rather than
+// on every loop tick (issue #40).
+static bool s_prevOnline = false;
 
 PortalState captivePortalGetState() { return s_state; }
 
@@ -277,6 +281,30 @@ static void analyzePortalPage(const String& html) {
                   (unsigned)s_form.hidden.size());
 }
 
+// A captive portal has been confirmed reachable (the probe was redirected to a
+// login page). Locate that page, auto-detect the login form, set the resulting
+// state (CAPTIVE when the form can be automated, UNSUPPORTED otherwise) and print
+// step-by-step login instructions. Shared by the boot-time probe
+// (captivePortalBegin) and the online heartbeat's portal-reappeared path so both
+// classify the portal identically instead of guessing (issue #40).
+static void handleCaptiveDetected(const String& body, const String& location) {
+    s_portalUrl = location.length() ? location : String(CAPTIVE_PROBE_URL);
+    Serial.printf("[CaptivePortal] Captive portal detected. Portal URL: %s\n", s_portalUrl.c_str());
+
+    String html = body;
+    if (location.length()) {
+        String page;
+        int pcode = fetchPortalPage(s_portalUrl, page);
+        Serial.printf("[CaptivePortal] Fetch portal page -> HTTP %d (%u bytes)\n",
+                      pcode, (unsigned)page.length());
+        if (page.length()) html = page;
+    }
+    analyzePortalPage(html);
+    // A captive portal is confirmed at this point — tell the operator, in clear
+    // step-by-step form, exactly which URL to open to clear it.
+    printPortalInstructions();
+}
+
 // -----------------------------------------------------------------------------
 // Public: post-connect probe
 // -----------------------------------------------------------------------------
@@ -312,22 +340,9 @@ void captivePortalBegin() {
         return;
     }
 
-    // Captive portal — locate the login page (redirect target or probe body).
-    s_portalUrl = location.length() ? location : String(CAPTIVE_PROBE_URL);
-    Serial.printf("[CaptivePortal] Captive portal detected. Portal URL: %s\n", s_portalUrl.c_str());
-
-    String html = body;
-    if (location.length()) {
-        String page;
-        int pcode = fetchPortalPage(s_portalUrl, page);
-        Serial.printf("[CaptivePortal] Fetch portal page -> HTTP %d (%u bytes)\n",
-                      pcode, (unsigned)page.length());
-        if (page.length()) html = page;
-    }
-    analyzePortalPage(html);
-    // A captive portal is confirmed at this point — tell the operator, in clear
-    // step-by-step form, exactly which URL to open to clear it.
-    printPortalInstructions();
+    // Captive portal — locate the login page, auto-detect the form, and print
+    // step-by-step login instructions (shared with the online heartbeat).
+    handleCaptiveDetected(body, location);
 #endif
 }
 
@@ -450,15 +465,23 @@ static void onlineHeartbeat() {
         return; // still online — stay quiet to avoid log noise
     }
     // Connectivity lost. Pause cloud uploads (captivePortalIsOnline() flips to
-    // false via PORTAL_STATE_FAILED) and steer the operator back to /portal. The
-    // offline heartbeat in captivePortalLoop() then re-probes until access is
-    // restored, at which point uploads resume automatically.
+    // false) and steer the operator back to /portal. The offline heartbeat in
+    // captivePortalLoop() then re-probes until access is restored, at which point
+    // uploads resume automatically.
     Serial.printf("[CaptivePortal] Online heartbeat lost connectivity (HTTP %d) — pausing cloud uploads.\n", code);
-    if (location.length()) s_portalUrl = location;
-    setStatus(PORTAL_STATE_FAILED,
-              "Lost internet connectivity — a portal login may be required again. Cloud uploads paused.");
-    s_periodicReprobeAt = millis() + CAPTIVE_PERIODIC_REPROBE_MS;
-    printPortalInstructions();
+    if (code > 0) {
+        // A captive portal re-appeared and was reachable (redirected us to a
+        // login page). Re-detect it exactly like the boot probe so /portal offers
+        // the right flow and the state (CAPTIVE / UNSUPPORTED) — and therefore the
+        // printed STEP 3 instructions — match the portal that is actually present.
+        handleCaptiveDetected(body, location);
+    } else {
+        // The probe endpoint was unreachable (network/DNS). This is not a portal
+        // we can log into, so mark it FAILED and point the operator at /portal.
+        setStatus(PORTAL_STATE_FAILED,
+                  "Lost internet connectivity — a portal login may be required again. Cloud uploads paused.");
+        printPortalInstructions();
+    }
 }
 
 static esp_err_t portal_reprobe_handler(httpd_req_t* req) {
@@ -643,8 +666,15 @@ void captivePortalLoop() {
     // /portal helper OR a manual browser login on any device — and resume cloud
     // uploads without a reboot. Cloud uploads stay paused via captivePortalIsOnline()
     // until this heartbeat confirms connectivity (issue #40).
-    if (!captivePortalIsOnline() && WiFi.status() == WL_CONNECTED) {
-        s_onlineHeartbeatAt = 0;   // restart the online timer once we recover
+    bool online = captivePortalIsOnline();
+    if (online != s_prevOnline) {
+        // Connectivity flipped: start the newly-active mode's heartbeat fresh so
+        // each mode's timer is initialised once per transition, not every tick.
+        s_periodicReprobeAt = 0;
+        s_onlineHeartbeatAt = 0;
+        s_prevOnline = online;
+    }
+    if (!online && WiFi.status() == WL_CONNECTED) {
         if (s_periodicReprobeAt == 0) {
             s_periodicReprobeAt = millis() + CAPTIVE_PERIODIC_REPROBE_MS;
         }
@@ -659,10 +689,9 @@ void captivePortalLoop() {
                               WiFi.localIP().toString().c_str());
             }
         }
-    } else if (captivePortalIsOnline() && WiFi.status() == WL_CONNECTED) {
+    } else if (online && WiFi.status() == WL_CONNECTED) {
         // Online: keep a gentle heartbeat so a captive portal that re-appears
         // mid-operation is caught and uploads are paused again (issue #40).
-        s_periodicReprobeAt = 0;   // restart the offline timer if a portal returns
         if (s_onlineHeartbeatAt == 0) {
             s_onlineHeartbeatAt = millis() + CAPTIVE_ONLINE_HEARTBEAT_MS;
         }
