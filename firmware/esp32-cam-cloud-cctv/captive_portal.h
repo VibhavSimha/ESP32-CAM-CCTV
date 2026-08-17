@@ -51,3 +51,13 @@ void registerCaptivePortalHandlers(httpd_handle_t server);
 
 // Current state (for diagnostics / other modules). 
 PortalState captivePortalGetState();
+
+// Internet-reachability heartbeat. Returns true ONLY when connectivity has been
+// CONFIRMED — either an open network (no captive portal) or after a successful
+// portal login. While a captive portal is still intercepting traffic (or the
+// connectivity probe cannot be reached) it returns false, so background cloud
+// work (Supabase uploads, tunnel URL publishing) can be paused until the user
+// logs in instead of hammering the network with requests that always fail
+// (issue #40). When the feature is disabled at compile time it always returns
+// true, so callers behave exactly as before.
+bool captivePortalIsOnline();

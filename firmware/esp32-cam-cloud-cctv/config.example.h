@@ -175,10 +175,16 @@
 //   4. Falls back to "open the portal in your browser" for challenge/JS portals
 //      (e.g. MikroTik CHAP) that cannot be automated safely.
 //
+// While a captive portal is blocking the internet, background Supabase uploads
+// and the remote tunnel are PAUSED and the serial log prints a clear step-by-step
+// banner with the exact URL to open (http://<device-ip>/portal). A connectivity
+// heartbeat re-probes every 30s and resumes cloud uploads automatically once you
+// have logged in — via the /portal helper or a manual browser login (issue #40).
+//
 // Only your Wi-Fi credentials (via WiFiManager/NVS) are persisted — the ISP
 // portal username/password are used once and never stored. Set to 0 to disable
-// the whole feature (the firmware then behaves exactly as before). See
-// docs/CONFIG_SETUP.md for details.
+// the whole feature (the firmware then behaves exactly as before, with cloud
+// uploads never gated on connectivity). See docs/CONFIG_SETUP.md for details.
 // -----------------------------------------------------------------------------
 #define ENABLE_CAPTIVE_PORTAL_LOGIN 1
 
@@ -193,3 +199,19 @@
 // Give up automated submission after this many failed attempts and steer the
 // user to the manual browser fallback.
 #define CAPTIVE_MAX_LOGIN_ATTEMPTS  3
+
+// Connectivity-heartbeat cadence (ms). While OFFLINE (behind a portal) the
+// firmware re-probes every CAPTIVE_PERIODIC_REPROBE_MS so it notices as soon as
+// you log in. While ONLINE it re-probes every CAPTIVE_ONLINE_HEARTBEAT_MS so a
+// portal that re-appears (e.g. an expiring ISP session) is caught and cloud
+// uploads are paused again (issue #40).
+#define CAPTIVE_PERIODIC_REPROBE_MS  30000UL
+#define CAPTIVE_ONLINE_HEARTBEAT_MS  60000UL
+
+// Diagnostic: dump the FULL fetched captive-portal login page to the serial
+// console when a portal is detected. This is the fastest way to see the exact
+// HTML the ESP32 received (field names, hidden CHAP tokens, JavaScript) so you
+// know precisely what needs to be parsed/submitted for your specific ISP portal.
+// It only prints when a captive portal is actually detected, so it stays silent
+// on open networks. Set to 0 to disable.
+#define CAPTIVE_LOG_PORTAL_PAGE      1

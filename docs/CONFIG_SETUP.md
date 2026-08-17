@@ -102,13 +102,31 @@ hostel / campus / ISP hotspots). When `ENABLE_CAPTIVE_PORTAL_LOGIN` is `1`
    ISP portal username/password; the board submits the login for you and
    re-checks connectivity.
 
+### Connectivity heartbeat gates the cloud (issue #40)
+Behind a captive portal the board is *joined* to Wi-Fi but the internet is still
+blocked, so Supabase uploads and the remote tunnel would otherwise fail on every
+attempt (`HTTP 0`) and flood the serial log. To prevent that, the firmware only
+talks to Supabase **after** the connectivity heartbeat has confirmed the internet
+is reachable:
+
+- While a captive portal (or an unreachable probe) is detected, background cloud
+  uploads are **paused** and the serial log prints a clear, step-by-step banner
+  telling you exactly which URL to open (`http://<device-ip>/portal`).
+- The heartbeat re-probes every `CAPTIVE_PERIODIC_REPROBE_MS` (30 s). As soon as
+  it detects the portal has been cleared — via the `/portal` helper **or** a
+  manual browser login on any device — it logs `Cloud uploads resume` and the
+  autonomous uploader starts again automatically, no reboot required.
+
 ### Configuration knobs (`config.h`)
 | Macro | Default | Purpose |
 | --- | --- | --- |
-| `ENABLE_CAPTIVE_PORTAL_LOGIN` | `1` | Set to `0` to disable the whole feature. |
+| `ENABLE_CAPTIVE_PORTAL_LOGIN` | `1` | Set to `0` to disable the whole feature (cloud uploads are then never gated). |
 | `CAPTIVE_PROBE_URL` | `http://connectivitycheck.gstatic.com/generate_204` | Plain-HTTP 204 probe used to detect interception. |
 | `CAPTIVE_PROBE_TIMEOUT_MS` | `6000` | Per-request timeout for the probe/submit. |
 | `CAPTIVE_MAX_LOGIN_ATTEMPTS` | `3` | Attempts before steering the user to the manual browser fallback. |
+| `CAPTIVE_PERIODIC_REPROBE_MS` | `30000` | Heartbeat cadence while **offline** (waiting for the portal login). |
+| `CAPTIVE_ONLINE_HEARTBEAT_MS` | `60000` | Heartbeat cadence while **online** (to catch a portal that re-appears). |
+| `CAPTIVE_LOG_PORTAL_PAGE` | `1` | Dump the full fetched portal login page to the serial console when a portal is detected (diagnostic — see the exact HTML/fields to parse). Set to `0` to silence. |
 
 ### Scope & fallback
 - **Persistence:** only the Wi-Fi credentials (WiFiManager/NVS) plus a lightweight
@@ -116,7 +134,10 @@ hostel / campus / ISP hotspots). When `ENABLE_CAPTIVE_PORTAL_LOGIN` is `1`
   and **never** persisted.
 - **Unsupported portals:** challenge/response logins (e.g. MikroTik CHAP), pages
   with no `<form>`, or JavaScript-only portals are detected and the device shows
-  a link to open the real portal page and finish the login manually.
+  a link to open the real portal page and finish the login manually. When a
+  portal is detected the firmware also prints the **full fetched login page** to
+  the serial console (`CAPTIVE_LOG_PORTAL_PAGE`, default on) so you can see the
+  exact HTML/fields it received and report them.
 - **Recovery:** if login fails or the network changes, the device stays reachable
   through its own `ESP32-CAM-Setup` AP and `/portal` page so you can retry
   without re-flashing.
