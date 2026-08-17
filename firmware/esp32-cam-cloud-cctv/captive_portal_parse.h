@@ -34,13 +34,28 @@ struct PortalForm {
     std::string chapId;            // decoded raw bytes of chap-id (CHAP only)
     std::string chapChallenge;     // decoded raw bytes of chap-challenge (CHAP only)
     std::vector<PortalFormField> hidden; // hidden inputs to echo back on submit
+    // A (possibly relative) URL to follow when THIS page carries no usable login
+    // form but is a redirect/landing page — e.g. a MikroTik hotspot serves an
+    // rlogin-style page ("If you are not redirected… click continue") that only
+    // reaches the real login.html via a <meta refresh>, a JS location redirect,
+    // or a "continue" link/form. The caller follows one hop and re-parses so the
+    // ESP32 can reach — and auto-submit — the real login form (issue #44).
+    std::string redirectUrl;
 };
 
-// Auto-detect the login form in `html`. Returns true when the form is simple
-// enough to automate — either a plain username+password form, or a MikroTik
-// hotspot CHAP form whose password we can hash ourselves (issue #42). On a
-// challenge/JS-only/no-form page it returns false and sets flags so the caller
-// can fall back to the browser-assisted manual path.
+// Auto-detect the login form in `html`. Returns true when a form simple enough
+// to automate is found — either a plain username+password form, or a MikroTik
+// hotspot CHAP form whose password we can hash ourselves (issue #42).
+//
+// The whole page is scanned: a portal page can carry SEVERAL forms (the MikroTik
+// default login page has a hidden "sendin" form BEFORE the visible login form),
+// so the first <form> is not assumed to be the login form. MikroTik pages that
+// carry chap-id/chap-challenge only inside their md5.js call (not as <input>s)
+// are detected too (issue #44).
+//
+// On a challenge / JS-only / no-form / redirect-only page it returns false and
+// sets flags (and `out.redirectUrl` when a next-hop URL is present) so the caller
+// can follow a redirect and/or fall back to the browser-assisted manual path.
 bool parseLoginForm(const std::string& html, PortalForm& out);
 
 // Heuristic: does an HTTP connectivity-probe response look like a captive portal
