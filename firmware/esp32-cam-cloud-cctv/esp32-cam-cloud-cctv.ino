@@ -1,4 +1,5 @@
 #include <Arduino.h>
+#include <cstring>
 #include "config.h"
 #include "camera_init.h"
 #include "wifi_manager.h"
@@ -9,10 +10,70 @@
 #include "crypto_auth.h"
 #include "motion_pir.h"
 
+// Print one aligned "[Config] <label> <status>" line (helper for logConfigStatus).
+static void logConfigLine(const char* label, bool ok, const char* okText, const char* badText) {
+    Serial.printf("[Config] %-24s %s\n", label, ok ? okText : badText);
+}
+
+// Report whether each configuration macro has a real value WITHOUT printing any
+// secret (issue #44). This is a boot-time diagnostic so an operator can confirm
+// at a glance that config.h is filled in correctly and rule out a plain
+// misconfiguration as the cause of connectivity / captive-portal problems. Only
+// SET / NOT-SET / still-the-example-default is logged — never the actual values.
+static void logConfigStatus() {
+    Serial.println("========== Configuration status (secrets hidden) ==========");
+
+    // Camera viewer login.
+    logConfigLine("Camera login user", strlen(CONFIG_HTTP_USER) > 0, "SET", "NOT SET");
+    bool passSet  = strlen(CONFIG_HTTP_PASS) > 0;
+    bool passWeak = passSet && (strcmp(CONFIG_HTTP_PASS, "changeme12345678") == 0);
+    logConfigLine("Camera login password", passSet && !passWeak, "SET",
+                  passSet ? "SET but still the EXAMPLE DEFAULT — change it!" : "NOT SET");
+
+    // Device pubkey pinning (login MITM hardening).
+    logConfigLine("Device pubkey pinned", strlen(CONFIG_DEVICE_PUBKEY_B64) > 0,
+                  "SET (pinned)", "NOT PINNED (login works but is not MITM-protected)");
+
+    // Public tunnel.
+#if CONFIG_TUNNEL_MODE == CONFIG_TUNNEL_MODE_BORE
+    Serial.printf("[Config] %-24s %s\n", "Tunnel mode", "BORE");
+    logConfigLine("BORE server", strlen(CONFIG_BORE_SERVER) > 0, "SET", "NOT SET");
+#elif CONFIG_TUNNEL_MODE == CONFIG_TUNNEL_MODE_SELFHOST
+    Serial.printf("[Config] %-24s %s\n", "Tunnel mode", "SELFHOST");
+    logConfigLine("Selfhost tunnel ID",
+                  strlen(CONFIG_SELFHOST_TUNNEL_ID) > 0 &&
+                      strcmp(CONFIG_SELFHOST_TUNNEL_ID, "00000000-0000-4000-8000-000000000000") != 0,
+                  "SET", "NOT SET (still the example placeholder)");
+#else
+    Serial.printf("[Config] %-24s %s\n", "Tunnel mode", "UNKNOWN");
+#endif
+
+    // Supabase cloud storage.
+    logConfigLine("Supabase URL",
+                  strlen(SUPABASE_URL) > 0 && strcmp(SUPABASE_URL, "https://xxxx.supabase.co") != 0,
+                  "SET", "NOT CONFIGURED (still the example placeholder)");
+    logConfigLine("Supabase anon key",
+                  strlen(SUPABASE_ANON_KEY) > 0 && strcmp(SUPABASE_ANON_KEY, "your-anon-key") != 0,
+                  "SET", "NOT CONFIGURED (still the example placeholder)");
+    logConfigLine("Supabase bucket", strlen(SUPABASE_BUCKET) > 0, "SET", "NOT SET");
+
+    // Wi-Fi setup AP + feature toggles.
+    logConfigLine("Wi-Fi setup AP name", strlen(WIFI_AP_NAME) > 0, "SET", "NOT SET");
+    logConfigLine("Captive-portal login", ENABLE_CAPTIVE_PORTAL_LOGIN != 0, "ENABLED", "DISABLED");
+    logConfigLine("PIR motion", ENABLE_PIR_MOTION != 0, "ENABLED", "DISABLED");
+    logConfigLine("Captive probe URL", strlen(CAPTIVE_PROBE_URL) > 0, "SET", "NOT SET");
+
+    Serial.println("===========================================================");
+}
+
 void setup() {
     Serial.begin(115200);
     Serial.setDebugOutput(true);
     Serial.println();
+
+    // Log which configuration values are set (no secrets) so a plain
+    // misconfiguration can be ruled out up-front (issue #44).
+    logConfigStatus();
 
     // 1. Initialize Camera
     if (initCamera() != ESP_OK) {

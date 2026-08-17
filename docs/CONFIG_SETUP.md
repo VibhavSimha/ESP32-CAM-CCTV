@@ -95,15 +95,24 @@ hostel / campus / ISP hotspots). When `ENABLE_CAPTIVE_PORTAL_LOGIN` is `1`
    network returns `204` and nothing happens.
 2. If a captive portal intercepts the probe, the firmware fetches the portal
    login page and **auto-detects** the username and password fields — the field
-   names are **not** hardcoded, so it adapts to different ISPs (it uses the first
-   text-like input as the username and the `type=password` input as the
-   password, echoing any hidden fields on submit). **MikroTik** hotspots that use
-   a CHAP (MD5 challenge) login are handled too: the board reads the page's
-   `chap-id`/`chap-challenge`, hashes the password locally as
+   names are **not** hardcoded, so it adapts to different ISPs (it scans **all**
+   `<form>`s on the page and picks the real login form, using the first text-like
+   input as the username and the `type=password` input as the password, echoing
+   any hidden fields on submit). **MikroTik** hotspots that use a CHAP (MD5
+   challenge) login are handled too: the board reads the page's
+   `chap-id`/`chap-challenge` — from hidden inputs **or** from the inline
+   `hexMD5('$(chap-id)' + … + '$(chap-challenge)')` JavaScript when that is the
+   only place they appear — hashes the password locally as
    `MD5(chap-id + password + chap-challenge)` — exactly like the portal's own
    JavaScript — and submits that, so the plaintext password never leaves the
-   board (issue #42).
-3. Open `http://<device-ip>/portal` in a browser on the same network. Enter the
+   board (issues #42, #44).
+3. Some hotspots (MikroTik especially) first serve an **rlogin-style landing
+   page** that only *redirects* to the real `login.html` via a `<meta refresh>`,
+   a JavaScript `window.location` change or a "continue" link. The ESP32 does not
+   run JavaScript, so the firmware follows up to `CAPTIVE_MAX_REDIRECT_HOPS` such
+   hops itself to reach the real login form instead of stalling on the landing
+   page (issue #44).
+4. Open `http://<device-ip>/portal` in a browser on the same network. Enter the
    ISP portal username/password; the board submits the login for you and
    re-checks connectivity.
 
@@ -132,6 +141,36 @@ is reachable:
 | `CAPTIVE_PERIODIC_REPROBE_MS` | `30000` | Heartbeat cadence while **offline** (waiting for the portal login). |
 | `CAPTIVE_ONLINE_HEARTBEAT_MS` | `60000` | Heartbeat cadence while **online** (to catch a portal that re-appears). |
 | `CAPTIVE_LOG_PORTAL_PAGE` | `1` | Dump the full fetched portal login page to the serial console when a portal is detected (diagnostic — see the exact HTML/fields to parse). Set to `0` to silence. |
+| `CAPTIVE_MAX_REDIRECT_HOPS` | `3` | How many landing-page redirects (`<meta refresh>` / JS `location` / "continue" link) the firmware will follow to reach the real login form (issue #44). |
+
+### Why log in on the camera's `/portal`, not on your phone (per-MAC gotcha)
+A common question: *should I open the ISP portal URL on my PC while it is on the
+same hotspot?* Usually **no** — and here is why. Most hotspots (MikroTik included)
+authorise **each device separately, by its MAC address**. Logging in from your
+phone or PC only grants **that** device internet — the camera has a *different*
+MAC and stays blocked. If your phone is already logged in, opening the portal
+there often just shows *"you are already logged in"*, which does nothing for the
+camera and is the exact dead-end seen in issue #44.
+
+The reliable path is to let the **camera log itself in**: open
+`http://<device-ip>/portal`, type the ISP username/password there, and the
+**camera** submits the login over **its own** connection, so **its** MAC is the
+one authorised. Only fall back to a manual browser login for portals that cannot
+be automated — and if the camera then stays blocked, ask your ISP to authorise
+the camera's MAC address (printed in the serial log's action banner).
+
+### Startup diagnostics (rule out misconfiguration — issue #44)
+To make problems easy to diagnose from the serial log alone, the firmware prints
+two extra diagnostic blocks (no secrets are ever logged):
+
+- A **`[Config]` status banner at boot** that reports, for every `config.h`
+  value, whether it is `SET`, `NOT SET`, or still the example default/placeholder
+  — **without** printing any actual value. Use it to confirm at a glance that
+  `config.h` is filled in correctly.
+- **`[CaptivePortal] Network diagnostics`** (SSID, RSSI, channel, IP, gateway,
+  subnet, DNS, MAC) and a **`Parse result`** line (which form fields / CHAP /
+  redirect the parser found) whenever a portal is detected, so signal, DNS
+  interception or a mis-detected form can be ruled out quickly.
 
 ### Scope & fallback
 - **Persistence:** only the Wi-Fi credentials (WiFiManager/NVS) plus a lightweight

@@ -218,3 +218,11 @@
 // It only prints when a captive portal is actually detected, so it stays silent
 // on open networks. Set to 0 to disable.
 #define CAPTIVE_LOG_PORTAL_PAGE      1
+
+// Some hotspots (MikroTik especially) do not serve the login form directly: the
+// first page is an rlogin-style LANDING page that only redirects to the real
+// login.html via a <meta refresh>, a JavaScript location change or a "continue"
+// link. The ESP32 does not run JavaScript, so the firmware follows up to this
+// many such hops itself to reach the real login form instead of stalling on the
+// landing page (issue #44). 0 disables redirect-following.
+#define CAPTIVE_MAX_REDIRECT_HOPS    3
