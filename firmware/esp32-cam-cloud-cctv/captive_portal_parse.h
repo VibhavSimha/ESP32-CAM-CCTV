@@ -25,18 +25,22 @@ struct PortalFormField {
 struct PortalForm {
     bool formFound = false;        // a <form> ... </form> block was located
     bool valid = false;            // usable for automated ESP32-side submit
-    bool challenge = false;        // challenge/response portal (e.g. MikroTik CHAP)
+    bool challenge = false;        // challenge/response portal we CANNOT automate
+    bool chapLogin = false;        // MikroTik CHAP portal we CAN automate (issue #42)
     std::string action;            // form action (may be empty -> post to page URL)
     std::string method;            // "post" or "get" (lowercase)
     std::string userField;         // auto-detected username input name
     std::string passField;         // auto-detected password input name
+    std::string chapId;            // decoded raw bytes of chap-id (CHAP only)
+    std::string chapChallenge;     // decoded raw bytes of chap-challenge (CHAP only)
     std::vector<PortalFormField> hidden; // hidden inputs to echo back on submit
 };
 
 // Auto-detect the login form in `html`. Returns true when the form is simple
-// enough to automate (a username field, a password field, no challenge). On a
-// challenge/JS-only/no-form page, returns false and sets flags so the caller can
-// fall back to the browser-assisted manual path.
+// enough to automate — either a plain username+password form, or a MikroTik
+// hotspot CHAP form whose password we can hash ourselves (issue #42). On a
+// challenge/JS-only/no-form page it returns false and sets flags so the caller
+// can fall back to the browser-assisted manual path.
 bool parseLoginForm(const std::string& html, PortalForm& out);
 
 // Heuristic: does an HTTP connectivity-probe response look like a captive portal
@@ -46,7 +50,19 @@ bool looksLikeCaptivePortal(int status, const std::string& body);
 
 // Build an application/x-www-form-urlencoded body from the detected form,
 // substituting the user-supplied username/password into the auto-detected
-// fields and echoing every hidden field. Exposed for host testing.
+// fields and echoing every hidden field. For a MikroTik CHAP form (issue #42)
+// the password is replaced by the CHAP response hash — the plaintext password is
+// never sent. Exposed for host testing.
 std::string buildFormBody(const PortalForm& form,
                           const std::string& username,
                           const std::string& password);
+
+// Compute the MikroTik hotspot CHAP login response:
+//   hex( MD5( chapId + password + chapChallenge ) )
+// where `chapId` and `chapChallenge` are the RAW (already hex-decoded) byte
+// strings taken from the portal page. MD5 here is mandated by the MikroTik CHAP
+// hotspot protocol; it is not used for any security decision of our own. Exposed
+// for host testing against known vectors.
+std::string mikrotikChapPassword(const std::string& chapId,
+                                 const std::string& chapChallenge,
+                                 const std::string& password);
