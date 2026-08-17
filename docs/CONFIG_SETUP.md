@@ -126,6 +126,7 @@ is reachable:
 | `CAPTIVE_MAX_LOGIN_ATTEMPTS` | `3` | Attempts before steering the user to the manual browser fallback. |
 | `CAPTIVE_PERIODIC_REPROBE_MS` | `30000` | Heartbeat cadence while **offline** (waiting for the portal login). |
 | `CAPTIVE_ONLINE_HEARTBEAT_MS` | `60000` | Heartbeat cadence while **online** (to catch a portal that re-appears). |
+| `CAPTIVE_LOG_PORTAL_PAGE` | `1` | Dump the full fetched portal login page to the serial console when a portal is detected (diagnostic — see the exact HTML/fields to parse). Set to `0` to silence. |
 
 ### Scope & fallback
 - **Persistence:** only the Wi-Fi credentials (WiFiManager/NVS) plus a lightweight
@@ -133,7 +134,10 @@ is reachable:
   and **never** persisted.
 - **Unsupported portals:** challenge/response logins (e.g. MikroTik CHAP), pages
   with no `<form>`, or JavaScript-only portals are detected and the device shows
-  a link to open the real portal page and finish the login manually.
+  a link to open the real portal page and finish the login manually. When a
+  portal is detected the firmware also prints the **full fetched login page** to
+  the serial console (`CAPTIVE_LOG_PORTAL_PAGE`, default on) so you can see the
+  exact HTML/fields it received and report them.
 - **Recovery:** if login fails or the network changes, the device stays reachable
   through its own `ESP32-CAM-Setup` AP and `/portal` page so you can retry
   without re-flashing.

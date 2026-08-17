@@ -35,6 +35,16 @@
 // Cap how much of a portal page we read into RAM (heap is precious here).
 #define CAPTIVE_MAX_PAGE_BYTES 12288
 
+// Dump the full fetched captive-portal login page to the serial console when a
+// portal is detected. This is a diagnostic aid: many ISP portals (e.g. MikroTik
+// CHAP) cannot be auto-detected, and seeing the exact HTML the ESP32 received is
+// the fastest way to work out which fields to parse/submit. Set to 0 in config.h
+// to silence it. It only ever prints when a captive portal is actually detected
+// (rare), so it does not add noise on open networks.
+#ifndef CAPTIVE_LOG_PORTAL_PAGE
+#define CAPTIVE_LOG_PORTAL_PAGE 1
+#endif
+
 // -----------------------------------------------------------------------------
 // Module state
 // -----------------------------------------------------------------------------
@@ -246,6 +256,30 @@ static int fetchPortalPage(const String& url, String& html) {
     return code;
 }
 
+// Dump the exact portal HTML we are about to parse to the serial console, in
+// small chunks so a large page cannot overflow the UART TX buffer. This is what
+// lets us see the real login form (field names, hidden CHAP tokens, JS) and
+// decide precisely what to parse/submit instead of guessing (see the
+// CAPTIVE_LOG_PORTAL_PAGE knob). Byte-accurate: we write the raw bytes, not an
+// escaped/normalised copy, so what you see is exactly what the ESP32 received.
+static void logPortalPage(const String& html) {
+#if CAPTIVE_LOG_PORTAL_PAGE
+    const char* p = html.c_str();
+    const size_t n = html.length();
+    Serial.printf("[CaptivePortal] ===== BEGIN portal page (%u bytes) =====\n", (unsigned)n);
+    const size_t chunk = 256;
+    for (size_t i = 0; i < n; i += chunk) {
+        size_t len = (n - i < chunk) ? (n - i) : chunk;
+        Serial.write((const uint8_t*)(p + i), len);
+        Serial.flush();
+    }
+    if (n == 0 || p[n - 1] != '\n') Serial.println();
+    Serial.println("[CaptivePortal] ===== END portal page =====");
+#else
+    (void)html;
+#endif
+}
+
 // Parse the portal page and populate s_form / s_portalUrl / state.
 static void analyzePortalPage(const String& html) {
     std::string h(html.c_str(), html.length());
@@ -299,6 +333,9 @@ static void handleCaptiveDetected(const String& body, const String& location) {
                       pcode, (unsigned)page.length());
         if (page.length()) html = page;
     }
+    // Dump the exact page we are about to parse so the real login form (field
+    // names / hidden CHAP tokens / JS) is visible on the serial console.
+    logPortalPage(html);
     analyzePortalPage(html);
     // A captive portal is confirmed at this point — tell the operator, in clear
     // step-by-step form, exactly which URL to open to clear it.

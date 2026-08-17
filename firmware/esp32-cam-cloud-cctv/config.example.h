@@ -207,3 +207,11 @@
 // uploads are paused again (issue #40).
 #define CAPTIVE_PERIODIC_REPROBE_MS  30000UL
 #define CAPTIVE_ONLINE_HEARTBEAT_MS  60000UL
+
+// Diagnostic: dump the FULL fetched captive-portal login page to the serial
+// console when a portal is detected. This is the fastest way to see the exact
+// HTML the ESP32 received (field names, hidden CHAP tokens, JavaScript) so you
+// know precisely what needs to be parsed/submitted for your specific ISP portal.
+// It only prints when a captive portal is actually detected, so it stays silent
+// on open networks. Set to 0 to disable.
+#define CAPTIVE_LOG_PORTAL_PAGE      1
