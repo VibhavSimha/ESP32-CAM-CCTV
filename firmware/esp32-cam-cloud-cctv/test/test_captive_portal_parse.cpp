@@ -350,6 +350,36 @@ static void test_redirect_page_js_location() {
     CHECK(f.redirectUrl == "/login?mac=AA-BB");
 }
 
+// A bare `window.location='…'` assignment (no .href/.replace) is still followed.
+static void test_redirect_js_bare_window_location() {
+    std::printf("test_redirect_js_bare_window_location\n");
+    const std::string html =
+        "<html><body>"
+        "<script>window.location='/hotspot/login.html';</script>"
+        "</body></html>";
+    PortalForm f;
+    CHECK(!parseLoginForm(html, f));
+    CHECK(!f.formFound);
+    CHECK(f.redirectUrl == "/hotspot/login.html");
+}
+
+// A "location=" that is only a QUERY-STRING parameter inside a quoted URL (not a
+// JS redirect) must NOT be mistaken for a next-hop target. There is no <meta>
+// refresh, no <form> and no continue/login anchor, so the redirect must be empty.
+// (The trailing attribute makes a naive bare-"location=" scan return bogus text,
+// so this also guards against reintroducing that too-broad key.)
+static void test_redirect_ignores_querystring_location() {
+    std::printf("test_redirect_ignores_querystring_location\n");
+    const std::string html =
+        "<html><body>Loading..."
+        "<img src=\"/pixel.png?location=home\" alt=\"banner\">"
+        "</body></html>";
+    PortalForm f;
+    CHECK(!parseLoginForm(html, f));
+    CHECK(!f.formFound);
+    CHECK(f.redirectUrl.empty());
+}
+
 // A landing page whose only next-hop hint is a "continue"/login anchor.
 static void test_redirect_page_continue_link() {
     std::printf("test_redirect_page_continue_link\n");
@@ -411,6 +441,8 @@ int main() {
     test_issue44_mikrotik_default_template_chap_js();
     test_redirect_page_meta_refresh();
     test_redirect_page_js_location();
+    test_redirect_js_bare_window_location();
+    test_redirect_ignores_querystring_location();
     test_redirect_page_continue_link();
     test_multi_form_picks_login_form();
     test_js_chap_undecodable_is_challenge();
