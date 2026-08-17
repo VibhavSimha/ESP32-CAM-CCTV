@@ -135,6 +135,27 @@ static void test_mikrotik_chap_incomplete_fallback() {
     CHECK(!f.valid);
 }
 
+// A plain login form that merely has a stray field named "chap-id" (but no
+// chap-challenge) is NOT a CHAP portal: it must stay a normal, automatable
+// username/password form and not be pushed into the CHAP fallback.
+static void test_stray_chap_id_is_plain_form() {
+    std::printf("test_stray_chap_id_is_plain_form\n");
+    const std::string html =
+        "<form action='/login' method='post'>"
+        "<input type='hidden' name='chap-id' value='0a'>"
+        "<input name='username' type='text'>"
+        "<input type='password' name='password'>"
+        "</form>";
+    PortalForm f;
+    bool ok = parseLoginForm(html, f);
+    CHECK(ok);
+    CHECK(f.valid);
+    CHECK(!f.chapLogin);
+    CHECK(!f.challenge);
+    CHECK(f.userField == "username");
+    CHECK(f.passField == "password");
+}
+
 // MD5 and the MikroTik CHAP password construction against known-good vectors.
 static void test_md5_chap_vectors() {
     std::printf("test_md5_chap_vectors\n");
@@ -242,6 +263,7 @@ int main() {
     test_default_text_type();
     test_mikrotik_chap_automated();
     test_mikrotik_chap_incomplete_fallback();
+    test_stray_chap_id_is_plain_form();
     test_md5_chap_vectors();
     test_no_form_fallback();
     test_attribute_order();

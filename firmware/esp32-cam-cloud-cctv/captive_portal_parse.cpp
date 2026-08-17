@@ -171,10 +171,13 @@ bool parseLoginForm(const std::string& html, PortalForm& out) {
         }
     }
 
-    // MikroTik CHAP portal: if we found both chap-id and chap-challenge and can
-    // decode them, we can complete the login ourselves (hash the password with
-    // MD5). Otherwise fall back to the manual browser path.
-    if (!chapIdRaw.empty() || !chapChallengeRaw.empty()) {
+    // MikroTik CHAP portal: a hidden-field CHAP page always carries BOTH chap-id
+    // and chap-challenge. Only when both are present AND decode do we complete the
+    // login ourselves (hash the password with MD5). If both are present but cannot
+    // be decoded, fall back to the manual browser path (never send the plaintext
+    // password to a CHAP portal). A stray single field is ignored so a normal
+    // username/password form is unaffected.
+    if (!chapIdRaw.empty() && !chapChallengeRaw.empty()) {
         std::string idBytes, challengeBytes;
         if (hexDecode(chapIdRaw, idBytes) && hexDecode(chapChallengeRaw, challengeBytes) &&
             !out.userField.empty() && !out.passField.empty()) {
