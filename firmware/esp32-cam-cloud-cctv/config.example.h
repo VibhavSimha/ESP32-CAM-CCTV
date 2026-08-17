@@ -172,8 +172,11 @@
 //      AUTO-DETECTS the username/password fields — no field names are hardcoded.
 //   3. Serves a local helper page at http://<device-ip>/portal where you enter
 //      the ISP portal username/password; the board submits the login for you.
-//   4. Falls back to "open the portal in your browser" for challenge/JS portals
-//      (e.g. MikroTik CHAP) that cannot be automated safely.
+//      MikroTik hotspots that use a CHAP (MD5 challenge) login are handled too:
+//      the board hashes the password locally, exactly like the portal's JS would
+//      (issue #42).
+//   4. Falls back to "open the portal in your browser" for portals with no
+//      <form> or JavaScript-only logins that cannot be automated safely.
 //
 // While a captive portal is blocking the internet, background Supabase uploads
 // and the remote tunnel are PAUSED and the serial log prints a clear step-by-step

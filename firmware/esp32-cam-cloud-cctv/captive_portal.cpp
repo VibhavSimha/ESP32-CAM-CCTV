@@ -308,11 +308,18 @@ static void analyzePortalPage(const String& html) {
     }
 
     setStatus(PORTAL_STATE_CAPTIVE,
-              "Captive portal detected. Enter your ISP portal username and password.");
-    Serial.printf("[CaptivePortal] Auto-detected fields — user:'%s' pass:'%s' action:'%s' method:'%s' hidden:%u\n",
+              s_form.chapLogin
+                  ? "MikroTik captive portal detected. Enter your ISP portal username "
+                    "and password — the camera hashes the password (CHAP) and logs in."
+                  : "Captive portal detected. Enter your ISP portal username and password.");
+    if (s_form.chapLogin) {
+        Serial.println("[CaptivePortal] MikroTik CHAP portal — the camera will MD5-hash the "
+                       "password locally (chap-id + password + chap-challenge) before submitting.");
+    }
+    Serial.printf("[CaptivePortal] Auto-detected fields — user:'%s' pass:'%s' action:'%s' method:'%s' hidden:%u chap:%s\n",
                   s_form.userField.c_str(), s_form.passField.c_str(),
                   s_form.action.c_str(), s_form.method.c_str(),
-                  (unsigned)s_form.hidden.size());
+                  (unsigned)s_form.hidden.size(), s_form.chapLogin ? "yes" : "no");
 }
 
 // A captive portal has been confirmed reachable (the probe was redirected to a

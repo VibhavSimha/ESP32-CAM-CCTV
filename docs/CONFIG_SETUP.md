@@ -97,7 +97,12 @@ hostel / campus / ISP hotspots). When `ENABLE_CAPTIVE_PORTAL_LOGIN` is `1`
    login page and **auto-detects** the username and password fields — the field
    names are **not** hardcoded, so it adapts to different ISPs (it uses the first
    text-like input as the username and the `type=password` input as the
-   password, echoing any hidden fields on submit).
+   password, echoing any hidden fields on submit). **MikroTik** hotspots that use
+   a CHAP (MD5 challenge) login are handled too: the board reads the page's
+   `chap-id`/`chap-challenge`, hashes the password locally as
+   `MD5(chap-id + password + chap-challenge)` — exactly like the portal's own
+   JavaScript — and submits that, so the plaintext password never leaves the
+   board (issue #42).
 3. Open `http://<device-ip>/portal` in a browser on the same network. Enter the
    ISP portal username/password; the board submits the login for you and
    re-checks connectivity.
@@ -132,12 +137,13 @@ is reachable:
 - **Persistence:** only the Wi-Fi credentials (WiFiManager/NVS) plus a lightweight
   "portal seen" marker are stored. The ISP portal username/password are used once
   and **never** persisted.
-- **Unsupported portals:** challenge/response logins (e.g. MikroTik CHAP), pages
-  with no `<form>`, or JavaScript-only portals are detected and the device shows
-  a link to open the real portal page and finish the login manually. When a
-  portal is detected the firmware also prints the **full fetched login page** to
-  the serial console (`CAPTIVE_LOG_PORTAL_PAGE`, default on) so you can see the
-  exact HTML/fields it received and report them.
+- **Unsupported portals:** pages with no `<form>`, JavaScript-only portals, or
+  challenge/response logins other than MikroTik CHAP are detected and the device
+  shows a link to open the real portal page and finish the login manually.
+  (MikroTik CHAP logins **are** automated — see step 2 above.) When a portal is
+  detected the firmware also prints the **full fetched login page** to the serial
+  console (`CAPTIVE_LOG_PORTAL_PAGE`, default on) so you can see the exact
+  HTML/fields it received and report them.
 - **Recovery:** if login fails or the network changes, the device stays reachable
   through its own `ESP32-CAM-Setup` AP and `/portal` page so you can retry
   without re-flashing.

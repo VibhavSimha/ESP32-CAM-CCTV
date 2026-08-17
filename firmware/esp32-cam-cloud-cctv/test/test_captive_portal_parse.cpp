@@ -81,24 +81,79 @@ static void test_default_text_type() {
     CHECK(f.method == "get"); // no method attr -> HTML default
 }
 
-// MikroTik CHAP challenge portal must be flagged unsupported (fallback path).
-static void test_mikrotik_chap_fallback() {
-    std::printf("test_mikrotik_chap_fallback\n");
+// MikroTik CHAP portal (chap-id + chap-challenge hidden fields) must now be
+// AUTOMATED: the parser decodes the hex challenge, marks the form automatable
+// via CHAP, and buildFormBody submits the MD5 response — never the plaintext
+// password (issue #42).
+static void test_mikrotik_chap_automated() {
+    std::printf("test_mikrotik_chap_automated\n");
     const std::string html =
         "<form name='login' action='http://10.201.125.1/login' method='post'>"
         "<input type='hidden' name='dst' value='http://x'>"
         "<input type='hidden' name='popup' value='true'>"
-        "<input type='hidden' name='chap-id' value='\\5c'>"
-        "<input type='hidden' name='chap-challenge' value='abc'>"
+        "<input type='hidden' name='chap-id' value='0a'>"
+        "<input type='hidden' name='chap-challenge' value='1234567890abcdef1234567890abcdef'>"
         "<input name='username' type='text'>"
         "<input name='password' type='password'>"
         "</form>";
     PortalForm f;
     bool ok = parseLoginForm(html, f);
-    CHECK(!ok);           // not automatable
+    CHECK(ok);            // now automatable
     CHECK(f.formFound);
-    CHECK(f.challenge);   // challenge portal detected
+    CHECK(f.chapLogin);   // MikroTik CHAP auto-login path
+    CHECK(f.valid);
+    CHECK(!f.challenge);
+    CHECK(f.userField == "username");
+    CHECK(f.passField == "password");
+
+    // Precomputed reference: md5( \x0a + "test123" + fromhex(challenge) ).
+    const std::string expected = "e24fef6ab8c4544904d4e616601543c3";
+    std::string body = buildFormBody(f, "alice", "test123");
+    CHECK(body.find("password=" + expected) != std::string::npos);   // CHAP MD5 response submitted
+    CHECK(body.find("test123") == std::string::npos);                 // plaintext password never sent
+    CHECK(body.find("username=alice") != std::string::npos);
+    CHECK(body.find("dst=") != std::string::npos);
+}
+
+// A CHAP portal we cannot decode (odd/garbled chap-challenge) must fall back to
+// the manual browser flow rather than submitting a wrong hash.
+static void test_mikrotik_chap_incomplete_fallback() {
+    std::printf("test_mikrotik_chap_incomplete_fallback\n");
+    const std::string html =
+        "<form name='login' action='http://10.201.125.1/login' method='post'>"
+        "<input type='hidden' name='chap-id' value='0a'>"
+        "<input type='hidden' name='chap-challenge' value='xyz'>" // not hex
+        "<input name='username' type='text'>"
+        "<input name='password' type='password'>"
+        "</form>";
+    PortalForm f;
+    bool ok = parseLoginForm(html, f);
+    CHECK(!ok);          // cannot be automated safely
+    CHECK(f.formFound);
+    CHECK(f.challenge);  // -> manual browser fallback
+    CHECK(!f.chapLogin);
     CHECK(!f.valid);
+}
+
+// MD5 and the MikroTik CHAP password construction against known-good vectors.
+static void test_md5_chap_vectors() {
+    std::printf("test_md5_chap_vectors\n");
+    // With empty chap-id/chap-challenge, mikrotikChapPassword() reduces to a
+    // plain MD5 of the password — the canonical RFC 1321 test vector for "abc".
+    CHECK(mikrotikChapPassword("", "", "abc") == "900150983cd24fb0d6963f7d28e17f72");
+    CHECK(mikrotikChapPassword("", "", "") == "d41d8cd98f00b204e9800998ecf8427e");
+    // A message long enough to span two MD5 blocks (100 'A's) exercises padding.
+    CHECK(mikrotikChapPassword("", "", std::string(100, 'A')) ==
+          "8adc5937e635f6c9af646f0b23560fae");
+    // Full CHAP construction: chap-id 0x0a, "test123", 16-byte challenge.
+    std::string idBytes(1, (char)0x0a);
+    std::string challenge;
+    for (int i = 0; i < 2; i++) {
+        const unsigned char b[8] = {0x12, 0x34, 0x56, 0x78, 0x90, 0xab, 0xcd, 0xef};
+        challenge.append((const char*)b, 8);
+    }
+    CHECK(mikrotikChapPassword(idBytes, challenge, "test123") ==
+          "e24fef6ab8c4544904d4e616601543c3");
 }
 
 // A JavaScript-only portal (no <form>) must fall back gracefully.
@@ -142,45 +197,56 @@ static void test_captive_detection() {
     CHECK(!looksLikeCaptivePortal(200, ""));            // empty 200, no redirect
 }
 
-// Issue #40: the exact field-report scenario — the generate_204 probe is
-// intercepted with an HTTP 302 to a MikroTik ISP portal, whose login page is a
-// CHAP challenge that cannot be automated. This is the detection path that must
-// mark the device offline (captivePortalIsOnline() == false on the firmware)
-// so that cloud uploads are paused and the operator is steered to /portal.
-static void test_issue40_isp_captive_redirect() {
-    std::printf("test_issue40_isp_captive_redirect\n");
+// Issue #42 (follows on from #40): the exact field-report scenario — the
+// generate_204 probe is intercepted with an HTTP 302 to a MikroTik ISP portal.
+// Its login page is a CHAP form; instead of giving up, the firmware now decodes
+// chap-id/chap-challenge and logs in by submitting MD5(chap-id+password+
+// chap-challenge). Cloud uploads still stay paused (captivePortalIsOnline()==
+// false) until the post-login re-probe confirms connectivity — the #40 guarantee
+// is unchanged; only the path to clearing the portal is now automatic.
+static void test_issue42_mikrotik_chap_login() {
+    std::printf("test_issue42_mikrotik_chap_login\n");
     // 1. The probe response looks like a captive portal (302 redirect).
     CHECK(looksLikeCaptivePortal(302, ""));
 
-    // 2. The fetched MikroTik portal page is a CHAP challenge -> not automatable,
-    //    so the firmware falls back to the browser/manual path (uploads paused).
+    // 2. The fetched MikroTik portal page is a CHAP form with hex-encoded
+    //    chap-id/chap-challenge -> now automatable end to end.
     const std::string portalHtml =
         "<html><head><title>ISP Login</title></head><body>"
         "<form name='login' action='http://10.201.125.1/login' method='post'>"
         "<input type='hidden' name='dst' value='http://connectivitycheck.gstatic.com/generate_204'>"
         "<input type='hidden' name='popup' value='true'>"
-        "<input type='hidden' name='chap-id' value='\\37'>"
-        "<input type='hidden' name='chap-challenge' value='deadbeef'>"
+        "<input type='hidden' name='chap-id' value='37'>"
+        "<input type='hidden' name='chap-challenge' value='deadbeefdeadbeefdeadbeefdeadbeef'>"
         "<input name='username' type='text'>"
         "<input name='password' type='password'>"
         "</form></body></html>";
     PortalForm f;
     bool ok = parseLoginForm(portalHtml, f);
-    CHECK(!ok);            // cannot be automated
+    CHECK(ok);             // automatable via CHAP
     CHECK(f.formFound);
-    CHECK(f.challenge);    // challenge portal -> manual browser fallback
-    CHECK(!f.valid);
+    CHECK(f.chapLogin);
+    CHECK(f.valid);
+    CHECK(!f.challenge);
+
+    // The submitted password is the 32-hex-char CHAP response, not the plaintext.
+    std::string body = buildFormBody(f, "guest", "hunter2");
+    CHECK(body.find("hunter2") == std::string::npos);
+    CHECK(body.find("username=guest") != std::string::npos);
+    CHECK(body.find("popup=true") != std::string::npos);
 }
 
 int main() {
     test_generic_user_pass();
     test_email_field();
     test_default_text_type();
-    test_mikrotik_chap_fallback();
+    test_mikrotik_chap_automated();
+    test_mikrotik_chap_incomplete_fallback();
+    test_md5_chap_vectors();
     test_no_form_fallback();
     test_attribute_order();
     test_captive_detection();
-    test_issue40_isp_captive_redirect();
+    test_issue42_mikrotik_chap_login();
 
     if (g_failures == 0) {
         std::printf("\nAll captive-portal parser tests passed.\n");

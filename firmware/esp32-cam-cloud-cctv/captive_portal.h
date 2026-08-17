@@ -14,9 +14,12 @@
 //      login page and AUTO-DETECTS the username/password field names (it never
 //      hardcodes them; see captive_portal_parse.h).
 //   3. A local helper page at /portal accepts the ISP username/password and,
-//      for a simple form-based portal, submits the login from the ESP32.
-//   4. Challenge/JS-only/tokenized portals fall back to a browser-assisted
-//      manual path (the /portal page links out to the real portal URL).
+//      for a simple form-based portal, submits the login from the ESP32. MikroTik
+//      hotspots that use a CHAP (MD5 challenge) login are also submitted from the
+//      ESP32 — the password is hashed locally as MD5(chap-id + password +
+//      chap-challenge), exactly like the portal's JavaScript (issue #42).
+//   4. No-form / JavaScript-only / tokenized portals fall back to a browser-
+//      assisted manual path (the /portal page links out to the real portal URL).
 //
 //  Only Wi-Fi credentials (via WiFiManager/NVS) and a lightweight "portal seen"
 //  marker are persisted — portal credentials are NOT stored.
