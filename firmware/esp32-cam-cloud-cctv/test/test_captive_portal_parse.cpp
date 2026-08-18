@@ -513,6 +513,51 @@ static void test_issue46_meta_refresh_beats_redirect_form() {
     CHECK(f.redirectFields.empty());
 }
 
+// Issue #48 — the Spectra (RADIUSdesk/MikroTik external-portal) landing page.
+// The plain-HTTP rlogin landing page the hotspot serves after interception is a
+// browser-auto-submitted POST form whose action is an **https://** external
+// portal. The parser must surface it as a POST next hop with an https redirect
+// URL; the firmware then has to follow that hop over TLS (a plain WiFiClient
+// returns HTTPC_ERROR_CONNECTION_LOST (-5) and dead-ends — the root-cause bug
+// fixed by using WiFiClientSecure for https portal URLs). This locks in the
+// parser side of that scenario.
+static void test_issue48_spectra_https_redirect_post() {
+    std::printf("test_issue48_spectra_https_redirect_post\n");
+    const std::string html =
+        "<html><head><title>Spectra</title></head>"
+        "<body onload=\"document.forms[0].submit()\">"
+        "<center>If you are not redirected in a few seconds, click 'continue' below<br>"
+        "<form action=\"https://alpsmp.spectra.co/alepocp/\" method=\"post\">"
+        "<input type=\"hidden\" name=\"mac\" value=\"A8:42:E3:48:53:0C\">"
+        "<input type=\"hidden\" name=\"ip\" value=\"10.201.125.99\">"
+        "<input type=\"hidden\" name=\"link-login-only\" value=\"http://10.201.125.1/login\">"
+        "<input type=\"hidden\" name=\"link-orig\" value=\"http://connectivitycheck.gstatic.com/generate_204\">"
+        "<input type=\"submit\" value=\"continue\">"
+        "</form></center></body></html>";
+    PortalForm f;
+    bool ok = parseLoginForm(html, f);
+    CHECK(!ok);                 // no automatable username/password form on the landing page
+    CHECK(f.formFound);         // the redirect <form> is present
+    CHECK(!f.valid);
+    CHECK(!f.challenge);
+    CHECK(!f.chapLogin);
+    // The next hop is the POST redirect to the HTTPS external portal.
+    CHECK(f.redirectUrl == "https://alpsmp.spectra.co/alepocp/");
+    CHECK(f.redirectUrl.rfind("https://", 0) == 0);   // scheme requires TLS transport (the fix)
+    CHECK(f.redirectMethod == "post");
+    CHECK(f.redirectFields.size() == 4);              // mac, ip, link-login-only, link-orig
+    CHECK(f.redirectFields[0].name == "mac");
+    CHECK(f.redirectFields[2].name == "link-login-only");
+    CHECK(f.redirectFields[2].value == "http://10.201.125.1/login");
+
+    // The body the firmware POSTs to follow the hop echoes every hidden field.
+    PortalForm hop;
+    hop.hidden = f.redirectFields;
+    std::string body = buildFormBody(hop, "", "");
+    CHECK(body.find("mac=A8%3A42%3AE3%3A48%3A53%3A0C") != std::string::npos);
+    CHECK(body.find("link-login-only=http%3A%2F%2F10.201.125.1%2Flogin") != std::string::npos);
+}
+
 int main() {
     test_generic_user_pass();
     test_email_field();
@@ -536,6 +581,7 @@ int main() {
     test_issue46_mikrotik_redirect_form_post();
     test_issue46_mikrotik_redirect_form_get();
     test_issue46_meta_refresh_beats_redirect_form();
+    test_issue48_spectra_https_redirect_post();
 
     if (g_failures == 0) {
         std::printf("\nAll captive-portal parser tests passed.\n");

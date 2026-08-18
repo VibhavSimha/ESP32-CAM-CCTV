@@ -64,3 +64,10 @@ PortalState captivePortalGetState();
 // (issue #40). When the feature is disabled at compile time it always returns
 // true, so callers behave exactly as before.
 bool captivePortalIsOnline();
+
+// Print a full, secrets-free diagnostics block (portal state + detected form +
+// network + free heap + captive-portal config) to the serial monitor. Call once
+// at startup after Wi-Fi connects so a fresh capture always contains the whole
+// picture even when the early boot banner was lost to the flash->run reset. The
+// same block is served over HTTP at GET /portal/diag (issue #48).
+void captivePortalPrintDiagnostics();

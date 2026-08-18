@@ -93,6 +93,19 @@ void setup() {
     //     page is served by the camera web server started in step 6.
     captivePortalBegin();
 
+    // 3c. Re-print the configuration status and dump a full captive-portal /
+    //     network / heap diagnostics block now that Wi-Fi is up. The very first
+    //     configuration banner (logged from the top of setup()) is frequently
+    //     lost or corrupted in a serial capture that only attaches during the
+    //     flash->run reset — which is exactly why the "[Config] … SET/NOT SET"
+    //     lines were missing from the issue #48 logs. Repeating them here, at a
+    //     stable point after the network is up, guarantees they are always
+    //     visible, and the diagnostics block gives a one-shot picture of the
+    //     portal state (also available live at http://<device-ip>/portal/diag).
+    Serial.println("[Boot] Re-printing configuration + diagnostics after Wi-Fi connect:");
+    logConfigStatus();
+    captivePortalPrintDiagnostics();
+
     // 4. Initialize Cloud Storage (Supabase)
     setupCloudStorage();
 
