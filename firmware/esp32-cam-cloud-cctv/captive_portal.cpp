@@ -466,9 +466,9 @@ static void handleCaptiveDetected(const String& body, const String& location) {
         bool postHop = (s_form.redirectMethod == "post");
         String postBody;
         if (postHop) {
-            PortalForm hop;
-            hop.hidden = s_form.redirectFields;
-            postBody = String(buildFormBody(hop, std::string(), std::string()).c_str());
+            PortalForm redirectForm;
+            redirectForm.hidden = s_form.redirectFields;
+            postBody = String(buildFormBody(redirectForm, std::string(), std::string()).c_str());
         }
         Serial.printf("[CaptivePortal] Landing page redirects (no login form here) — following hop %d via %s: %s\n",
                       hop + 1, postHop ? "POST" : "GET", nextUrl.c_str());
