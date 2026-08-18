@@ -783,7 +783,7 @@ static void buildPortalDiagnostics(String& d) {
     d += "message         : "; d += s_lastMessage; d += "\n";
     d += "attempts        : "; d += s_attempts; d += "\n";
     d += "portalUrl       : "; d += (s_portalUrl.length() ? s_portalUrl : String("(none)")); d += "\n";
-    d += "portalUrlScheme : "; d += (isHttpsUrl(s_portalUrl) ? "https" : "http"); d += "\n";
+    d += "portalUrlScheme : "; d += (s_portalUrl.length() ? (isHttpsUrl(s_portalUrl) ? "https" : "http") : "(none)"); d += "\n";
     d += "formFound       : "; d += (s_form.formFound ? "yes" : "no"); d += "\n";
     d += "formValid       : "; d += (s_form.valid ? "yes" : "no"); d += "\n";
     d += "challenge       : "; d += (s_form.challenge ? "yes" : "no"); d += "\n";
@@ -865,14 +865,27 @@ static void doReprobe() {
     s_periodicReprobeAt = millis() + CAPTIVE_PERIODIC_REPROBE_MS;
 }
 
+// Overwrite a String's backing buffer through a VOLATILE pointer, then release
+// it. The volatile write prevents the compiler from eliminating the zeroing as a
+// dead store just because the buffer is freed immediately afterwards (a plain
+// `for (...) s[i]=0; s="";` can be optimised away). Used to scrub transient ISP
+// portal credentials from RAM as soon as they have been used (issue #48). They
+// are never persisted.
+static void secureZeroString(String& s) {
+    const size_t n = s.length();
+    if (n) {
+        volatile char* p = (volatile char*)s.c_str();
+        for (size_t i = 0; i < n; i++) p[i] = 0;
+    }
+    s = "";
+}
+
 // Overwrite and release the transiently-held ISP portal credentials. They are
 // kept in RAM only between the /portal/login handler queuing a deferred submit
 // and captivePortalLoop() running it; they are NEVER persisted (issue #48).
 static void wipePendingCredentials() {
-    for (size_t i = 0; i < s_pendingUser.length(); i++) s_pendingUser[i] = 0;
-    for (size_t i = 0; i < s_pendingPass.length(); i++) s_pendingPass[i] = 0;
-    s_pendingUser = "";
-    s_pendingPass = "";
+    secureZeroString(s_pendingUser);
+    secureZeroString(s_pendingPass);
 }
 
 // Deferred handler for a /portal/login submit made while no automatable form was
@@ -1035,9 +1048,8 @@ static esp_err_t portal_login_handler(httpd_req_t* req) {
         s_attempts++;
         setStatus(PORTAL_STATE_SUBMITTED,
                   "Scanning the portal for a login form and submitting your credentials…");
-        for (size_t i = 0; i < username.length(); i++) username[i] = 0;
-        for (size_t i = 0; i < password.length(); i++) password[i] = 0;
-        username = ""; password = "";
+        secureZeroString(username);
+        secureZeroString(password);
         sendStatusJson(req);
         return ESP_OK;
     }
@@ -1049,9 +1061,8 @@ static esp_err_t portal_login_handler(httpd_req_t* req) {
 
     // Wipe the credentials from RAM as soon as they are used — we do not keep or
     // persist portal credentials.
-    for (size_t i = 0; i < username.length(); i++) username[i] = 0;
-    for (size_t i = 0; i < password.length(); i++) password[i] = 0;
-    username = ""; password = "";
+    secureZeroString(username);
+    secureZeroString(password);
 
     if (!sent) {
         if (s_attempts >= CAPTIVE_MAX_LOGIN_ATTEMPTS) {
