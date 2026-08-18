@@ -881,16 +881,18 @@ static void doReprobe() {
     s_periodicReprobeAt = millis() + CAPTIVE_PERIODIC_REPROBE_MS;
 }
 
-// Overwrite a String's backing buffer through a VOLATILE pointer, then release
-// it. The volatile write prevents the compiler from eliminating the zeroing as a
-// dead store just because the buffer is freed immediately afterwards (a plain
-// `for (...) s[i]=0; s="";` can be optimised away). Used to scrub transient ISP
-// portal credentials from RAM as soon as they have been used (issue #48). They
-// are never persisted.
+// Overwrite a String's backing buffer, then release it. `&s[0]` uses the mutable
+// `char& String::operator[]` overload, so it is a legitimately writable pointer
+// into the String's own buffer (no `const` is cast away, unlike writing through
+// c_str()). Writing through a VOLATILE view of it prevents the compiler from
+// eliminating the zeroing as a dead store just because the buffer is freed
+// immediately afterwards (a plain `for (...) s[i]=0; s="";` can be optimised
+// away). Used to scrub transient ISP portal credentials from RAM as soon as they
+// have been used (issue #48). They are never persisted.
 static void secureZeroString(String& s) {
     const size_t n = s.length();
     if (n) {
-        volatile char* p = (volatile char*)s.c_str();
+        volatile char* p = (volatile char*)&s[0];
         for (size_t i = 0; i < n; i++) p[i] = 0;
     }
     s = "";
@@ -1064,6 +1066,10 @@ static esp_err_t portal_login_handler(httpd_req_t* req) {
         s_attempts++;
         setStatus(PORTAL_STATE_SUBMITTED,
                   "Scanning the portal for a login form and submitting your credentials…");
+        // s_pendingUser/Pass now hold a COPY of the credentials (String assignment
+        // copies the buffer) and are wiped after the deferred submit runs
+        // (wipePendingCredentials in doRedetectAndSubmit). Scrub the local copies
+        // here too so no plaintext lingers in this handler's freed buffers.
         secureZeroString(username);
         secureZeroString(password);
         sendStatusJson(req);
