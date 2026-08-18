@@ -35,6 +35,15 @@
 // Cap how much of a portal page we read into RAM (heap is precious here).
 #define CAPTIVE_MAX_PAGE_BYTES 12288
 
+// Some captive portals (notably MikroTik hotspots) do not serve the login form
+// directly: the first page is an rlogin-style LANDING page that only redirects
+// to the real login page via a <meta refresh>, a JavaScript location change or a
+// "continue" link. The ESP32 HTTP client does not run JavaScript, so we follow
+// up to this many such hops ourselves to reach the real login form (issue #44).
+#ifndef CAPTIVE_MAX_REDIRECT_HOPS
+#define CAPTIVE_MAX_REDIRECT_HOPS 3
+#endif
+
 // Dump the full fetched captive-portal login page to the serial console when a
 // portal is detected. This is a diagnostic aid: many ISP portals (e.g. MikroTik
 // CHAP) cannot be auto-detected, and seeing the exact HTML the ESP32 received is
@@ -166,29 +175,51 @@ static void persistSeen(const String& ssid) {
 // open (on any phone/laptop joined to the same Wi-Fi) to clear the captive
 // portal. This replaces the previous terse one-line "manual browser fallback"
 // note so the required action is unmistakable in the serial log, instead of the
-// log filling up with repeated upload failures (issue #40).
+// log filling up with repeated upload failures (issue #40). It also spells out
+// the per-MAC "already logged in" gotcha so operators do not waste time logging
+// in on the wrong device (issue #44).
 static void printPortalInstructions() {
-    String ip = WiFi.localIP().toString();
+    String ip  = WiFi.localIP().toString();
+    String mac = WiFi.macAddress();
     Serial.println();
     Serial.println("========= ACTION REQUIRED: Wi-Fi captive-portal login =========");
     Serial.println("[CaptivePortal] This network needs a one-time login before the camera");
     Serial.println("[CaptivePortal] can reach the internet. Cloud uploads and the remote");
     Serial.println("[CaptivePortal] tunnel are PAUSED until you complete it.");
     Serial.println("[CaptivePortal]");
-    Serial.println("[CaptivePortal]   STEP 1  Join the SAME Wi-Fi on a phone or laptop.");
-    Serial.printf ("[CaptivePortal]   STEP 2  Open in a browser:  http://%s/portal\n", ip.c_str());
+    Serial.println("[CaptivePortal]   STEP 1  On a phone or laptop, join the SAME Wi-Fi network the");
+    Serial.println("[CaptivePortal]           camera is on (the SSID shown as connected above).");
+    Serial.println("[CaptivePortal]   STEP 2  In that device's browser, open the camera's helper page:");
+    Serial.printf ("[CaptivePortal]               http://%s/portal\n", ip.c_str());
     if (s_state == PORTAL_STATE_CAPTIVE) {
-        Serial.println("[CaptivePortal]   STEP 3  Enter your ISP portal username & password there;");
-        Serial.println("[CaptivePortal]           the camera submits the login for you.");
+        Serial.println("[CaptivePortal]   STEP 3  Type your ISP hotspot username & password into that");
+        Serial.println("[CaptivePortal]           page and press Log in. The CAMERA then submits the");
+        Serial.println("[CaptivePortal]           login itself (hashing the password locally if the");
+        Serial.println("[CaptivePortal]           portal uses CHAP), so the camera's OWN connection is");
+        Serial.println("[CaptivePortal]           authorised — not your phone's.");
     } else {
-        Serial.println("[CaptivePortal]   STEP 3  Tap the portal link on that page, finish the login");
-        Serial.println("[CaptivePortal]           in your browser, then tap 'Check again'.");
+        Serial.println("[CaptivePortal]   STEP 3  This portal's login could not be automated. Tap the");
+        Serial.println("[CaptivePortal]           portal link on that page, finish the login in your");
+        Serial.println("[CaptivePortal]           browser, then tap 'Check again'.");
         if (s_portalUrl.length()) {
-            Serial.printf("[CaptivePortal]           (ISP portal: %s )\n", s_portalUrl.c_str());
+            Serial.printf("[CaptivePortal]           (ISP portal page: %s )\n", s_portalUrl.c_str());
         }
     }
-    Serial.println("[CaptivePortal]   STEP 4  The camera re-checks connectivity every 30s and");
-    Serial.println("[CaptivePortal]           resumes uploads automatically once you are online.");
+    Serial.println("[CaptivePortal]   STEP 4  Leave the camera powered on. It re-checks connectivity");
+    Serial.println("[CaptivePortal]           every 30s and resumes uploads automatically once online.");
+    Serial.println("[CaptivePortal]");
+    Serial.println("[CaptivePortal]   IMPORTANT — same-ISP / 'already logged in' gotcha:");
+    Serial.println("[CaptivePortal]   Hotspots authorise each DEVICE separately (per MAC address).");
+    Serial.println("[CaptivePortal]   Logging in from your phone/PC only grants THAT device internet");
+    Serial.println("[CaptivePortal]   (it may even show \"you are already logged in\") and does NOT");
+    Serial.println("[CaptivePortal]   help the camera, which has a different MAC. Always enter the");
+    Serial.println("[CaptivePortal]   credentials on the camera's /portal page so the CAMERA logs");
+    Serial.println("[CaptivePortal]   ITSELF in.");
+    if (s_state != PORTAL_STATE_CAPTIVE) {
+        Serial.println("[CaptivePortal]   If you must log in manually and the camera stays blocked,");
+        Serial.println("[CaptivePortal]   ask your ISP to authorise the camera's MAC address:");
+        Serial.printf ("[CaptivePortal]               %s\n", mac.c_str());
+    }
     Serial.println("===============================================================");
     Serial.println();
 }
@@ -285,6 +316,13 @@ static void analyzePortalPage(const String& html) {
     std::string h(html.c_str(), html.length());
     parseLoginForm(h, s_form);
 
+    // Adjacent debug: report exactly what the parser saw so a mis-detection can
+    // be diagnosed from the serial log alone (issue #44).
+    Serial.printf("[CaptivePortal] Parse result — formFound:%d valid:%d challenge:%d chap:%d redirect:'%s'\n",
+                  s_form.formFound ? 1 : 0, s_form.valid ? 1 : 0,
+                  s_form.challenge ? 1 : 0, s_form.chapLogin ? 1 : 0,
+                  s_form.redirectUrl.c_str());
+
     if (!s_form.formFound) {
         setStatus(PORTAL_STATE_UNSUPPORTED,
                   "Captive portal detected, but no login form was found (it may "
@@ -332,18 +370,57 @@ static void handleCaptiveDetected(const String& body, const String& location) {
     s_portalUrl = location.length() ? location : String(CAPTIVE_PROBE_URL);
     Serial.printf("[CaptivePortal] Captive portal detected. Portal URL: %s\n", s_portalUrl.c_str());
 
+    String currentUrl = s_portalUrl;
     String html = body;
     if (location.length()) {
         String page;
-        int pcode = fetchPortalPage(s_portalUrl, page);
+        int pcode = fetchPortalPage(currentUrl, page);
         Serial.printf("[CaptivePortal] Fetch portal page -> HTTP %d (%u bytes)\n",
                       pcode, (unsigned)page.length());
         if (page.length()) html = page;
     }
-    // Dump the exact page we are about to parse so the real login form (field
-    // names / hidden CHAP tokens / JS) is visible on the serial console.
-    logPortalPage(html);
-    analyzePortalPage(html);
+
+    // Follow up to CAPTIVE_MAX_REDIRECT_HOPS landing-page redirects to reach the
+    // real login form. Many hotspots (MikroTik especially) serve an rlogin-style
+    // page first that only points to login.html via a <meta refresh>, a JS
+    // location change or a "continue" link. Because the ESP32 does not run
+    // JavaScript, we walk those hops ourselves; without this the firmware stalls
+    // on the landing page and reports the portal as "unsupported" (issue #44).
+    for (int hop = 0; ; hop++) {
+        // Dump the exact page we are about to parse so the real login form (field
+        // names / hidden CHAP tokens / JS) is visible on the serial console.
+        logPortalPage(html);
+        analyzePortalPage(html);
+
+        if (s_state == PORTAL_STATE_CAPTIVE) break;   // reached an automatable form
+        if (s_form.redirectUrl.empty()) break;        // no next hop to follow
+        if (hop >= CAPTIVE_MAX_REDIRECT_HOPS) {
+            Serial.printf("[CaptivePortal] Redirect hop limit (%d) reached — staying on manual fallback.\n",
+                          CAPTIVE_MAX_REDIRECT_HOPS);
+            break;
+        }
+
+        String nextUrl = resolveActionUrl(currentUrl, String(s_form.redirectUrl.c_str()));
+        if (nextUrl == currentUrl) {
+            Serial.println("[CaptivePortal] Redirect target is the current page — stopping to avoid a loop.");
+            break;
+        }
+        Serial.printf("[CaptivePortal] Landing page redirects (no login form here) — following hop %d: %s\n",
+                      hop + 1, nextUrl.c_str());
+
+        String page;
+        int pcode = fetchPortalPage(nextUrl, page);
+        Serial.printf("[CaptivePortal] Fetch portal page -> HTTP %d (%u bytes)\n",
+                      pcode, (unsigned)page.length());
+        if (pcode <= 0 || page.length() == 0) {
+            Serial.println("[CaptivePortal] Could not fetch the redirect target — staying on manual fallback.");
+            break;
+        }
+        currentUrl = nextUrl;
+        s_portalUrl = nextUrl; // point the manual-browser fallback at the real login page
+        html = page;
+    }
+
     // A captive portal is confirmed at this point — tell the operator, in clear
     // step-by-step form, exactly which URL to open to clear it.
     printPortalInstructions();
@@ -352,6 +429,29 @@ static void handleCaptiveDetected(const String& body, const String& location) {
 // -----------------------------------------------------------------------------
 // Public: post-connect probe
 // -----------------------------------------------------------------------------
+
+// Log low-level network parameters so an operator can rule out signal / gateway /
+// DNS problems as the cause of a stuck probe (issue #44). No secrets are printed
+// — only the local network configuration any device on the LAN can already see.
+static void logNetworkDiagnostics() {
+    Serial.println("[CaptivePortal] Network diagnostics (rule out adjacent causes):");
+    Serial.printf ("[CaptivePortal]   SSID:'%s'  RSSI:%d dBm  channel:%d\n",
+                   WiFi.SSID().c_str(), (int)WiFi.RSSI(), WiFi.channel());
+    Serial.printf ("[CaptivePortal]   IP:%s  gateway:%s  subnet:%s\n",
+                   WiFi.localIP().toString().c_str(),
+                   WiFi.gatewayIP().toString().c_str(),
+                   WiFi.subnetMask().toString().c_str());
+    Serial.printf ("[CaptivePortal]   DNS1:%s  DNS2:%s  MAC:%s\n",
+                   WiFi.dnsIP(0).toString().c_str(),
+                   WiFi.dnsIP(1).toString().c_str(),
+                   WiFi.macAddress().c_str());
+    // A gateway that is also the DNS server, or a private DNS, is typical of a
+    // hotspot that intercepts DNS — a useful hint when the probe misbehaves.
+    if (WiFi.dnsIP(0) == WiFi.gatewayIP()) {
+        Serial.println("[CaptivePortal]   Note: DNS == gateway (hotspot likely intercepts DNS).");
+    }
+}
+
 void captivePortalBegin() {
 #if !ENABLE_CAPTIVE_PORTAL_LOGIN
     return;
@@ -359,6 +459,8 @@ void captivePortalBegin() {
     if (WiFi.status() != WL_CONNECTED) {
         return; // scope is strictly post-connect
     }
+
+    logNetworkDiagnostics();
 
     String body, location;
     int code = probeInternet(body, location);

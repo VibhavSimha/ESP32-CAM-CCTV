@@ -257,6 +257,175 @@ static void test_issue42_mikrotik_chap_login() {
     CHECK(body.find("popup=true") != std::string::npos);
 }
 
+// Issue #44: the MikroTik DEFAULT hotspot login page. A hidden "sendin" form is
+// emitted BEFORE the visible username/password form, and the chap-id/chap-
+// challenge live ONLY in the md5.js hexMD5(...) call — not as <input>s. The
+// parser must scan past the stub form, find the real one, and read the CHAP
+// tokens from the JavaScript so the login is automated end to end.
+static void test_issue44_mikrotik_default_template_chap_js() {
+    std::printf("test_issue44_mikrotik_default_template_chap_js\n");
+    const std::string html =
+        "<html><head>"
+        "<meta http-equiv=\"refresh\" content=\"5; url=http://10.201.125.1/status\">"
+        "</head><body>"
+        "<form name=\"sendin\" action=\"http://10.201.125.1/login\" method=\"post\">"
+        "<input type=\"hidden\" name=\"username\" />"
+        "<input type=\"hidden\" name=\"password\" />"
+        "<input type=\"hidden\" name=\"dst\" value=\"http://connectivitycheck.gstatic.com/generate_204\" />"
+        "<input type=\"hidden\" name=\"popup\" value=\"true\" />"
+        "</form>"
+        "<script type=\"text/javascript\" src=\"/md5.js\"></script>"
+        "<script type=\"text/javascript\">"
+        "function doLogin() {"
+        "document.sendin.username.value = document.login.username.value;"
+        "document.sendin.password.value = hexMD5('37' + document.login.password.value + 'deadbeefdeadbeefdeadbeefdeadbeef');"
+        "document.sendin.submit(); return false; }"
+        "</script>"
+        "<form name=\"login\" action=\"http://10.201.125.1/login\" method=\"post\" onSubmit=\"return doLogin()\">"
+        "<input type=\"hidden\" name=\"dst\" value=\"http://connectivitycheck.gstatic.com/generate_204\" />"
+        "<input type=\"hidden\" name=\"popup\" value=\"true\" />"
+        "<input name=\"username\" type=\"text\" value=\"\"/>"
+        "<input name=\"password\" type=\"password\"/>"
+        "<input type=\"submit\" value=\"OK\" />"
+        "</form></body></html>";
+    PortalForm f;
+    bool ok = parseLoginForm(html, f);
+    CHECK(ok);
+    CHECK(f.formFound);
+    CHECK(f.valid);
+    CHECK(f.chapLogin);                  // read from the md5.js hexMD5(...) call
+    CHECK(!f.challenge);
+    CHECK(f.userField == "username");    // from the VISIBLE login form, not sendin
+    CHECK(f.passField == "password");
+    CHECK(f.action == "http://10.201.125.1/login");
+    CHECK(f.chapId.size() == 1);         // 0x37 -> one byte
+    CHECK(f.chapChallenge.size() == 16); // 32 hex chars -> 16 bytes
+
+    std::string idBytes(1, (char)0x37);
+    std::string challenge;
+    const unsigned char dead[4] = {0xde, 0xad, 0xbe, 0xef};
+    for (int i = 0; i < 4; i++) challenge.append((const char*)dead, 4);
+    const std::string expected = mikrotikChapPassword(idBytes, challenge, "hunter2");
+
+    std::string body = buildFormBody(f, "guest", "hunter2");
+    CHECK(body.find("hunter2") == std::string::npos);   // plaintext never sent
+    CHECK(body.find(expected) != std::string::npos);    // CHAP MD5 response submitted
+    CHECK(body.find("username=guest") != std::string::npos);
+    CHECK(body.find("popup=true") != std::string::npos);
+}
+
+// Issue #44: a MikroTik rlogin-style LANDING page. It is not the login form — it
+// only redirects (via <meta refresh>) to the real login page and offers a
+// "continue" button. parseLoginForm must report no usable form but hand back the
+// meta-refresh URL so the caller can follow one hop to the real login page.
+static void test_redirect_page_meta_refresh() {
+    std::printf("test_redirect_page_meta_refresh\n");
+    const std::string html =
+        "<html><head>"
+        "<meta http-equiv=\"refresh\" content=\"3; url=http://10.201.125.1/login?dst=http://x\">"
+        "</head><body>"
+        "If you are not redirected in a few seconds, click 'continue' below<br>"
+        "<form action=\"http://10.201.125.1/login\" method=\"get\">"
+        "<input type=\"submit\" value=\"continue\"></form>"
+        "</body></html>";
+    PortalForm f;
+    bool ok = parseLoginForm(html, f);
+    CHECK(!ok);
+    CHECK(f.formFound);       // a <form> exists (the "continue" button)
+    CHECK(!f.valid);
+    CHECK(f.redirectUrl == "http://10.201.125.1/login?dst=http://x");
+}
+
+// A JavaScript-only redirect landing page (no <form>) must still surface the
+// window.location target as the next hop.
+static void test_redirect_page_js_location() {
+    std::printf("test_redirect_page_js_location\n");
+    const std::string html =
+        "<html><head></head><body>Redirecting..."
+        "<script>window.location.href = \"/login?mac=AA-BB\";</script>"
+        "</body></html>";
+    PortalForm f;
+    CHECK(!parseLoginForm(html, f));
+    CHECK(!f.formFound);
+    CHECK(f.redirectUrl == "/login?mac=AA-BB");
+}
+
+// A bare `window.location='…'` assignment (no .href/.replace) is still followed.
+static void test_redirect_js_bare_window_location() {
+    std::printf("test_redirect_js_bare_window_location\n");
+    const std::string html =
+        "<html><body>"
+        "<script>window.location='/hotspot/login.html';</script>"
+        "</body></html>";
+    PortalForm f;
+    CHECK(!parseLoginForm(html, f));
+    CHECK(!f.formFound);
+    CHECK(f.redirectUrl == "/hotspot/login.html");
+}
+
+// A "location=" that is only a QUERY-STRING parameter inside a quoted URL (not a
+// JS redirect) must NOT be mistaken for a next-hop target. There is no <meta>
+// refresh, no <form> and no continue/login anchor, so the redirect must be empty.
+// (The trailing attribute makes a naive bare-"location=" scan return bogus text,
+// so this also guards against reintroducing that too-broad key.)
+static void test_redirect_ignores_querystring_location() {
+    std::printf("test_redirect_ignores_querystring_location\n");
+    const std::string html =
+        "<html><body>Loading..."
+        "<img src=\"/pixel.png?location=home\" alt=\"banner\">"
+        "</body></html>";
+    PortalForm f;
+    CHECK(!parseLoginForm(html, f));
+    CHECK(!f.formFound);
+    CHECK(f.redirectUrl.empty());
+}
+
+// A landing page whose only next-hop hint is a "continue"/login anchor.
+static void test_redirect_page_continue_link() {
+    std::printf("test_redirect_page_continue_link\n");
+    const std::string html =
+        "<html><body><p>Please wait. "
+        "<a href=\"/login?token=1\">click continue to log in</a></p></body></html>";
+    PortalForm f;
+    CHECK(!parseLoginForm(html, f));
+    CHECK(f.redirectUrl == "/login?token=1");
+}
+
+// A page with a stub form FIRST (a bare submit button) and the real
+// username/password form second: the login form must win, not the first form.
+static void test_multi_form_picks_login_form() {
+    std::printf("test_multi_form_picks_login_form\n");
+    const std::string html =
+        "<form action=\"/next\" method=\"get\"><input type=\"submit\" value=\"Enter\"></form>"
+        "<form action=\"/auth\" method=\"post\">"
+        "<input name=\"u\" type=\"text\"><input name=\"p\" type=\"password\"></form>";
+    PortalForm f;
+    CHECK(parseLoginForm(html, f));
+    CHECK(f.valid);
+    CHECK(!f.chapLogin);
+    CHECK(f.userField == "u");
+    CHECK(f.passField == "p");
+    CHECK(f.action == "/auth");
+}
+
+// A visible username/password form whose md5.js CHAP tokens will NOT decode
+// (non-hex) must fall back to the manual browser path — never send the plaintext
+// password to a CHAP portal.
+static void test_js_chap_undecodable_is_challenge() {
+    std::printf("test_js_chap_undecodable_is_challenge\n");
+    const std::string html =
+        "<form name=\"login\" action=\"/login\" method=\"post\">"
+        "<input name=\"username\" type=\"text\">"
+        "<input name=\"password\" type=\"password\"></form>"
+        "<script>x = hexMD5('zz' + document.login.password.value + 'nothex');</script>";
+    PortalForm f;
+    bool ok = parseLoginForm(html, f);
+    CHECK(!ok);
+    CHECK(f.challenge);
+    CHECK(!f.valid);
+    CHECK(!f.chapLogin);
+}
+
 int main() {
     test_generic_user_pass();
     test_email_field();
@@ -269,6 +438,14 @@ int main() {
     test_attribute_order();
     test_captive_detection();
     test_issue42_mikrotik_chap_login();
+    test_issue44_mikrotik_default_template_chap_js();
+    test_redirect_page_meta_refresh();
+    test_redirect_page_js_location();
+    test_redirect_js_bare_window_location();
+    test_redirect_ignores_querystring_location();
+    test_redirect_page_continue_link();
+    test_multi_form_picks_login_form();
+    test_js_chap_undecodable_is_challenge();
 
     if (g_failures == 0) {
         std::printf("\nAll captive-portal parser tests passed.\n");

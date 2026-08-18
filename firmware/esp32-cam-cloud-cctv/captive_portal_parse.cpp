@@ -110,29 +110,29 @@ static bool hexDecode(const std::string& s, std::string& out) {
     return true;
 }
 
-bool parseLoginForm(const std::string& html, PortalForm& out) {
-    out = PortalForm();
-
-    size_t formStart = ifind(html, "<form");
-    if (formStart == std::string::npos) {
-        return false; // No form at all -> browser-assisted fallback.
-    }
-    out.formFound = true;
+// Parse ONE <form> whose "<form" begins at `formStart`. Fills `f` (action,
+// method, userField, passField, hidden inputs) and reports any chap-id /
+// chap-challenge carried as hidden <input> fields (issue #42) via `chapIdRaw` /
+// `chapChallengeRaw`. Returns the index just past this form's "</form>" so the
+// caller can keep scanning for further forms on the page.
+static size_t parseSingleForm(const std::string& html, size_t formStart,
+                              PortalForm& f, std::string& chapIdRaw,
+                              std::string& chapChallengeRaw) {
+    f = PortalForm();
+    f.formFound = true;
+    chapIdRaw.clear();
+    chapChallengeRaw.clear();
 
     size_t openEnd = html.find('>', formStart);
-    if (openEnd == std::string::npos) return false;
+    if (openEnd == std::string::npos) return std::string::npos;
     std::string formTag = html.substr(formStart, openEnd - formStart);
 
-    out.action = getAttr(formTag, "action");
+    f.action = getAttr(formTag, "action");
     std::string method = toLowerCopy(getAttr(formTag, "method"));
-    out.method = method.empty() ? "get" : method; // HTML default is GET.
+    f.method = method.empty() ? "get" : method; // HTML default is GET.
 
     size_t formEnd = ifind(html, "</form>", openEnd);
     size_t bodyEnd = (formEnd == std::string::npos) ? html.size() : formEnd;
-
-    // Raw (page-encoded) chap-id / chap-challenge values, captured so we can
-    // decode them into a MikroTik CHAP login response after the walk (issue #42).
-    std::string chapIdRaw, chapChallengeRaw;
 
     // Walk every <input> tag inside the form body.
     size_t pos = openEnd + 1;
@@ -148,7 +148,7 @@ bool parseLoginForm(const std::string& html, PortalForm& out) {
         std::string name = getAttr(tag, "name");
         std::string value = getAttr(tag, "value");
 
-        // A MikroTik hotspot CHAP portal carries hidden chap-id / chap-challenge
+        // A MikroTik hotspot CHAP portal may carry hidden chap-id / chap-challenge
         // fields and expects password = MD5(chap-id + password + chap-challenge).
         // Capture the values so we can compute that hash ourselves and log the
         // user in automatically instead of falling back to the browser (issue #42).
@@ -159,43 +159,239 @@ bool parseLoginForm(const std::string& html, PortalForm& out) {
         if (name.empty()) continue; // Cannot submit a nameless field.
 
         if (type == "password") {
-            if (out.passField.empty()) out.passField = name;
+            if (f.passField.empty()) f.passField = name;
         } else if (type == "hidden") {
-            out.hidden.push_back(PortalFormField{name, value});
+            f.hidden.push_back(PortalFormField{name, value});
         } else if (type == "submit" || type == "button" || type == "reset" ||
                    type == "checkbox" || type == "radio" || type == "image" ||
                    type == "file") {
             // Not a credential field; ignore for auto-detection.
         } else if (isTextLikeType(type)) {
-            if (out.userField.empty()) out.userField = name;
+            if (f.userField.empty()) f.userField = name;
         }
     }
 
-    // MikroTik CHAP portal: a hidden-field CHAP page always carries BOTH chap-id
-    // and chap-challenge. Only when both are present AND decode do we complete the
-    // login ourselves (hash the password with MD5). If both are present but cannot
-    // be decoded, fall back to the manual browser path (never send the plaintext
-    // password to a CHAP portal). A stray single field is ignored so a normal
-    // username/password form is unaffected.
-    if (!chapIdRaw.empty() && !chapChallengeRaw.empty()) {
-        std::string idBytes, challengeBytes;
-        if (hexDecode(chapIdRaw, idBytes) && hexDecode(chapChallengeRaw, challengeBytes) &&
-            !out.userField.empty() && !out.passField.empty()) {
-            out.chapLogin = true;
-            out.chapId = idBytes;
-            out.chapChallenge = challengeBytes;
-            out.valid = true;
-            return true;
+    if (formEnd == std::string::npos) return html.size();
+    return formEnd + 7; // strlen("</form>")
+}
+
+// Return the first single/double-quoted string literal that starts at or after
+// `from`, stopping at a statement/line boundary so we never wander into an
+// unrelated statement. Used to pull the target out of a JS location redirect.
+static std::string firstQuotedFrom(const std::string& html, size_t from) {
+    for (size_t i = from; i < html.size(); i++) {
+        char c = html[i];
+        if (c == '\'' || c == '"') {
+            size_t end = html.find(c, i + 1);
+            if (end == std::string::npos) return "";
+            return html.substr(i + 1, end - (i + 1));
         }
-        // CHAP present but not automatable (undecodable values or missing
-        // username/password field) -> browser-assisted fallback.
-        out.challenge = true;
-        out.valid = false;
+        if (c == ';' || c == '\n' || c == '\r' || c == '<') return "";
+    }
+    return "";
+}
+
+// MikroTik hotspot login pages compute the CHAP response in JavaScript, inlining
+// the per-session tokens as quoted hex literals:
+//   hexMD5('<chap-id>' + document.login.password.value + '<chap-challenge>')
+// Pull the first and last quoted literals out of that call so a page whose CHAP
+// tokens live ONLY in md5.js (not as hidden <input>s) is still automatable — this
+// is the default MikroTik template behind issue #44. Returns false when no such
+// call (with two quoted literals) is present.
+static bool extractJsChap(const std::string& html, std::string& idHex,
+                          std::string& challengeHex) {
+    size_t call = ifind(html, "hexmd5(");
+    if (call == std::string::npos) return false;
+    size_t open = html.find('(', call);
+    if (open == std::string::npos) return false;
+    size_t close = html.find(')', open);
+    if (close == std::string::npos) return false;
+
+    std::vector<std::string> literals;
+    size_t i = open + 1;
+    while (i < close) {
+        char c = html[i];
+        if (c == '\'' || c == '"') {
+            size_t end = html.find(c, i + 1);
+            if (end == std::string::npos || end > close) break;
+            literals.push_back(html.substr(i + 1, end - (i + 1)));
+            i = end + 1;
+        } else {
+            i++;
+        }
+    }
+    if (literals.size() < 2) return false;
+    idHex = literals.front();
+    challengeHex = literals.back();
+    return !idHex.empty() && !challengeHex.empty();
+}
+
+// A landing/redirect page (no usable login form) still tells the browser where
+// the real login page is. Extract that next-hop URL, preferring the most reliable
+// signal: a <meta http-equiv="refresh" content="N; url=…">, then a JS
+// window.location redirect, then a "continue"/login anchor. Returns "" when the
+// page carries no redirect hint. The caller resolves relative URLs against the
+// page URL and follows ONE hop (issue #44).
+static std::string extractRedirectUrl(const std::string& html) {
+    // 1. <meta http-equiv="refresh" content="0; url=http://…">
+    size_t m = 0;
+    while ((m = ifind(html, "<meta", m)) != std::string::npos) {
+        size_t end = html.find('>', m);
+        if (end == std::string::npos) break;
+        std::string tag = html.substr(m, end - m);
+        m = end + 1;
+        if (toLowerCopy(getAttr(tag, "http-equiv")) != "refresh") continue;
+        std::string content = getAttr(tag, "content");
+        size_t u = toLowerCopy(content).find("url=");
+        if (u == std::string::npos) continue;
+        std::string url = content.substr(u + 4);
+        // Trim surrounding whitespace and optional quotes.
+        while (!url.empty() && std::isspace((unsigned char)url.front())) url.erase(url.begin());
+        while (!url.empty() && (url.back() == '\'' || url.back() == '"' ||
+                                std::isspace((unsigned char)url.back()))) url.pop_back();
+        if (!url.empty() && (url.front() == '\'' || url.front() == '"')) url.erase(url.begin());
+        if (!url.empty()) return url;
+    }
+
+    // 2. JavaScript redirects: window.location.href='…', location.replace('…'),
+    //    location.assign('…'), window.location='…'. The method forms carry a '.'
+    //    so they cannot be confused with a query-string parameter; the bare
+    //    assignment is matched as "window.location=" (rather than a naked
+    //    "location=") so a URL such as "/login?location=home" embedded in the
+    //    page is NOT mistaken for a redirect target.
+    static const char* jsKeys[] = {"location.href", "location.replace",
+                                   "location.assign", "window.location="};
+    for (const char* key : jsKeys) {
+        size_t k = ifind(html, key);
+        if (k == std::string::npos) continue;
+        std::string url = firstQuotedFrom(html, k + std::strlen(key));
+        if (!url.empty()) return url;
+    }
+
+    // 3. A "continue"/login anchor: <a href="…">…continue…</a>.
+    size_t a = 0;
+    while ((a = ifind(html, "<a", a)) != std::string::npos) {
+        size_t end = html.find('>', a);
+        if (end == std::string::npos) break;
+        std::string tag = html.substr(a, end - a);
+        size_t textEnd = ifind(html, "</a>", end);
+        std::string text = (textEnd == std::string::npos)
+                               ? std::string()
+                               : toLowerCopy(html.substr(end + 1, textEnd - (end + 1)));
+        a = end + 1;
+        std::string href = getAttr(tag, "href");
+        if (href.empty() || href == "#") continue;
+        if (text.find("continue") != std::string::npos ||
+            text.find("login") != std::string::npos ||
+            text.find("log in") != std::string::npos) {
+            return href;
+        }
+    }
+    return "";
+}
+
+bool parseLoginForm(const std::string& html, PortalForm& out) {
+    out = PortalForm();
+
+    // Scan EVERY <form> on the page rather than assuming the first one is the
+    // login form. The MikroTik default login page, for example, emits a hidden
+    // "sendin" form (chap plumbing, no visible fields) BEFORE the real username/
+    // password form, so the first <form> alone yields "Form incomplete" (the
+    // exact issue #44 failure).
+    PortalForm best;                // first fully-usable username+password form
+    bool haveBest = false;
+    PortalForm challengeCandidate;  // a CHAP form we could not decode safely
+    bool haveChallenge = false;
+    bool anyForm = false;
+    std::string firstGetAction;     // fallback redirect target (a "continue" form)
+
+    size_t search = 0;
+    while (true) {
+        size_t formStart = ifind(html, "<form", search);
+        if (formStart == std::string::npos) break;
+        anyForm = true;
+
+        PortalForm cand;
+        std::string chapIdRaw, chapChallengeRaw;
+        size_t next = parseSingleForm(html, formStart, cand, chapIdRaw, chapChallengeRaw);
+        search = (next == std::string::npos || next <= formStart) ? (formStart + 5) : next;
+
+        bool hasUserPass = !cand.userField.empty() && !cand.passField.empty();
+
+        // A form carrying BOTH chap-id and chap-challenge as hidden inputs is a
+        // MikroTik CHAP form (issue #42). Automate it only when both decode AND a
+        // username/password field is present; otherwise never send the plaintext
+        // password to a CHAP portal — remember it as a manual-fallback challenge.
+        if (!chapIdRaw.empty() && !chapChallengeRaw.empty()) {
+            std::string idBytes, challengeBytes;
+            if (hasUserPass && hexDecode(chapIdRaw, idBytes) &&
+                hexDecode(chapChallengeRaw, challengeBytes)) {
+                cand.chapLogin = true;
+                cand.chapId = idBytes;
+                cand.chapChallenge = challengeBytes;
+                cand.valid = true;
+                out = cand;
+                return true;
+            }
+            if (!haveChallenge) {
+                challengeCandidate = cand;
+                challengeCandidate.challenge = true;
+                challengeCandidate.valid = false;
+                haveChallenge = true;
+            }
+            continue;
+        }
+
+        if (hasUserPass) {
+            if (!haveBest) { best = cand; haveBest = true; }
+        } else if (firstGetAction.empty() && cand.passField.empty() &&
+                   !cand.action.empty() && cand.method == "get") {
+            // A form with no password and a GET action is most likely a
+            // "continue" redirect form on a landing page — keep as a fallback.
+            firstGetAction = cand.action;
+        }
+    }
+
+    if (haveBest) {
+        out = best;
+        // A plain username+password form on a MikroTik-style page may still be a
+        // CHAP login: the chap-id/chap-challenge live in the page's md5.js call,
+        // not in <input>s. Detect that and hash locally (issue #44) rather than
+        // sending the plaintext password to a CHAP portal.
+        std::string idHex, challengeHex;
+        if (extractJsChap(html, idHex, challengeHex)) {
+            std::string idBytes, challengeBytes;
+            if (hexDecode(idHex, idBytes) && hexDecode(challengeHex, challengeBytes)) {
+                out.chapLogin = true;
+                out.chapId = idBytes;
+                out.chapChallenge = challengeBytes;
+            } else {
+                // The page is CHAP but the tokens will not decode — do NOT fall
+                // back to submitting the plaintext password.
+                out.valid = false;
+                out.challenge = true;
+                out.redirectUrl = extractRedirectUrl(html);
+                return false;
+            }
+        }
+        out.valid = true;
+        return true;
+    }
+
+    if (haveChallenge) {
+        out = challengeCandidate;
+        out.redirectUrl = extractRedirectUrl(html);
         return false;
     }
 
-    out.valid = !out.userField.empty() && !out.passField.empty();
-    return out.valid;
+    // Forms exist but none carry a username+password, OR there is no form at all
+    // (a JS/redirect landing page). Offer a next-hop URL so the caller can follow
+    // one redirect to the real login page and re-parse it (issue #44).
+    out = PortalForm();
+    out.formFound = anyForm;
+    out.redirectUrl = extractRedirectUrl(html);
+    if (out.redirectUrl.empty()) out.redirectUrl = firstGetAction;
+    return false;
 }
 
 bool looksLikeCaptivePortal(int status, const std::string& body) {
