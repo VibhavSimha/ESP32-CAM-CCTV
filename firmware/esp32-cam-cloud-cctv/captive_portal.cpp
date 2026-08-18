@@ -64,6 +64,13 @@ static String      s_lastMessage;      // human-readable status for the UI
 static int         s_attempts = 0;
 static bool        s_reprobePending = false;
 static unsigned long s_reprobeAt = 0;
+// Set by the /portal/reprobe HTTP handler ("Check again" button) so the actual
+// blocking probe runs in the main-loop task instead of the httpd task. Doing the
+// probe inline in the handler froze the whole web server for ~13 s while the
+// socket timed out, so /portal itself became unresponsive (issue #46, confirmed
+// by the reporter's HAR: GET /portal took 13,380 ms). We ACK immediately and let
+// captivePortalLoop() do the work; the page's existing poll surfaces the result.
+static bool        s_manualReprobePending = false;
 // Periodic re-probe interval when in UNSUPPORTED/FAILED state so that we
 // automatically detect when the user manually logs in via their browser.
 #ifndef CAPTIVE_PERIODIC_REPROBE_MS
@@ -171,6 +178,21 @@ static void persistSeen(const String& ssid) {
 // Operator guidance
 // -----------------------------------------------------------------------------
 
+// Best-effort URL a human can open to reach the ISP login page when we could not
+// positively determine it (e.g. the connectivity probe was unreachable). Captive
+// portals almost always intercept plain-HTTP traffic to the default gateway, so
+// the gateway root is the safest thing to hand the operator. This guarantees the
+// /portal helper's "Open the portal page" link never falls back to the device's
+// own page (which rendered as http://<device-ip>/portal# and went nowhere —
+// issue #46).
+static String bestEffortPortalUrl() {
+    IPAddress gw = WiFi.gatewayIP();
+    if ((uint32_t)gw != 0) {
+        return String("http://") + gw.toString() + "/";
+    }
+    return String(CAPTIVE_PROBE_URL);
+}
+
 // Print a clear, step-by-step banner telling the operator EXACTLY which URL to
 // open (on any phone/laptop joined to the same Wi-Fi) to clear the captive
 // portal. This replaces the previous terse one-line "manual browser fallback"
@@ -277,6 +299,37 @@ static int fetchPortalPage(const String& url, String& html) {
         return -1000;
     }
     int code = http.GET();
+    if (code > 0) {
+        html = http.getString();
+        if (html.length() > CAPTIVE_MAX_PAGE_BYTES) {
+            html = html.substring(0, CAPTIVE_MAX_PAGE_BYTES);
+        }
+    }
+    http.end();
+    return code;
+}
+
+// POST a MikroTik-style "redirect"/"continue" landing form (application/x-www-
+// form-urlencoded `body`) and return the page the portal responds with. Some
+// hotspots (notably RADIUSdesk external portals) serve an rlogin landing page
+// whose ONLY route to the real login form is a <form name="redirect" method=
+// "post"> that the browser auto-submits — a GET to its action does not reproduce
+// what the browser does, so we replay it as a POST here (issue #46). Redirects
+// are FORCE-followed so the 302 the portal issues after the POST is chased to the
+// real login page (which is then re-parsed for an automatable form).
+static int fetchPortalPagePost(const String& url, const String& body, String& html) {
+    html = "";
+    // WiFiClient must outlive the HTTPClient (see probeInternet for details).
+    WiFiClient client;
+    HTTPClient http;
+    http.setConnectTimeout(CAPTIVE_PROBE_TIMEOUT_MS);
+    http.setTimeout(CAPTIVE_PROBE_TIMEOUT_MS);
+    http.setFollowRedirects(HTTPC_FORCE_FOLLOW_REDIRECTS);
+    if (!http.begin(client, url)) {
+        return -1000;
+    }
+    http.addHeader("Content-Type", "application/x-www-form-urlencoded");
+    int code = http.POST(body);
     if (code > 0) {
         html = http.getString();
         if (html.length() > CAPTIVE_MAX_PAGE_BYTES) {
@@ -405,11 +458,24 @@ static void handleCaptiveDetected(const String& body, const String& location) {
             Serial.println("[CaptivePortal] Redirect target is the current page — stopping to avoid a loop.");
             break;
         }
-        Serial.printf("[CaptivePortal] Landing page redirects (no login form here) — following hop %d: %s\n",
-                      hop + 1, nextUrl.c_str());
+
+        // A MikroTik-style "redirect"/"continue" landing form is auto-submitted by
+        // the browser; replay it with the SAME method (POST echoing its hidden
+        // fields, else a plain GET) so we reach the real login page instead of
+        // dead-ending on the landing page (issue #46).
+        bool postHop = (s_form.redirectMethod == "post");
+        String postBody;
+        if (postHop) {
+            PortalForm hop;
+            hop.hidden = s_form.redirectFields;
+            postBody = String(buildFormBody(hop, std::string(), std::string()).c_str());
+        }
+        Serial.printf("[CaptivePortal] Landing page redirects (no login form here) — following hop %d via %s: %s\n",
+                      hop + 1, postHop ? "POST" : "GET", nextUrl.c_str());
 
         String page;
-        int pcode = fetchPortalPage(nextUrl, page);
+        int pcode = postHop ? fetchPortalPagePost(nextUrl, postBody, page)
+                            : fetchPortalPage(nextUrl, page);
         Serial.printf("[CaptivePortal] Fetch portal page -> HTTP %d (%u bytes)\n",
                       pcode, (unsigned)page.length());
         if (pcode <= 0 || page.length() == 0) {
@@ -417,7 +483,11 @@ static void handleCaptiveDetected(const String& body, const String& location) {
             break;
         }
         currentUrl = nextUrl;
-        s_portalUrl = nextUrl; // point the manual-browser fallback at the real login page
+        // Point the manual-browser fallback at the real login page for a GET hop
+        // (a URL a human can open directly). For a POST hop the target is a
+        // browser-detection endpoint that only makes sense as a form submission, so
+        // keep the original portal URL — that is what the operator's browser hits.
+        if (!postHop) s_portalUrl = nextUrl;
         html = page;
     }
 
@@ -480,6 +550,10 @@ void captivePortalBegin() {
         setStatus(PORTAL_STATE_FAILED,
                   "Could not reach the internet probe. If this network has a "
                   "login page, open it in your browser.");
+        // We do not know the exact ISP portal URL here, but a login page (if any)
+        // is almost always at the gateway — hand the operator a working link so
+        // the /portal helper never points back at the device itself (issue #46).
+        if (s_portalUrl.length() == 0) s_portalUrl = bestEffortPortalUrl();
         Serial.println("[CaptivePortal] Probe failed (network/DNS). Staying recoverable.");
         Serial.printf("[CaptivePortal] Cloud uploads paused. Open http://%s/portal on another "
                       "device to check/retry.\n", WiFi.localIP().toString().c_str());
@@ -629,13 +703,22 @@ static void onlineHeartbeat() {
         setStatus(PORTAL_STATE_FAILED,
                   "Lost internet connectivity — cloud uploads paused. If a login "
                   "page appears, open it in your browser.");
+        // Give the manual fallback a working link (gateway root) rather than a
+        // possibly-stale/empty URL (issue #46).
+        if (s_portalUrl.length() == 0) s_portalUrl = bestEffortPortalUrl();
         Serial.printf("[CaptivePortal] Cloud uploads paused. Open http://%s/portal on "
                       "another device to check/retry.\n", WiFi.localIP().toString().c_str());
     }
 }
 
 static esp_err_t portal_reprobe_handler(httpd_req_t* req) {
-    doReprobe();
+    // Do NOT probe inline here: probeInternet() can block for many seconds while
+    // a socket times out, and this handler runs in the single httpd task, which
+    // would freeze the whole web server (issue #46). Instead, flag the request
+    // and let captivePortalLoop() run the probe in the main-loop task, then ACK
+    // immediately. The page keeps polling /portal/status for the outcome.
+    s_manualReprobePending = true;
+    setStatus(s_state, "Re-checking the connection…");
     sendStatusJson(req);
     return ESP_OK;
 }
@@ -732,21 +815,24 @@ static esp_err_t portal_page_handler(httpd_req_t* req) {
         "<label>Portal password</label><input id='p' type='password' autocomplete='current-password'>"
         "<button type='submit'>Log in</button></form>"
         "<p id='manual' class='hide'>This portal can't be logged in automatically. "
-        "<a id='plink' href='#' target='_blank' rel='noopener'>Open the portal page</a> and finish there, "
+        "<span id='plinkwrap'><a id='plink' href='#' target='_blank' rel='noopener'>Open the portal page</a> and finish there, </span>"
         "then tap <strong>Check again</strong> below.</p>"
         "<button id='rprobe' class='hide' type='button'>Check again</button>"
         "</div><script>(function(){"
         "var msg=document.getElementById('msg'),f=document.getElementById('f'),"
         "manual=document.getElementById('manual'),plink=document.getElementById('plink'),"
+        "plinkwrap=document.getElementById('plinkwrap'),"
         "rprobe=document.getElementById('rprobe');"
         "function render(s){msg.textContent=s.message||'';"
         "if(s.automatable){f.classList.remove('hide');manual.classList.add('hide');rprobe.classList.add('hide');}"
         "else{f.classList.add('hide');}"
-        "if(s.state==='unsupported'||s.state==='failed'){if(s.portalUrl){plink.href=s.portalUrl;}manual.classList.remove('hide');rprobe.classList.remove('hide');}"
+        "if(s.state==='unsupported'||s.state==='failed'){"
+        "if(s.portalUrl){plink.href=s.portalUrl;plinkwrap.classList.remove('hide');}else{plinkwrap.classList.add('hide');}"
+        "manual.classList.remove('hide');rprobe.classList.remove('hide');}"
         "else{manual.classList.add('hide');rprobe.classList.add('hide');}}"
         "function poll(){fetch('/portal/status').then(r=>r.json()).then(render).catch(()=>{});}"
-        "rprobe.addEventListener('click',function(){msg.textContent='Checking…';"
-        "fetch('/portal/reprobe',{method:'POST'}).then(r=>r.json()).then(render).catch(()=>{msg.textContent='Network error.';});});"
+        "rprobe.addEventListener('click',function(){msg.textContent='Re-checking the connection…';"
+        "fetch('/portal/reprobe',{method:'POST'}).then(r=>r.json()).then(function(s){render(s);setTimeout(poll,1500);}).catch(()=>{msg.textContent='Network error.';});});"
         "f.addEventListener('submit',function(e){e.preventDefault();"
         "var b='user='+encodeURIComponent(document.getElementById('u').value)+"
         "'&pass='+encodeURIComponent(document.getElementById('p').value);"
@@ -782,6 +868,16 @@ void registerCaptivePortalHandlers(httpd_handle_t server) {
 // -----------------------------------------------------------------------------
 void captivePortalLoop() {
 #if ENABLE_CAPTIVE_PORTAL_LOGIN
+    // Operator tapped "Check again" on /portal. The HTTP handler deferred the
+    // (potentially multi-second, blocking) probe to us so the httpd task — and
+    // therefore the whole web server — stayed responsive (issue #46). Run it now
+    // in the main-loop task; the page's /portal/status poll surfaces the result.
+    if (s_manualReprobePending) {
+        s_manualReprobePending = false;
+        doReprobe();
+        return;
+    }
+
     // Post-submit re-probe (after automated credential submission).
     if (s_reprobePending) {
         if ((long)(millis() - s_reprobeAt) >= 0) {

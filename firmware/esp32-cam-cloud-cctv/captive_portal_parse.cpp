@@ -303,7 +303,8 @@ bool parseLoginForm(const std::string& html, PortalForm& out) {
     PortalForm challengeCandidate;  // a CHAP form we could not decode safely
     bool haveChallenge = false;
     bool anyForm = false;
-    std::string firstGetAction;     // fallback redirect target (a "continue" form)
+    PortalForm continueForm;        // first "redirect"/"continue" landing form (no creds)
+    bool haveContinueForm = false;
 
     size_t search = 0;
     while (true) {
@@ -344,11 +345,17 @@ bool parseLoginForm(const std::string& html, PortalForm& out) {
 
         if (hasUserPass) {
             if (!haveBest) { best = cand; haveBest = true; }
-        } else if (firstGetAction.empty() && cand.passField.empty() &&
-                   !cand.action.empty() && cand.method == "get") {
-            // A form with no password and a GET action is most likely a
-            // "continue" redirect form on a landing page — keep as a fallback.
-            firstGetAction = cand.action;
+        } else if (!haveContinueForm && cand.userField.empty() &&
+                   cand.passField.empty() && !cand.action.empty()) {
+            // A form carrying NEITHER a username nor a password input, but WITH an
+            // action, is a MikroTik-style "redirect"/"continue" landing form that
+            // the browser auto-submits to reach the real login page. Remember the
+            // first one (GET *or* POST) as the next-hop fallback; the previous code
+            // kept only GET forms, so a POST redirect form — used by RADIUSdesk
+            // external portals — was dropped and the flow dead-ended with
+            // redirect:'' (issue #46).
+            continueForm = cand;
+            haveContinueForm = true;
         }
     }
 
@@ -390,7 +397,16 @@ bool parseLoginForm(const std::string& html, PortalForm& out) {
     out = PortalForm();
     out.formFound = anyForm;
     out.redirectUrl = extractRedirectUrl(html);
-    if (out.redirectUrl.empty()) out.redirectUrl = firstGetAction;
+    if (out.redirectUrl.empty() && haveContinueForm) {
+        // No <meta refresh> / JS location / "continue" anchor hint on the page —
+        // fall back to the MikroTik-style "redirect"/"continue" landing FORM,
+        // preserving its method and hidden fields so the caller resubmits it
+        // exactly as the browser would (a POST form was previously dropped, which
+        // dead-ended the flow with redirect:'' — issue #46).
+        out.redirectUrl = continueForm.action;
+        out.redirectMethod = continueForm.method;
+        out.redirectFields = continueForm.hidden;
+    }
     return false;
 }
 

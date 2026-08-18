@@ -41,6 +41,15 @@ struct PortalForm {
     // or a "continue" link/form. The caller follows one hop and re-parses so the
     // ESP32 can reach — and auto-submit — the real login form (issue #44).
     std::string redirectUrl;
+    // How to follow `redirectUrl`. Empty (or "get") means a plain GET navigation
+    // (a <meta refresh>, JS location change or "continue" link). "post" means the
+    // next hop is a MikroTik-style "redirect"/"continue" <form method="post"> that
+    // the browser AUTO-SUBMITS to reach the real login page — common with
+    // RADIUSdesk external portals. The caller must resubmit it as a POST, echoing
+    // `redirectFields`, or it dead-ends on the landing page with redirect:'' (the
+    // exact issue #46 failure).
+    std::string redirectMethod;
+    std::vector<PortalFormField> redirectFields;
 };
 
 // Auto-detect the login form in `html`. Returns true when a form simple enough
