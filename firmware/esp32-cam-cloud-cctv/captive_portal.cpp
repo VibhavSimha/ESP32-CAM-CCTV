@@ -71,6 +71,12 @@
 static PortalState s_state = PORTAL_STATE_UNKNOWN;
 static PortalForm  s_form;             // auto-detected login form
 static String      s_portalUrl;        // URL of the portal login page
+// URL of the page the current s_form was actually parsed from. This can differ
+// from s_portalUrl when the real login form is reached by following one or more
+// landing-page redirects: for a POST hop s_portalUrl is deliberately kept at the
+// browser-facing URL, so the form action must be resolved against THIS page URL
+// instead, or a relative/empty action would post to the wrong host (issue #48).
+static String      s_formPageUrl;
 static String      s_lastMessage;      // human-readable status for the UI
 static int         s_attempts = 0;
 static bool        s_reprobePending = false;
@@ -538,6 +544,10 @@ static void handleCaptiveDetected(const String& body, const String& location) {
         // names / hidden CHAP tokens / JS) is visible on the serial console.
         logPortalPage(html);
         analyzePortalPage(html);
+        // Remember which page THIS form came from so a relative/empty form action
+        // is later resolved against the correct base, even after a POST hop where
+        // s_portalUrl is intentionally left at the browser-facing URL (issue #48).
+        s_formPageUrl = currentUrl;
 
         if (s_state == PORTAL_STATE_CAPTIVE) break;   // reached an automatable form
         if (s_form.redirectUrl.empty()) break;        // no next hop to follow
@@ -676,7 +686,12 @@ static bool submitPortalLogin(const String& username, const String& password, St
         outMsg = "This portal cannot be automated. Please log in from your browser.";
         return false;
     }
-    String actionUrl = resolveActionUrl(s_portalUrl, String(s_form.action.c_str()));
+    // Resolve the form action against the page the form was actually parsed from
+    // (s_formPageUrl), not s_portalUrl — those differ after a POST redirect hop,
+    // where s_portalUrl is kept at the browser-facing URL (issue #48). Fall back
+    // to s_portalUrl when no distinct form-page URL was recorded.
+    String base = s_formPageUrl.length() ? s_formPageUrl : s_portalUrl;
+    String actionUrl = resolveActionUrl(base, String(s_form.action.c_str()));
     std::string bodyStd = buildFormBody(s_form,
                                         std::string(username.c_str(), username.length()),
                                         std::string(password.c_str(), password.length()));
@@ -784,6 +799,7 @@ static void buildPortalDiagnostics(String& d) {
     d += "attempts        : "; d += s_attempts; d += "\n";
     d += "portalUrl       : "; d += (s_portalUrl.length() ? s_portalUrl : String("(none)")); d += "\n";
     d += "portalUrlScheme : "; d += (s_portalUrl.length() ? (isHttpsUrl(s_portalUrl) ? "https" : "http") : "(none)"); d += "\n";
+    d += "formPageUrl     : "; d += (s_formPageUrl.length() ? s_formPageUrl : String("(none)")); d += "\n";
     d += "formFound       : "; d += (s_form.formFound ? "yes" : "no"); d += "\n";
     d += "formValid       : "; d += (s_form.valid ? "yes" : "no"); d += "\n";
     d += "challenge       : "; d += (s_form.challenge ? "yes" : "no"); d += "\n";
