@@ -108,10 +108,12 @@ hostel / campus / ISP hotspots). When `ENABLE_CAPTIVE_PORTAL_LOGIN` is `1`
    board (issues #42, #44).
 3. Some hotspots (MikroTik especially) first serve an **rlogin-style landing
    page** that only *redirects* to the real `login.html` via a `<meta refresh>`,
-   a JavaScript `window.location` change or a "continue" link. The ESP32 does not
-   run JavaScript, so the firmware follows up to `CAPTIVE_MAX_REDIRECT_HOPS` such
-   hops itself to reach the real login form instead of stalling on the landing
-   page (issue #44).
+   a JavaScript `window.location` change, a "continue" link, **or a hidden
+   `<form name="redirect">` that the browser auto-submits** (RADIUSdesk-style
+   external portals use a `method="post"` form here). The ESP32 does not run
+   JavaScript, so the firmware follows up to `CAPTIVE_MAX_REDIRECT_HOPS` such
+   hops itself — replaying a POST redirect form with its hidden fields — to reach
+   the real login form instead of stalling on the landing page (issues #44, #46).
 4. Open `http://<device-ip>/portal` in a browser on the same network. Enter the
    ISP portal username/password; the board submits the login for you and
    re-checks connectivity.
@@ -141,7 +143,7 @@ is reachable:
 | `CAPTIVE_PERIODIC_REPROBE_MS` | `30000` | Heartbeat cadence while **offline** (waiting for the portal login). |
 | `CAPTIVE_ONLINE_HEARTBEAT_MS` | `60000` | Heartbeat cadence while **online** (to catch a portal that re-appears). |
 | `CAPTIVE_LOG_PORTAL_PAGE` | `1` | Dump the full fetched portal login page to the serial console when a portal is detected (diagnostic — see the exact HTML/fields to parse). Set to `0` to silence. |
-| `CAPTIVE_MAX_REDIRECT_HOPS` | `3` | How many landing-page redirects (`<meta refresh>` / JS `location` / "continue" link) the firmware will follow to reach the real login form (issue #44). |
+| `CAPTIVE_MAX_REDIRECT_HOPS` | `3` | How many landing-page redirects (`<meta refresh>` / JS `location` / "continue" link / auto-submitted `<form name="redirect">`, GET or POST) the firmware will follow to reach the real login form (issues #44, #46). |
 
 ### Why log in on the camera's `/portal`, not on your phone (per-MAC gotcha)
 A common question: *should I open the ISP portal URL on my PC while it is on the

@@ -426,6 +426,93 @@ static void test_js_chap_undecodable_is_challenge() {
     CHECK(!f.chapLogin);
 }
 
+// Issue #46: the exact field-reported page — a MikroTik/RADIUSdesk "redirect"
+// LANDING page ("If you are not redirected in a few seconds, click 'continue'
+// below") whose only actionable element is a <form name="redirect" method="post">
+// that the browser auto-submits (document.redirect.submit()) to reach the real
+// login page. There is no <meta refresh>, no JS location change and no "continue"
+// <a> link, so the ONLY next-hop hint is the POST form. Previously this produced
+// redirect:'' and dead-ended; now the POST action, method and hidden fields are
+// surfaced so the firmware can follow the hop the same way the browser would.
+static void test_issue46_mikrotik_redirect_form_post() {
+    std::printf("test_issue46_mikrotik_redirect_form_post\n");
+    const std::string html =
+        "<html><body>"
+        "<center>If you are not redirected in a few seconds, click 'continue' below<br>"
+        "<form name=\"redirect\" action=\"http://portal.example.net/rd/mikrotik-browser-detect\" method=\"post\">"
+        "<input type=\"hidden\" name=\"mac\" value=\"A8:42:E3:48:53:0C\">"
+        "<input type=\"hidden\" name=\"ip\" value=\"10.201.125.99\">"
+        "<input type=\"hidden\" name=\"loginlink\" value=\"http://10.201.125.1/login\">"
+        "<input type=\"hidden\" name=\"nasid\" value=\"hotspot1\">"
+        "<input type=\"submit\" value=\"continue\">"
+        "</form></center>"
+        "<script type=\"text/javascript\">document.redirect.submit();</script>"
+        "</body></html>";
+    PortalForm f;
+    bool ok = parseLoginForm(html, f);
+    CHECK(!ok);                 // not an automatable username/password form
+    CHECK(f.formFound);         // a <form> exists (the redirect form)
+    CHECK(!f.valid);
+    CHECK(!f.challenge);
+    CHECK(!f.chapLogin);
+    // The next hop is the POST redirect form — its action, method and hidden
+    // fields must all be surfaced (this is what was missing: redirect:'').
+    CHECK(f.redirectUrl == "http://portal.example.net/rd/mikrotik-browser-detect");
+    CHECK(f.redirectMethod == "post");
+    CHECK(f.redirectFields.size() == 4);   // mac, ip, loginlink, nasid (submit excluded)
+    CHECK(f.redirectFields[0].name == "mac");
+    CHECK(f.redirectFields[2].name == "loginlink");
+    CHECK(f.redirectFields[2].value == "http://10.201.125.1/login");
+
+    // The body the firmware POSTs to follow the hop echoes every hidden field
+    // (buildFormBody with empty user/pass emits only the hidden fields).
+    PortalForm hop;
+    hop.hidden = f.redirectFields;
+    std::string body = buildFormBody(hop, "", "");
+    CHECK(body.find("mac=A8%3A42%3AE3%3A48%3A53%3A0C") != std::string::npos);
+    CHECK(body.find("loginlink=http%3A%2F%2F10.201.125.1%2Flogin") != std::string::npos);
+}
+
+// A GET-method MikroTik "redirect" landing form (the PacketFence variant) must
+// likewise be surfaced as the next hop, with redirectMethod=="get".
+static void test_issue46_mikrotik_redirect_form_get() {
+    std::printf("test_issue46_mikrotik_redirect_form_get\n");
+    const std::string html =
+        "<html><body>"
+        "<center>If you are not redirected in a few seconds, click 'continue' below<br>"
+        "<form name=\"redirect\" action=\"http://192.168.1.5/Mikrotik\" method=\"get\">"
+        "<input type=\"hidden\" name=\"mac\" value=\"00:11:22:33:44:55\">"
+        "<input type=\"hidden\" name=\"ip\" value=\"10.0.0.9\">"
+        "<input type=\"submit\" value=\"continue\">"
+        "</form></center></body></html>";
+    PortalForm f;
+    CHECK(!parseLoginForm(html, f));
+    CHECK(f.formFound);
+    CHECK(!f.valid);
+    CHECK(f.redirectUrl == "http://192.168.1.5/Mikrotik");
+    CHECK(f.redirectMethod == "get");
+    CHECK(f.redirectFields.size() == 2);
+}
+
+// A <meta refresh> present ALONGSIDE a POST redirect form must still win (a meta
+// refresh is a plain GET navigation): redirectMethod stays empty so the caller
+// GETs the meta target rather than POSTing the form.
+static void test_issue46_meta_refresh_beats_redirect_form() {
+    std::printf("test_issue46_meta_refresh_beats_redirect_form\n");
+    const std::string html =
+        "<html><head>"
+        "<meta http-equiv=\"refresh\" content=\"0; url=http://10.201.125.1/login?dst=x\">"
+        "</head><body>"
+        "<form name=\"redirect\" action=\"http://detect.example/\" method=\"post\">"
+        "<input type=\"hidden\" name=\"mac\" value=\"00:11:22:33:44:55\"></form>"
+        "</body></html>";
+    PortalForm f;
+    CHECK(!parseLoginForm(html, f));
+    CHECK(f.redirectUrl == "http://10.201.125.1/login?dst=x");
+    CHECK(f.redirectMethod.empty());        // GET navigation, not a POST hop
+    CHECK(f.redirectFields.empty());
+}
+
 int main() {
     test_generic_user_pass();
     test_email_field();
@@ -446,6 +533,9 @@ int main() {
     test_redirect_page_continue_link();
     test_multi_form_picks_login_form();
     test_js_chap_undecodable_is_challenge();
+    test_issue46_mikrotik_redirect_form_post();
+    test_issue46_mikrotik_redirect_form_get();
+    test_issue46_meta_refresh_beats_redirect_form();
 
     if (g_failures == 0) {
         std::printf("\nAll captive-portal parser tests passed.\n");
