@@ -226,3 +226,13 @@
 // many such hops itself to reach the real login form instead of stalling on the
 // landing page (issue #44). 0 disables redirect-following.
 #define CAPTIVE_MAX_REDIRECT_HOPS    3
+
+// Many ISP portals redirect the plain-HTTP landing page to an HTTPS external
+// login page (e.g. Spectra/RADIUSdesk — issue #48). The firmware follows those
+// hops over TLS (certificate check disabled: a captive portal presents an
+// untrusted cert and the board has no RTC to validate one). A TLS handshake
+// needs ~40 KB of heap transiently, so it is skipped when free heap is below
+// this watermark to avoid a brown-out; the manual-browser fallback is used
+// instead. At boot (when the portal is first probed) heap is ~140 KB, well above
+// this. Lower it only if you know your build has less headroom.
+#define CAPTIVE_MIN_HEAP_FOR_TLS     60000UL

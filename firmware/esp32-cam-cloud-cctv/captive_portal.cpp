@@ -4,6 +4,7 @@
 
 #include <Arduino.h>
 #include <WiFi.h>
+#include <WiFiClientSecure.h>
 #include <HTTPClient.h>
 #include <Preferences.h>
 
@@ -44,6 +45,16 @@
 #define CAPTIVE_MAX_REDIRECT_HOPS 3
 #endif
 
+// Minimum free heap (bytes) required before opening a TLS connection to fetch or
+// submit an HTTPS captive-portal page. A mbedTLS handshake needs ~40 KB of heap
+// transiently; attempting it when the heap is already tight (camera + tunnel
+// running) can brown the board out, so below this watermark we skip the HTTPS hop
+// and stay on the manual-browser fallback instead of crashing (issue #48). At
+// boot — when the portal is first probed — the heap is ~140 KB, well above this.
+#ifndef CAPTIVE_MIN_HEAP_FOR_TLS
+#define CAPTIVE_MIN_HEAP_FOR_TLS 60000UL
+#endif
+
 // Dump the full fetched captive-portal login page to the serial console when a
 // portal is detected. This is a diagnostic aid: many ISP portals (e.g. MikroTik
 // CHAP) cannot be auto-detected, and seeing the exact HTML the ESP32 received is
@@ -60,6 +71,12 @@
 static PortalState s_state = PORTAL_STATE_UNKNOWN;
 static PortalForm  s_form;             // auto-detected login form
 static String      s_portalUrl;        // URL of the portal login page
+// URL of the page the current s_form was actually parsed from. This can differ
+// from s_portalUrl when the real login form is reached by following one or more
+// landing-page redirects: for a POST hop s_portalUrl is deliberately kept at the
+// browser-facing URL, so the form action must be resolved against THIS page URL
+// instead, or a relative/empty action would post to the wrong host (issue #48).
+static String      s_formPageUrl;
 static String      s_lastMessage;      // human-readable status for the UI
 static int         s_attempts = 0;
 static bool        s_reprobePending = false;
@@ -71,6 +88,14 @@ static unsigned long s_reprobeAt = 0;
 // by the reporter's HAR: GET /portal took 13,380 ms). We ACK immediately and let
 // captivePortalLoop() do the work; the page's existing poll surfaces the result.
 static bool        s_manualReprobePending = false;
+// Set by the /portal/login handler when the operator submits credentials but no
+// automatable login form has been detected yet (e.g. the boot-time HTTPS redirect
+// fetch failed). The blocking re-detect + submit is deferred to captivePortalLoop()
+// so the httpd task stays responsive (issue #46). The credentials are held only
+// until that deferred submit runs, then wiped (issue #48).
+static bool        s_redetectLoginPending = false;
+static String      s_pendingUser;
+static String      s_pendingPass;
 // Periodic re-probe interval when in UNSUPPORTED/FAILED state so that we
 // automatically detect when the user manually logs in via their browser.
 #ifndef CAPTIVE_PERIODIC_REPROBE_MS
@@ -250,6 +275,66 @@ static void printPortalInstructions() {
 // HTTP probe + fetch
 // -----------------------------------------------------------------------------
 
+// True when `url` uses the HTTPS scheme and therefore needs a TLS client. Many
+// ISP portals redirect the plain-HTTP landing page to an https:// login page
+// (e.g. Spectra/RADIUSdesk external portals — issue #48). A plain WiFiClient
+// cannot speak TLS, so such a fetch fails instantly with HTTPC_ERROR_CONNECTION_
+// LOST (-5), dead-ending the whole login flow. We transparently upgrade to a
+// WiFiClientSecure for these URLs so the redirect chain can be followed.
+static bool isHttpsUrl(const String& url) {
+    return url.startsWith("https://") || url.startsWith("HTTPS://");
+}
+
+// Map a negative HTTPClient (ESP32) error code to a readable name so the serial
+// log shows e.g. "CONNECTION_LOST (-5)" instead of a bare "-5" the operator has
+// to look up (issue #48 — "add more log surface"). Positive values are real HTTP
+// status codes and are printed as-is by the caller.
+static const char* httpErrorName(int code) {
+    switch (code) {
+        case HTTPC_ERROR_CONNECTION_REFUSED:  return "CONNECTION_REFUSED";
+        case HTTPC_ERROR_SEND_HEADER_FAILED:  return "SEND_HEADER_FAILED";
+        case HTTPC_ERROR_SEND_PAYLOAD_FAILED: return "SEND_PAYLOAD_FAILED";
+        case HTTPC_ERROR_NOT_CONNECTED:       return "NOT_CONNECTED";
+        case HTTPC_ERROR_CONNECTION_LOST:     return "CONNECTION_LOST";
+        case HTTPC_ERROR_NO_STREAM:           return "NO_STREAM";
+        case HTTPC_ERROR_NO_HTTP_SERVER:      return "NO_HTTP_SERVER";
+        case HTTPC_ERROR_TOO_LESS_RAM:        return "TOO_LESS_RAM";
+        case HTTPC_ERROR_ENCODING:            return "ENCODING";
+        case HTTPC_ERROR_STREAM_WRITE:        return "STREAM_WRITE";
+        case HTTPC_ERROR_READ_TIMEOUT:        return "READ_TIMEOUT";
+        case -1000:                           return "BEGIN_FAILED";
+        case -1001:                           return "HEAP_TOO_LOW_FOR_TLS";
+        default:                              return code < 0 ? "UNKNOWN_ERROR" : "HTTP";
+    }
+}
+
+// Pick the transport for `url`: a TLS client (certificate check disabled — a
+// captive portal presents an untrusted/again-self-signed cert and the board has
+// no RTC time to validate one anyway) for https://, else a plain client. Both
+// clients are declared by the caller so they outlive the HTTPClient that borrows
+// one of them (see probeInternet for why the ordering matters).
+static WiFiClient& selectPortalClient(const String& url, WiFiClient& plain,
+                                      WiFiClientSecure& secure) {
+    if (isHttpsUrl(url)) {
+        secure.setInsecure();
+        return secure;
+    }
+    return plain;
+}
+
+// Uniform "fetch result" log line: adds the URL scheme and, for a negative code,
+// the decoded HTTPClient error name so failures are self-explanatory (issue #48).
+static void logFetchResult(const char* what, const String& url, int code, size_t bytes) {
+    if (code < 0) {
+        Serial.printf("[CaptivePortal] %s [%s] -> HTTP %d (%s), %u bytes\n",
+                      what, isHttpsUrl(url) ? "https" : "http", code,
+                      httpErrorName(code), (unsigned)bytes);
+    } else {
+        Serial.printf("[CaptivePortal] %s [%s] -> HTTP %d, %u bytes\n",
+                      what, isHttpsUrl(url) ? "https" : "http", code, (unsigned)bytes);
+    }
+}
+
 // Perform the connectivity probe. Returns the HTTP status code (or a negative
 // HTTPClient error), fills `body` and, on a redirect, `location`.
 static int probeInternet(String& body, String& location) {
@@ -286,11 +371,18 @@ static int probeInternet(String& body, String& location) {
 }
 
 // GET the portal login page at `url`, following redirects. Returns HTTP status
-// and fills `html`.
+// and fills `html`. Transparently uses TLS for https:// targets (issue #48).
 static int fetchPortalPage(const String& url, String& html) {
     html = "";
-    // WiFiClient must outlive the HTTPClient (see probeInternet for details).
-    WiFiClient client;
+    if (isHttpsUrl(url) && ESP.getFreeHeap() < CAPTIVE_MIN_HEAP_FOR_TLS) {
+        Serial.printf("[CaptivePortal] Skipping HTTPS GET of %s — free heap %u < %lu needed for TLS.\n",
+                      url.c_str(), (unsigned)ESP.getFreeHeap(), (unsigned long)CAPTIVE_MIN_HEAP_FOR_TLS);
+        return -1001;
+    }
+    // The transport client(s) must outlive the HTTPClient (see probeInternet).
+    WiFiClient plainClient;
+    WiFiClientSecure secureClient;
+    WiFiClient& client = selectPortalClient(url, plainClient, secureClient);
     HTTPClient http;
     http.setConnectTimeout(CAPTIVE_PROBE_TIMEOUT_MS);
     http.setTimeout(CAPTIVE_PROBE_TIMEOUT_MS);
@@ -314,13 +406,22 @@ static int fetchPortalPage(const String& url, String& html) {
 // hotspots (notably RADIUSdesk external portals) serve an rlogin landing page
 // whose ONLY route to the real login form is a <form name="redirect" method=
 // "post"> that the browser auto-submits — a GET to its action does not reproduce
-// what the browser does, so we replay it as a POST here (issue #46). Redirects
-// are FORCE-followed so the 302 the portal issues after the POST is chased to the
-// real login page (which is then re-parsed for an automatable form).
+// what the browser does, so we replay it as a POST here (issue #46). The action
+// is frequently an https:// external portal, so TLS is used transparently when
+// needed (issue #48). Redirects are FORCE-followed so the 302 the portal issues
+// after the POST is chased to the real login page (which is then re-parsed for an
+// automatable form).
 static int fetchPortalPagePost(const String& url, const String& body, String& html) {
     html = "";
-    // WiFiClient must outlive the HTTPClient (see probeInternet for details).
-    WiFiClient client;
+    if (isHttpsUrl(url) && ESP.getFreeHeap() < CAPTIVE_MIN_HEAP_FOR_TLS) {
+        Serial.printf("[CaptivePortal] Skipping HTTPS POST to %s — free heap %u < %lu needed for TLS.\n",
+                      url.c_str(), (unsigned)ESP.getFreeHeap(), (unsigned long)CAPTIVE_MIN_HEAP_FOR_TLS);
+        return -1001;
+    }
+    // The transport client(s) must outlive the HTTPClient (see probeInternet).
+    WiFiClient plainClient;
+    WiFiClientSecure secureClient;
+    WiFiClient& client = selectPortalClient(url, plainClient, secureClient);
     HTTPClient http;
     http.setConnectTimeout(CAPTIVE_PROBE_TIMEOUT_MS);
     http.setTimeout(CAPTIVE_PROBE_TIMEOUT_MS);
@@ -428,8 +529,7 @@ static void handleCaptiveDetected(const String& body, const String& location) {
     if (location.length()) {
         String page;
         int pcode = fetchPortalPage(currentUrl, page);
-        Serial.printf("[CaptivePortal] Fetch portal page -> HTTP %d (%u bytes)\n",
-                      pcode, (unsigned)page.length());
+        logFetchResult("Fetch portal page", currentUrl, pcode, page.length());
         if (page.length()) html = page;
     }
 
@@ -444,6 +544,10 @@ static void handleCaptiveDetected(const String& body, const String& location) {
         // names / hidden CHAP tokens / JS) is visible on the serial console.
         logPortalPage(html);
         analyzePortalPage(html);
+        // Remember which page THIS form came from so a relative/empty form action
+        // is later resolved against the correct base, even after a POST hop where
+        // s_portalUrl is intentionally left at the browser-facing URL (issue #48).
+        s_formPageUrl = currentUrl;
 
         if (s_state == PORTAL_STATE_CAPTIVE) break;   // reached an automatable form
         if (s_form.redirectUrl.empty()) break;        // no next hop to follow
@@ -476,10 +580,13 @@ static void handleCaptiveDetected(const String& body, const String& location) {
         String page;
         int pcode = postHop ? fetchPortalPagePost(nextUrl, postBody, page)
                             : fetchPortalPage(nextUrl, page);
-        Serial.printf("[CaptivePortal] Fetch portal page -> HTTP %d (%u bytes)\n",
-                      pcode, (unsigned)page.length());
+        logFetchResult("Fetch redirect target", nextUrl, pcode, page.length());
         if (pcode <= 0 || page.length() == 0) {
             Serial.println("[CaptivePortal] Could not fetch the redirect target — staying on manual fallback.");
+            if (isHttpsUrl(nextUrl) && pcode == HTTPC_ERROR_CONNECTION_LOST) {
+                Serial.println("[CaptivePortal] (HTTPS target dropped the connection — the portal's TLS "
+                               "may be incompatible with the ESP32; use the /portal form or a browser.)");
+            }
             break;
         }
         currentUrl = nextUrl;
@@ -534,7 +641,12 @@ void captivePortalBegin() {
 
     String body, location;
     int code = probeInternet(body, location);
-    Serial.printf("[CaptivePortal] Probe %s -> HTTP %d\n", CAPTIVE_PROBE_URL, code);
+    if (code < 0) {
+        Serial.printf("[CaptivePortal] Probe %s -> HTTP %d (%s)\n", CAPTIVE_PROBE_URL, code, httpErrorName(code));
+    } else {
+        Serial.printf("[CaptivePortal] Probe %s -> HTTP %d%s\n", CAPTIVE_PROBE_URL, code,
+                      code >= 300 && code < 400 ? " (redirected — captive portal)" : "");
+    }
 
     std::string b(body.c_str(), body.length());
     if (code > 0 && !looksLikeCaptivePortal(code, b)) {
@@ -574,17 +686,33 @@ static bool submitPortalLogin(const String& username, const String& password, St
         outMsg = "This portal cannot be automated. Please log in from your browser.";
         return false;
     }
-    String actionUrl = resolveActionUrl(s_portalUrl, String(s_form.action.c_str()));
+    // Resolve the form action against the page the form was actually parsed from
+    // (s_formPageUrl), not s_portalUrl — those differ after a POST redirect hop,
+    // where s_portalUrl is kept at the browser-facing URL (issue #48). Fall back
+    // to s_portalUrl when no distinct form-page URL was recorded.
+    String base = s_formPageUrl.length() ? s_formPageUrl : s_portalUrl;
+    String actionUrl = resolveActionUrl(base, String(s_form.action.c_str()));
     std::string bodyStd = buildFormBody(s_form,
                                         std::string(username.c_str(), username.length()),
                                         std::string(password.c_str(), password.length()));
     String body(bodyStd.c_str());
 
-    Serial.printf("[CaptivePortal] Submitting login to %s (method %s)\n",
-                  actionUrl.c_str(), s_form.method.c_str());
+    Serial.printf("[CaptivePortal] Submitting login to %s (method %s, %s)\n",
+                  actionUrl.c_str(), s_form.method.c_str(),
+                  isHttpsUrl(actionUrl) ? "https" : "http");
 
-    // WiFiClient must outlive the HTTPClient (see probeInternet for details).
-    WiFiClient client;
+    if (isHttpsUrl(actionUrl) && ESP.getFreeHeap() < CAPTIVE_MIN_HEAP_FOR_TLS) {
+        Serial.printf("[CaptivePortal] Skipping HTTPS login submit — free heap %u < %lu needed for TLS.\n",
+                      (unsigned)ESP.getFreeHeap(), (unsigned long)CAPTIVE_MIN_HEAP_FOR_TLS);
+        outMsg = "Not enough memory to open a secure connection to the portal right "
+                 "now. Please finish the login in your browser instead.";
+        return false;
+    }
+
+    // The transport client(s) must outlive the HTTPClient (see probeInternet).
+    WiFiClient plainClient;
+    WiFiClientSecure secureClient;
+    WiFiClient& client = selectPortalClient(actionUrl, plainClient, secureClient);
     HTTPClient http;
     http.setConnectTimeout(CAPTIVE_PROBE_TIMEOUT_MS);
     http.setTimeout(CAPTIVE_PROBE_TIMEOUT_MS);
@@ -600,7 +728,11 @@ static bool submitPortalLogin(const String& username, const String& password, St
         http.addHeader("Content-Type", "application/x-www-form-urlencoded");
         code = http.POST(body);
     }
-    Serial.printf("[CaptivePortal] Portal login response: HTTP %d\n", code);
+    if (code < 0) {
+        Serial.printf("[CaptivePortal] Portal login response: HTTP %d (%s)\n", code, httpErrorName(code));
+    } else {
+        Serial.printf("[CaptivePortal] Portal login response: HTTP %d\n", code);
+    }
     http.end();
 
     if (code <= 0) {
@@ -651,13 +783,90 @@ static esp_err_t portal_status_handler(httpd_req_t* req) {
     return ESP_OK;
 }
 
+// Build a human-readable, secrets-free diagnostics dump: everything an operator
+// needs to understand why the captive-portal login is (or is not) working, in one
+// place. Shared by the /portal/diag web endpoint and the serial banner
+// (captivePortalPrintDiagnostics) so both always show identical information
+// (issue #48 — "add all possible diagnostic helpers ... print that during
+// startup").
+static void buildPortalDiagnostics(String& d) {
+    d = "";
+    d.reserve(1024);
+    d += "ESP32-CAM captive-portal diagnostics\n";
+    d += "state           : "; d += stateName(s_state); d += "\n";
+    d += "online          : "; d += (captivePortalIsOnline() ? "yes" : "no"); d += "\n";
+    d += "message         : "; d += s_lastMessage; d += "\n";
+    d += "attempts        : "; d += s_attempts; d += "\n";
+    d += "portalUrl       : "; d += (s_portalUrl.length() ? s_portalUrl : String("(none)")); d += "\n";
+    d += "portalUrlScheme : "; d += (s_portalUrl.length() ? (isHttpsUrl(s_portalUrl) ? "https" : "http") : "(none)"); d += "\n";
+    d += "formPageUrl     : "; d += (s_formPageUrl.length() ? s_formPageUrl : String("(none)")); d += "\n";
+    d += "formFound       : "; d += (s_form.formFound ? "yes" : "no"); d += "\n";
+    d += "formValid       : "; d += (s_form.valid ? "yes" : "no"); d += "\n";
+    d += "challenge       : "; d += (s_form.challenge ? "yes" : "no"); d += "\n";
+    d += "chapLogin       : "; d += (s_form.chapLogin ? "yes" : "no"); d += "\n";
+    d += "userField       : "; d += (s_form.userField.size() ? s_form.userField.c_str() : "(none)"); d += "\n";
+    d += "passField       : "; d += (s_form.passField.size() ? s_form.passField.c_str() : "(none)"); d += "\n";
+    d += "formAction      : "; d += (s_form.action.size() ? s_form.action.c_str() : "(none)"); d += "\n";
+    d += "formMethod      : "; d += (s_form.method.size() ? s_form.method.c_str() : "(none)"); d += "\n";
+    d += "hiddenFields    : "; d += (unsigned)s_form.hidden.size(); d += "\n";
+    d += "-- network --\n";
+    d += "wifiConnected   : "; d += (WiFi.status() == WL_CONNECTED ? "yes" : "no"); d += "\n";
+    d += "ssid            : "; d += WiFi.SSID(); d += "\n";
+    d += "rssi_dBm        : "; d += WiFi.RSSI(); d += "\n";
+    d += "channel         : "; d += WiFi.channel(); d += "\n";
+    d += "ip              : "; d += WiFi.localIP().toString(); d += "\n";
+    d += "gateway         : "; d += WiFi.gatewayIP().toString(); d += "\n";
+    d += "subnet          : "; d += WiFi.subnetMask().toString(); d += "\n";
+    d += "dns0            : "; d += WiFi.dnsIP(0).toString(); d += "\n";
+    d += "dns1            : "; d += WiFi.dnsIP(1).toString(); d += "\n";
+    d += "mac             : "; d += WiFi.macAddress(); d += "\n";
+    d += "-- runtime --\n";
+    d += "freeHeap        : "; d += (unsigned)ESP.getFreeHeap(); d += "\n";
+    d += "minTlsHeap      : "; d += (unsigned long)CAPTIVE_MIN_HEAP_FOR_TLS; d += "\n";
+    d += "uptime_ms       : "; d += (unsigned long)millis(); d += "\n";
+    d += "-- config (captive portal) --\n";
+    d += "probeUrl        : "; d += CAPTIVE_PROBE_URL; d += "\n";
+    d += "probeTimeout_ms : "; d += (int)CAPTIVE_PROBE_TIMEOUT_MS; d += "\n";
+    d += "maxLoginAttempts: "; d += (int)CAPTIVE_MAX_LOGIN_ATTEMPTS; d += "\n";
+    d += "maxRedirectHops : "; d += (int)CAPTIVE_MAX_REDIRECT_HOPS; d += "\n";
+    d += "logPortalPage   : "; d += (int)CAPTIVE_LOG_PORTAL_PAGE; d += "\n";
+}
+
+static esp_err_t portal_diag_handler(httpd_req_t* req) {
+    String d;
+    buildPortalDiagnostics(d);
+    httpd_resp_set_type(req, "text/plain");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+    httpd_resp_send(req, d.c_str(), HTTPD_RESP_USE_STRLEN);
+    return ESP_OK;
+}
+
+// Public: dump the same diagnostics block to the serial monitor. Called at
+// startup (from the .ino, after Wi-Fi connects) so a fresh serial capture always
+// contains the full portal/network/heap/config picture even if the earlier boot
+// banner scrolled past or was corrupted by the flash->run reset (issue #48).
+void captivePortalPrintDiagnostics() {
+    String d;
+    buildPortalDiagnostics(d);
+    Serial.println("[CaptivePortal] ===== BEGIN diagnostics =====");
+    Serial.print(d);
+    Serial.println("[CaptivePortal] ===== END diagnostics =====");
+    Serial.println("[CaptivePortal] Tip: GET http://<device-ip>/portal/diag for this block over HTTP,");
+    Serial.println("[CaptivePortal]      and open http://<device-ip>/portal to enter portal credentials.");
+}
+
 // Immediate re-probe triggered by the user clicking "Check again" after they
 // have manually logged into a challenge/CHAP portal via their browser, and also
 // the periodic connectivity heartbeat driven from captivePortalLoop().
 static void doReprobe() {
     String body, location;
     int code = probeInternet(body, location);
-    Serial.printf("[CaptivePortal] Heartbeat re-probe %s -> HTTP %d\n", CAPTIVE_PROBE_URL, code);
+    if (code < 0) {
+        Serial.printf("[CaptivePortal] Heartbeat re-probe %s -> HTTP %d (%s)\n",
+                      CAPTIVE_PROBE_URL, code, httpErrorName(code));
+    } else {
+        Serial.printf("[CaptivePortal] Heartbeat re-probe %s -> HTTP %d\n", CAPTIVE_PROBE_URL, code);
+    }
     std::string b(body.c_str(), body.length());
     if (code > 0 && !looksLikeCaptivePortal(code, b)) {
         setStatus(PORTAL_STATE_SUCCESS, "Portal login succeeded — you are online.");
@@ -669,6 +878,81 @@ static void doReprobe() {
         setStatus(s_state, "Still behind the captive portal. Please complete the login in your browser, then tap Check again.");
     }
     // Schedule the next periodic re-probe from now.
+    s_periodicReprobeAt = millis() + CAPTIVE_PERIODIC_REPROBE_MS;
+}
+
+// Overwrite a String's backing buffer, then release it. `&s[0]` uses the mutable
+// `char& String::operator[]` overload, so it is a legitimately writable pointer
+// into the String's own buffer (no `const` is cast away, unlike writing through
+// c_str()). Writing through a VOLATILE view of it prevents the compiler from
+// eliminating the zeroing as a dead store just because the buffer is freed
+// immediately afterwards (a plain `for (...) s[i]=0; s="";` can be optimised
+// away). Used to scrub transient ISP portal credentials from RAM as soon as they
+// have been used (issue #48). They are never persisted.
+static void secureZeroString(String& s) {
+    const size_t n = s.length();
+    if (n) {
+        volatile char* p = (volatile char*)&s[0];
+        for (size_t i = 0; i < n; i++) p[i] = 0;
+    }
+    s = "";
+}
+
+// Overwrite and release the transiently-held ISP portal credentials. They are
+// kept in RAM only between the /portal/login handler queuing a deferred submit
+// and captivePortalLoop() running it; they are NEVER persisted (issue #48).
+static void wipePendingCredentials() {
+    secureZeroString(s_pendingUser);
+    secureZeroString(s_pendingPass);
+}
+
+// Deferred handler for a /portal/login submit made while no automatable form was
+// known yet (s_form.valid == false). Runs in the main-loop task, so the blocking
+// probe + TLS handshake never freeze the web server (issue #46). It re-probes and
+// re-detects the portal — now able to follow HTTPS redirects to the real login
+// page (issue #48) — and, if a usable form emerges, submits the operator's
+// credentials to it. Either way the stashed credentials are wiped before return.
+static void doRedetectAndSubmit() {
+    String body, location;
+    int code = probeInternet(body, location);
+    if (code < 0) {
+        Serial.printf("[CaptivePortal] Manual submit: re-probe %s -> HTTP %d (%s)\n",
+                      CAPTIVE_PROBE_URL, code, httpErrorName(code));
+    } else {
+        Serial.printf("[CaptivePortal] Manual submit: re-probe %s -> HTTP %d\n", CAPTIVE_PROBE_URL, code);
+    }
+    std::string b(body.c_str(), body.length());
+
+    if (code > 0 && !looksLikeCaptivePortal(code, b)) {
+        // Already online — nothing to submit.
+        setStatus(PORTAL_STATE_SUCCESS, "You are already online — no portal login was needed.");
+        persistSeen(WiFi.SSID());
+    } else if (code > 0) {
+        // Portal present: re-detect (follows HTTPS redirects) and submit if we now
+        // have an automatable form.
+        handleCaptiveDetected(body, location);
+        if (s_state == PORTAL_STATE_CAPTIVE && s_form.valid) {
+            setStatus(PORTAL_STATE_SUBMITTED, "Login form found — submitting your credentials…");
+            String msg;
+            bool sent = submitPortalLogin(s_pendingUser, s_pendingPass, msg);
+            if (sent) {
+                s_reprobePending = true;
+                s_reprobeAt = millis() + 1500;
+                setStatus(PORTAL_STATE_SUBMITTED, "Credentials submitted — verifying connectivity…");
+            } else {
+                setStatus(PORTAL_STATE_FAILED, msg);
+            }
+        } else {
+            setStatus(PORTAL_STATE_UNSUPPORTED,
+                      "Could not find an automatable login form on this portal. Please "
+                      "finish the login in your browser, then tap Check again.");
+        }
+    } else {
+        setStatus(PORTAL_STATE_FAILED,
+                  "Could not reach the portal to submit your login. Please try again in a moment.");
+    }
+
+    wipePendingCredentials();
     s_periodicReprobeAt = millis() + CAPTIVE_PERIODIC_REPROBE_MS;
 }
 
@@ -768,6 +1052,30 @@ static esp_err_t portal_login_handler(httpd_req_t* req) {
         return ESP_OK;
     }
 
+    // If we do NOT yet have an automatable login form (e.g. the boot-time HTTPS
+    // redirect fetch failed, or the operator opened /portal on an "unsupported"
+    // portal), defer a fresh re-detect + submit to captivePortalLoop() instead of
+    // giving up. This is what lets the user "just enter a username/password" and
+    // have the camera try, even when the exact fields were not detected at boot
+    // (issue #48). The blocking work is deferred so the httpd task is not frozen
+    // (issue #46). Credentials are stashed briefly, then wiped after the submit.
+    if (!s_form.valid) {
+        s_pendingUser = username;
+        s_pendingPass = password;
+        s_redetectLoginPending = true;
+        s_attempts++;
+        setStatus(PORTAL_STATE_SUBMITTED,
+                  "Scanning the portal for a login form and submitting your credentials…");
+        // s_pendingUser/Pass now hold a COPY of the credentials (String assignment
+        // copies the buffer) and are wiped after the deferred submit runs
+        // (wipePendingCredentials in doRedetectAndSubmit). Scrub the local copies
+        // here too so no plaintext lingers in this handler's freed buffers.
+        secureZeroString(username);
+        secureZeroString(password);
+        sendStatusJson(req);
+        return ESP_OK;
+    }
+
     s_attempts++;
     setStatus(PORTAL_STATE_SUBMITTED, "Submitting your credentials to the portal…");
     String msg;
@@ -775,9 +1083,8 @@ static esp_err_t portal_login_handler(httpd_req_t* req) {
 
     // Wipe the credentials from RAM as soon as they are used — we do not keep or
     // persist portal credentials.
-    for (size_t i = 0; i < username.length(); i++) username[i] = 0;
-    for (size_t i = 0; i < password.length(); i++) password[i] = 0;
-    username = ""; password = "";
+    secureZeroString(username);
+    secureZeroString(password);
 
     if (!sent) {
         if (s_attempts >= CAPTIVE_MAX_LOGIN_ATTEMPTS) {
@@ -807,6 +1114,8 @@ static esp_err_t portal_page_handler(httpd_req_t* req) {
         "input{width:100%;box-sizing:border-box;padding:.6rem;border-radius:8px;border:1px solid #444;background:#000;color:#fff}"
         "button{margin-top:1rem;width:100%;padding:.7rem;border:0;border-radius:8px;background:#2d7;color:#000;font-weight:600;cursor:pointer}"
         "#msg{margin-top:1rem;padding:.6rem;border-radius:8px;background:#222;font-size:.9rem;white-space:pre-wrap}"
+        ".hint{font-size:.82rem;color:#bbb;margin:.7rem 0 0}"
+        ".foot{font-size:.8rem;color:#999;margin-top:1.2rem;border-top:1px solid #333;padding-top:.7rem}"
         "a{color:#6cf}.hide{display:none}</style></head><body><div class='card'>"
         "<h1>Wi-Fi Portal Login</h1>"
         "<div id='msg'>Checking network…</div>"
@@ -814,22 +1123,31 @@ static esp_err_t portal_page_handler(httpd_req_t* req) {
         "<label>Portal username</label><input id='u' autocomplete='username' autocapitalize='none'>"
         "<label>Portal password</label><input id='p' type='password' autocomplete='current-password'>"
         "<button type='submit'>Log in</button></form>"
-        "<p id='manual' class='hide'>This portal can't be logged in automatically. "
-        "<span id='plinkwrap'><a id='plink' href='#' target='_blank' rel='noopener'>Open the portal page</a> and finish there, </span>"
+        "<p id='hint' class='hint hide'>Enter the username and password your ISP hotspot login page asks for. "
+        "The <strong>camera</strong> submits them over its own connection, so the camera's own MAC address is the one authorised.</p>"
+        "<p id='manual' class='hide'>If the automatic login doesn't work, "
+        "<span id='plinkwrap'><a id='plink' href='#' target='_blank' rel='noopener'>open the portal page</a> and finish there, </span>"
         "then tap <strong>Check again</strong> below.</p>"
         "<button id='rprobe' class='hide' type='button'>Check again</button>"
+        "<p class='foot'>Trouble? <a id='diag' href='/portal/diag' target='_blank' rel='noopener'>View diagnostics</a>"
+        " &middot; watch the Serial Monitor for detailed logs.</p>"
         "</div><script>(function(){"
         "var msg=document.getElementById('msg'),f=document.getElementById('f'),"
+        "hint=document.getElementById('hint'),"
         "manual=document.getElementById('manual'),plink=document.getElementById('plink'),"
         "plinkwrap=document.getElementById('plinkwrap'),"
         "rprobe=document.getElementById('rprobe');"
         "function render(s){msg.textContent=s.message||'';"
-        "if(s.automatable){f.classList.remove('hide');manual.classList.add('hide');rprobe.classList.add('hide');}"
-        "else{f.classList.add('hide');}"
+        "var online=(s.state==='open'||s.state==='success');"
+        // Always offer the credential form (and the how-to hint) unless we're
+        // already online — so the user can attempt a login even when the exact
+        // fields were not auto-detected (issue #48).
+        "if(online){f.classList.add('hide');hint.classList.add('hide');rprobe.classList.add('hide');}"
+        "else{f.classList.remove('hide');hint.classList.remove('hide');rprobe.classList.remove('hide');}"
         "if(s.state==='unsupported'||s.state==='failed'){"
         "if(s.portalUrl){plink.href=s.portalUrl;plinkwrap.classList.remove('hide');}else{plinkwrap.classList.add('hide');}"
-        "manual.classList.remove('hide');rprobe.classList.remove('hide');}"
-        "else{manual.classList.add('hide');rprobe.classList.add('hide');}}"
+        "manual.classList.remove('hide');}"
+        "else{manual.classList.add('hide');}}"
         "function poll(){fetch('/portal/status').then(r=>r.json()).then(render).catch(()=>{});}"
         "rprobe.addEventListener('click',function(){msg.textContent='Re-checking the connection…';"
         "fetch('/portal/reprobe',{method:'POST'}).then(r=>r.json()).then(function(s){render(s);setTimeout(poll,1500);}).catch(()=>{msg.textContent='Network error.';});});"
@@ -853,11 +1171,13 @@ void registerCaptivePortalHandlers(httpd_handle_t server) {
     httpd_uri_t status_uri  = { .uri = "/portal/status", .method = HTTP_GET,  .handler = portal_status_handler, .user_ctx = NULL };
     httpd_uri_t login_uri   = { .uri = "/portal/login",  .method = HTTP_POST, .handler = portal_login_handler,  .user_ctx = NULL };
     httpd_uri_t reprobe_uri = { .uri = "/portal/reprobe", .method = HTTP_POST, .handler = portal_reprobe_handler, .user_ctx = NULL };
+    httpd_uri_t diag_uri    = { .uri = "/portal/diag",   .method = HTTP_GET,  .handler = portal_diag_handler,   .user_ctx = NULL };
     httpd_register_uri_handler(server, &portal_uri);
     httpd_register_uri_handler(server, &status_uri);
     httpd_register_uri_handler(server, &login_uri);
     httpd_register_uri_handler(server, &reprobe_uri);
-    Serial.println("[CaptivePortal] Registered /portal, /portal/status, /portal/login, /portal/reprobe");
+    httpd_register_uri_handler(server, &diag_uri);
+    Serial.println("[CaptivePortal] Registered /portal, /portal/status, /portal/login, /portal/reprobe, /portal/diag");
 #else
     (void)server;
 #endif
@@ -875,6 +1195,15 @@ void captivePortalLoop() {
     if (s_manualReprobePending) {
         s_manualReprobePending = false;
         doReprobe();
+        return;
+    }
+
+    // Operator submitted credentials on /portal but no automatable form was known
+    // yet. Re-detect the portal (now able to follow HTTPS redirects — issue #48)
+    // and submit, deferred here so the httpd task stays responsive (issue #46).
+    if (s_redetectLoginPending) {
+        s_redetectLoginPending = false;
+        doRedetectAndSubmit();
         return;
     }
 

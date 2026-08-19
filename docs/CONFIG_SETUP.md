@@ -114,9 +114,21 @@ hostel / campus / ISP hotspots). When `ENABLE_CAPTIVE_PORTAL_LOGIN` is `1`
    JavaScript, so the firmware follows up to `CAPTIVE_MAX_REDIRECT_HOPS` such
    hops itself — replaying a POST redirect form with its hidden fields — to reach
    the real login form instead of stalling on the landing page (issues #44, #46).
-4. Open `http://<device-ip>/portal` in a browser on the same network. Enter the
-   ISP portal username/password; the board submits the login for you and
-   re-checks connectivity.
+   These redirects frequently point at an **`https://` external portal** (e.g.
+   Spectra/RADIUSdesk). The firmware follows them **over TLS** — a plain
+   connection to an `https://` target fails instantly with `HTTP -5
+   (CONNECTION_LOST)` and dead-ends the whole login, which was the root cause of
+   issue #48. TLS certificate validation is disabled (a captive portal presents
+   an untrusted cert and the board has no clock to validate one), and the
+   handshake is skipped when free heap is below `CAPTIVE_MIN_HEAP_FOR_TLS` to
+   avoid a brown-out.
+4. Open `http://<device-ip>/portal` in a browser on the same network. The
+   username/password form is **always shown while the device is offline** — even
+   when the exact login fields could not be auto-detected — so you can always
+   type your ISP portal credentials and have the camera try. On submit the board
+   re-scans the portal (following HTTPS redirects), submits the login for you and
+   re-checks connectivity. The credentials are held in RAM only for that one
+   submit and then wiped.
 
 ### Connectivity heartbeat gates the cloud (issue #40)
 Behind a captive portal the board is *joined* to Wi-Fi but the internet is still
@@ -144,6 +156,7 @@ is reachable:
 | `CAPTIVE_ONLINE_HEARTBEAT_MS` | `60000` | Heartbeat cadence while **online** (to catch a portal that re-appears). |
 | `CAPTIVE_LOG_PORTAL_PAGE` | `1` | Dump the full fetched portal login page to the serial console when a portal is detected (diagnostic — see the exact HTML/fields to parse). Set to `0` to silence. |
 | `CAPTIVE_MAX_REDIRECT_HOPS` | `3` | How many landing-page redirects (`<meta refresh>` / JS `location` / "continue" link / auto-submitted `<form name="redirect">`, GET or POST) the firmware will follow to reach the real login form (issues #44, #46). |
+| `CAPTIVE_MIN_HEAP_FOR_TLS` | `60000` | Minimum free heap (bytes) before the firmware opens a **TLS** connection to follow/submit an `https://` portal page. Below this the HTTPS hop is skipped (to avoid a brown-out) and the manual-browser fallback is used (issue #48). |
 
 ### Why log in on the camera's `/portal`, not on your phone (per-MAC gotcha)
 A common question: *should I open the ISP portal URL on my PC while it is on the
@@ -161,18 +174,34 @@ one authorised. Only fall back to a manual browser login for portals that cannot
 be automated — and if the camera then stays blocked, ask your ISP to authorise
 the camera's MAC address (printed in the serial log's action banner).
 
-### Startup diagnostics (rule out misconfiguration — issue #44)
+### Startup diagnostics (rule out misconfiguration — issues #44, #48)
 To make problems easy to diagnose from the serial log alone, the firmware prints
-two extra diagnostic blocks (no secrets are ever logged):
+several diagnostic blocks (no secrets are ever logged):
 
-- A **`[Config]` status banner at boot** that reports, for every `config.h`
-  value, whether it is `SET`, `NOT SET`, or still the example default/placeholder
-  — **without** printing any actual value. Use it to confirm at a glance that
-  `config.h` is filled in correctly.
+- A **`[Config]` status banner** that reports, for every `config.h` value,
+  whether it is `SET`, `NOT SET`, or still the example default/placeholder —
+  **without** printing any actual value. It is printed once at boot **and
+  re-printed right after Wi-Fi connects**. The re-print exists because a serial
+  capture that only attaches during the flash→run reset often misses the first
+  banner entirely (this is exactly why the `[Config] … SET/NOT SET` lines were
+  "gone" from the issue #48 logs) — repeating it at a stable point guarantees it
+  is always visible.
+- A consolidated **`[CaptivePortal] ===== BEGIN diagnostics =====`** block,
+  printed at startup after Wi-Fi connects and also served live over HTTP at
+  **`GET http://<device-ip>/portal/diag`** (plain text). It shows the portal
+  state, the auto-detected form (found/valid/challenge/CHAP, user/pass field
+  names, action, method, hidden-field count), the portal URL and its scheme
+  (`http`/`https`), the live network parameters (SSID, RSSI, channel, IP,
+  gateway, subnet, DNS, MAC), the free heap and TLS heap watermark, uptime, and
+  the effective captive-portal config knobs.
 - **`[CaptivePortal] Network diagnostics`** (SSID, RSSI, channel, IP, gateway,
   subnet, DNS, MAC) and a **`Parse result`** line (which form fields / CHAP /
   redirect the parser found) whenever a portal is detected, so signal, DNS
   interception or a mis-detected form can be ruled out quickly.
+- **Decoded HTTP error codes.** Every portal fetch/submit failure is logged with
+  the URL scheme and a human-readable name for the negative `HTTPClient` code —
+  e.g. `-> HTTP -5 (CONNECTION_LOST)` or `HEAP_TOO_LOW_FOR_TLS` — so you no
+  longer have to look up what a bare `-5` means.
 
 ### Scope & fallback
 - **Persistence:** only the Wi-Fi credentials (WiFiManager/NVS) plus a lightweight
