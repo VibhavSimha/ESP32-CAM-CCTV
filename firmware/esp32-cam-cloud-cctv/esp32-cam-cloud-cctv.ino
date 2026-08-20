@@ -63,6 +63,16 @@ static void logConfigStatus() {
     logConfigLine("PIR motion", ENABLE_PIR_MOTION != 0, "ENABLED", "DISABLED");
     logConfigLine("Captive probe URL", strlen(CAPTIVE_PROBE_URL) > 0, "SET", "NOT SET");
 
+    // MAC spoof status: show spoofed MAC if set, otherwise "DISABLED (factory MAC)".
+    {
+        const char* spoofMac = CAPTIVE_MAC_SPOOF;
+        if (spoofMac && spoofMac[0] != '\0') {
+            Serial.printf("[Config] %-24s ACTIVE (%s)\n", "MAC spoof (issue #50)", spoofMac);
+        } else {
+            logConfigLine("MAC spoof (issue #50)", false, "ACTIVE", "DISABLED (factory MAC)");
+        }
+    }
+
     Serial.println("===========================================================");
 }
 
