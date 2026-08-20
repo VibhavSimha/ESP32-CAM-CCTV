@@ -830,6 +830,11 @@ static void buildPortalDiagnostics(String& d) {
     d += "maxLoginAttempts: "; d += (int)CAPTIVE_MAX_LOGIN_ATTEMPTS; d += "\n";
     d += "maxRedirectHops : "; d += (int)CAPTIVE_MAX_REDIRECT_HOPS; d += "\n";
     d += "logPortalPage   : "; d += (int)CAPTIVE_LOG_PORTAL_PAGE; d += "\n";
+    // MAC spoof config (issue #50)
+    {
+        const char* s = CAPTIVE_MAC_SPOOF;
+        d += "macSpoof        : "; d += (s && s[0] ? s : "(disabled — factory MAC)"); d += "\n";
+    }
 }
 
 static esp_err_t portal_diag_handler(httpd_req_t* req) {
@@ -1104,7 +1109,31 @@ static esp_err_t portal_login_handler(httpd_req_t* req) {
 }
 
 static esp_err_t portal_page_handler(httpd_req_t* req) {
-    static const char html[] =
+    // Build a small per-device note about the MAC spoof option. Only shown when
+    // spoofing is NOT already active (i.e. the board is using its factory MAC and
+    // the portal is proving difficult to automate — issue #50).
+    static char macSpoofNote[320];
+    const char* spoofMac = CAPTIVE_MAC_SPOOF;
+    if (!spoofMac || spoofMac[0] == '\0') {
+        // Not spoofing yet — show the current MAC and a hint.
+        snprintf(macSpoofNote, sizeof(macSpoofNote),
+            "<p id='macnote' class='hint' style='margin-top:.9rem'>"
+            "<strong>MAC-spoof workaround (issue #50):</strong> "
+            "This portal authorises devices by MAC address. "
+            "If another device on this network is already authorised, "
+            "set <code>CAPTIVE_MAC_SPOOF</code> to its MAC in <code>config.h</code> and re-flash. "
+            "Camera MAC: <code>%s</code></p>",
+            WiFi.macAddress().c_str());
+    } else {
+        snprintf(macSpoofNote, sizeof(macSpoofNote),
+            "<p id='macnote' class='hint' style='margin-top:.9rem'>"
+            "<strong>MAC spoofing active (issue #50):</strong> "
+            "Camera is presenting as <code>%s</code>. "
+            "Keep the donor device off this Wi-Fi to avoid ARP conflicts.</p>",
+            spoofMac);
+    }
+
+    static const char htmlHead[] =
         "<!DOCTYPE html><html><head><meta charset='utf-8'>"
         "<meta name='viewport' content='width=device-width,initial-scale=1'>"
         "<link rel='icon' href='data:,'><title>ESP32-CAM Portal Login</title>"
@@ -1116,7 +1145,7 @@ static esp_err_t portal_page_handler(httpd_req_t* req) {
         "#msg{margin-top:1rem;padding:.6rem;border-radius:8px;background:#222;font-size:.9rem;white-space:pre-wrap}"
         ".hint{font-size:.82rem;color:#bbb;margin:.7rem 0 0}"
         ".foot{font-size:.8rem;color:#999;margin-top:1.2rem;border-top:1px solid #333;padding-top:.7rem}"
-        "a{color:#6cf}.hide{display:none}</style></head><body><div class='card'>"
+        "a{color:#6cf}.hide{display:none}code{background:#333;padding:.1em .3em;border-radius:4px}</style></head><body><div class='card'>"
         "<h1>Wi-Fi Portal Login</h1>"
         "<div id='msg'>Checking network…</div>"
         "<form id='f' class='hide'>"
@@ -1128,7 +1157,9 @@ static esp_err_t portal_page_handler(httpd_req_t* req) {
         "<p id='manual' class='hide'>If the automatic login doesn't work, "
         "<span id='plinkwrap'><a id='plink' href='#' target='_blank' rel='noopener'>open the portal page</a> and finish there, </span>"
         "then tap <strong>Check again</strong> below.</p>"
-        "<button id='rprobe' class='hide' type='button'>Check again</button>"
+        "<button id='rprobe' class='hide' type='button'>Check again</button>";
+
+    static const char htmlFoot[] =
         "<p class='foot'>Trouble? <a id='diag' href='/portal/diag' target='_blank' rel='noopener'>View diagnostics</a>"
         " &middot; watch the Serial Monitor for detailed logs.</p>"
         "</div><script>(function(){"
@@ -1139,9 +1170,6 @@ static esp_err_t portal_page_handler(httpd_req_t* req) {
         "rprobe=document.getElementById('rprobe');"
         "function render(s){msg.textContent=s.message||'';"
         "var online=(s.state==='open'||s.state==='success');"
-        // Always offer the credential form (and the how-to hint) unless we're
-        // already online — so the user can attempt a login even when the exact
-        // fields were not auto-detected (issue #48).
         "if(online){f.classList.add('hide');hint.classList.add('hide');rprobe.classList.add('hide');}"
         "else{f.classList.remove('hide');hint.classList.remove('hide');rprobe.classList.remove('hide');}"
         "if(s.state==='unsupported'||s.state==='failed'){"
@@ -1159,9 +1187,15 @@ static esp_err_t portal_page_handler(httpd_req_t* req) {
         ".then(r=>r.json()).then(function(s){render(s);setTimeout(poll,2000);}).catch(()=>{msg.textContent='Network error.';});});"
         "poll();setInterval(poll,4000);"
         "})();</script></body></html>";
+
     httpd_resp_set_type(req, "text/html");
     httpd_resp_set_hdr(req, "Cache-Control", "no-store");
-    return httpd_resp_send(req, html, HTTPD_RESP_USE_STRLEN);
+    // Send head + dynamic MAC note + foot in three chunks (no heap alloc for the
+    // full page — httpd_resp_send_chunk flushes each part individually).
+    httpd_resp_send_chunk(req, htmlHead, HTTPD_RESP_USE_STRLEN);
+    httpd_resp_send_chunk(req, macSpoofNote, HTTPD_RESP_USE_STRLEN);
+    httpd_resp_send_chunk(req, htmlFoot, HTTPD_RESP_USE_STRLEN);
+    return httpd_resp_send_chunk(req, NULL, 0); // end of chunked response
 }
 
 void registerCaptivePortalHandlers(httpd_handle_t server) {

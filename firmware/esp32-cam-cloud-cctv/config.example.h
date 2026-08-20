@@ -236,3 +236,44 @@
 // instead. At boot (when the portal is first probed) heap is ~140 KB, well above
 // this. Lower it only if you know your build has less headroom.
 #define CAPTIVE_MIN_HEAP_FOR_TLS     60000UL
+
+// -----------------------------------------------------------------------------
+// MAC ADDRESS SPOOFING — bypass ISP captive portals that remember authorised
+// devices by MAC address (issue #50)
+// -----------------------------------------------------------------------------
+// Some ISP hotspots (e.g. Spectra/RADIUSdesk) authorise each device by its
+// Wi-Fi MAC address. Once a device has logged in, the portal lets it pass
+// without a new login — it just checks the MAC on every subsequent connection.
+//
+// WORKAROUND: if you own a device (phone, laptop) that is ALREADY authorised on
+// that portal, you can clone its MAC address into this board. The ISP portal
+// then sees the "already logged in" MAC and grants internet access immediately
+// — no login form needed.
+//
+// HOW TO USE:
+//   1. Find the MAC address of the already-authorised device:
+//        Android: Settings → About phone → Wi-Fi MAC address
+//        iPhone:  Settings → Wi-Fi → tap the network → Wi-Fi Address
+//        Windows: run  ipconfig /all  and look for "Physical Address"
+//        Linux:   run  ip link show wlan0
+//   2. Set CAPTIVE_MAC_SPOOF below to that MAC in the format "AA:BB:CC:DD:EE:FF"
+//      (colon-separated, any case — the firmware normalises it).
+//   3. Re-flash. The board will use that MAC whenever it connects to Wi-Fi.
+//      The ISP portal will treat it as the already-authorised device and let
+//      it reach the internet without a login.
+//
+// CAVEATS:
+//   • Two devices with the same MAC on the same network can cause ARP conflicts
+//     (dropped packets, brief outages) while BOTH are connected at the same time.
+//     Keep the donor device OFF the Wi-Fi, or disconnect it, while the camera
+//     is running to avoid this.
+//   • The spoofed MAC is applied with esp_wifi_set_mac() before WiFiManager
+//     connects. WiFiManager / NVS store the Wi-Fi credentials against the
+//     original chip MAC, NOT this one — they are independent and unaffected.
+//   • Leave CAPTIVE_MAC_SPOOF as "" (empty) to disable spoofing and use the
+//     board's factory-assigned MAC (default behaviour).
+//
+// EXAMPLE (replace with the actual MAC of your authorised device):
+//   #define CAPTIVE_MAC_SPOOF "A8:86:DD:12:34:56"
+// -----------------------------------------------------------------------------
+#define CAPTIVE_MAC_SPOOF            ""
