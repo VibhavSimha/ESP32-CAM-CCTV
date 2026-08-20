@@ -159,6 +159,19 @@
 // -----------------------------------------------------------------------------
 #define WIFI_AP_NAME         "ESP32-CAM-Setup"
 
+// Optional: override the ESP32 station MAC address used when joining Wi-Fi.
+// Some ISP captive portals authorise internet access per MAC; once a known MAC
+// is authorised, that MAC can reconnect without re-entering credentials.
+//
+// Leave empty ("") to use the board's factory MAC (default).
+// Set to a literal like "AA:BB:CC:DD:EE:FF" (or AA-BB-CC-DD-EE-FF) to override.
+//
+// IMPORTANT:
+//  - Do NOT keep two active devices on the same network with the same MAC.
+//  - Only use a MAC address you are authorised to use on that network.
+//  - The override is applied before WiFiManager auto-connect.
+#define WIFI_STA_MAC_OVERRIDE ""
+
 // -----------------------------------------------------------------------------
 // POST-CONNECT CAPTIVE-PORTAL LOGIN (issue #33)
 // -----------------------------------------------------------------------------

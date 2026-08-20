@@ -380,6 +380,20 @@ static void test_redirect_ignores_querystring_location() {
     CHECK(f.redirectUrl.empty());
 }
 
+// A stray "location.href" token (e.g. in JSON/config text) is NOT a redirect.
+// Only real JS assignment/call syntax should produce a redirectUrl.
+static void test_redirect_ignores_non_redirect_location_href_token() {
+    std::printf("test_redirect_ignores_non_redirect_location_href_token\n");
+    const std::string html =
+        "<html><body>"
+        "<script>var cfg={\"location.href\":\"https://alpsmp.spectra.co/alepocp/?server=x\"};</script>"
+        "</body></html>";
+    PortalForm f;
+    CHECK(!parseLoginForm(html, f));
+    CHECK(!f.formFound);
+    CHECK(f.redirectUrl.empty());
+}
+
 // A landing page whose only next-hop hint is a "continue"/login anchor.
 static void test_redirect_page_continue_link() {
     std::printf("test_redirect_page_continue_link\n");
@@ -389,6 +403,23 @@ static void test_redirect_page_continue_link() {
     PortalForm f;
     CHECK(!parseLoginForm(html, f));
     CHECK(f.redirectUrl == "/login?token=1");
+}
+
+// A generic page with a "Log in" link (e.g. WordPress chrome) is NOT a captive-
+// portal landing redirect by itself. Without an explicit redirect cue, this link
+// must not be treated as the next hop.
+static void test_redirect_ignores_generic_log_in_anchor() {
+    std::printf("test_redirect_ignores_generic_log_in_anchor\n");
+    const std::string html =
+        "<html><body>"
+        "<form action=\"/search\" method=\"get\"><input type=\"search\" name=\"s\"></form>"
+        "<a href=\"https://alpsmp.spectra.co/alepocp/wp-login.php\">Log in</a>"
+        "</body></html>";
+    PortalForm f;
+    CHECK(!parseLoginForm(html, f));
+    CHECK(f.formFound);            // page has a form, but not a login form
+    CHECK(!f.valid);
+    CHECK(f.redirectUrl.empty());  // do not follow unrelated "Log in" chrome
 }
 
 // A page with a stub form FIRST (a bare submit button) and the real
@@ -575,7 +606,9 @@ int main() {
     test_redirect_page_js_location();
     test_redirect_js_bare_window_location();
     test_redirect_ignores_querystring_location();
+    test_redirect_ignores_non_redirect_location_href_token();
     test_redirect_page_continue_link();
+    test_redirect_ignores_generic_log_in_anchor();
     test_multi_form_picks_login_form();
     test_js_chap_undecodable_is_challenge();
     test_issue46_mikrotik_redirect_form_post();

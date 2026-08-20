@@ -175,18 +175,62 @@ static size_t parseSingleForm(const std::string& html, size_t formStart,
     return formEnd + 7; // strlen("</form>")
 }
 
-// Return the first single/double-quoted string literal that starts at or after
-// `from`, stopping at a statement/line boundary so we never wander into an
-// unrelated statement. Used to pull the target out of a JS location redirect.
-static std::string firstQuotedFrom(const std::string& html, size_t from) {
-    for (size_t i = from; i < html.size(); i++) {
-        char c = html[i];
-        if (c == '\'' || c == '"') {
-            size_t end = html.find(c, i + 1);
-            if (end == std::string::npos) return "";
-            return html.substr(i + 1, end - (i + 1));
+// Skip ASCII whitespace from `i`.
+static size_t skipWs(const std::string& s, size_t i) {
+    while (i < s.size() && std::isspace((unsigned char)s[i])) i++;
+    return i;
+}
+
+// Parse a quoted JS string literal that starts at/after `from` (after optional
+// whitespace). Returns "" when no quoted literal begins there.
+static std::string quotedLiteralFrom(const std::string& html, size_t from) {
+    size_t i = skipWs(html, from);
+    if (i >= html.size()) return "";
+    char q = html[i];
+    if (q != '\'' && q != '"') return "";
+    size_t end = html.find(q, i + 1);
+    if (end == std::string::npos) return "";
+    return html.substr(i + 1, end - (i + 1));
+}
+
+// Extract URL from a JavaScript assignment such as:
+//   <lhs> = "..."
+// Example keys: "window.location", "location.href".
+static std::string extractJsAssignUrl(const std::string& html, const char* lhs) {
+    size_t pos = 0;
+    while ((pos = ifind(html, lhs, pos)) != std::string::npos) {
+        size_t i = skipWs(html, pos + std::strlen(lhs));
+        if (i < html.size() && html[i] == '.') {
+            // "window.location" is a prefix of ".href/.replace/..." forms;
+            // do not treat those as bare assignment matches here.
+            pos++;
+            continue;
         }
-        if (c == ';' || c == '\n' || c == '\r' || c == '<') return "";
+        if (i >= html.size() || html[i] != '=') {
+            pos++;
+            continue;
+        }
+        std::string url = quotedLiteralFrom(html, i + 1);
+        if (!url.empty()) return url;
+        pos++;
+    }
+    return "";
+}
+
+// Extract URL from a JavaScript call such as:
+//   <callee>("...")
+// Example keys: "location.replace", "location.assign".
+static std::string extractJsCallUrl(const std::string& html, const char* callee) {
+    size_t pos = 0;
+    while ((pos = ifind(html, callee, pos)) != std::string::npos) {
+        size_t i = skipWs(html, pos + std::strlen(callee));
+        if (i >= html.size() || html[i] != '(') {
+            pos++;
+            continue;
+        }
+        std::string url = quotedLiteralFrom(html, i + 1);
+        if (!url.empty()) return url;
+        pos++;
     }
     return "";
 }
@@ -254,21 +298,25 @@ static std::string extractRedirectUrl(const std::string& html) {
     }
 
     // 2. JavaScript redirects: window.location.href='…', location.replace('…'),
-    //    location.assign('…'), window.location='…'. The method forms carry a '.'
-    //    so they cannot be confused with a query-string parameter; the bare
-    //    assignment is matched as "window.location=" (rather than a naked
-    //    "location=") so a URL such as "/login?location=home" embedded in the
-    //    page is NOT mistaken for a redirect target.
-    static const char* jsKeys[] = {"location.href", "location.replace",
-                                   "location.assign", "window.location="};
-    for (const char* key : jsKeys) {
-        size_t k = ifind(html, key);
-        if (k == std::string::npos) continue;
-        std::string url = firstQuotedFrom(html, k + std::strlen(key));
-        if (!url.empty()) return url;
-    }
+    //    location.assign('…'), window.location='…'. Match only real assignment/
+    //    call syntax (not a random "location.href" token in JSON/content), else
+    //    unrelated pages can be misread as redirects.
+    std::string jsUrl = extractJsAssignUrl(html, "window.location.href");
+    if (!jsUrl.empty()) return jsUrl;
+    jsUrl = extractJsAssignUrl(html, "location.href");
+    if (!jsUrl.empty()) return jsUrl;
+    jsUrl = extractJsCallUrl(html, "location.replace");
+    if (!jsUrl.empty()) return jsUrl;
+    jsUrl = extractJsCallUrl(html, "location.assign");
+    if (!jsUrl.empty()) return jsUrl;
+    jsUrl = extractJsAssignUrl(html, "window.location");
+    if (!jsUrl.empty()) return jsUrl;
 
     // 3. A "continue"/login anchor: <a href="…">…continue…</a>.
+    std::string htmlLower = toLowerCopy(html);
+    bool hasRedirectCue = htmlLower.find("if you are not redirected") != std::string::npos ||
+                          htmlLower.find("redirected in a few seconds") != std::string::npos ||
+                          htmlLower.find("click continue") != std::string::npos;
     size_t a = 0;
     while ((a = ifind(html, "<a", a)) != std::string::npos) {
         size_t end = html.find('>', a);
@@ -281,9 +329,10 @@ static std::string extractRedirectUrl(const std::string& html) {
         a = end + 1;
         std::string href = getAttr(tag, "href");
         if (href.empty() || href == "#") continue;
-        if (text.find("continue") != std::string::npos ||
-            text.find("login") != std::string::npos ||
-            text.find("log in") != std::string::npos) {
+        bool continueLike = text.find("continue") != std::string::npos;
+        bool loginLike = text.find("login") != std::string::npos ||
+                         text.find("log in") != std::string::npos;
+        if (continueLike || (loginLike && hasRedirectCue)) {
             return href;
         }
     }
