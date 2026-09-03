@@ -86,6 +86,16 @@ static bool isTextLikeType(const std::string& type) {
            type == "number" || type == "search" || type == "url";
 }
 
+// Some captive portals ask for a short PIN/OTP in a plain text-like input
+// instead of using <input type="password">. Keep this narrow and additive:
+// it is used only as a fallback when no real password field was found.
+static bool looksPasswordLikeName(const std::string& lowerName) {
+    return lowerName.find("pass") != std::string::npos ||
+           lowerName.find("pwd") != std::string::npos ||
+           lowerName.find("pin") != std::string::npos ||
+           lowerName.find("otp") != std::string::npos;
+}
+
 // Decode an even-length hex string (e.g. a MikroTik chap-challenge) into raw
 // bytes. Returns false when `s` is empty, has an odd length, or contains a
 // non-hex digit — in which case the caller must NOT attempt an automated CHAP
@@ -133,6 +143,8 @@ static size_t parseSingleForm(const std::string& html, size_t formStart,
 
     size_t formEnd = ifind(html, "</form>", openEnd);
     size_t bodyEnd = (formEnd == std::string::npos) ? html.size() : formEnd;
+    std::string firstTextField;
+    std::string hintedPassField;
 
     // Walk every <input> tag inside the form body.
     size_t pos = openEnd + 1;
@@ -167,28 +179,124 @@ static size_t parseSingleForm(const std::string& html, size_t formStart,
                    type == "file") {
             // Not a credential field; ignore for auto-detection.
         } else if (isTextLikeType(type)) {
-            if (f.userField.empty()) f.userField = name;
+            if (firstTextField.empty()) firstTextField = name;
+            if (hintedPassField.empty() && looksPasswordLikeName(lname)) {
+                hintedPassField = name;
+            }
         }
+    }
+
+    if (f.userField.empty()) f.userField = firstTextField;
+    if (f.passField.empty() && !hintedPassField.empty() && hintedPassField != f.userField) {
+        f.passField = hintedPassField;
     }
 
     if (formEnd == std::string::npos) return html.size();
     return formEnd + 7; // strlen("</form>")
 }
 
-// Return the first single/double-quoted string literal that starts at or after
-// `from`, stopping at a statement/line boundary so we never wander into an
-// unrelated statement. Used to pull the target out of a JS location redirect.
-static std::string firstQuotedFrom(const std::string& html, size_t from) {
-    for (size_t i = from; i < html.size(); i++) {
-        char c = html[i];
-        if (c == '\'' || c == '"') {
-            size_t end = html.find(c, i + 1);
-            if (end == std::string::npos) return "";
-            return html.substr(i + 1, end - (i + 1));
+// Skip ASCII whitespace from `i`.
+static size_t skipWs(const std::string& s, size_t i) {
+    while (i < s.size() && std::isspace((unsigned char)s[i])) i++;
+    return i;
+}
+
+// Parse a quoted JS string literal that starts at/after `from` (after optional
+// whitespace). Returns "" when no quoted literal begins there.
+static std::string quotedLiteralFrom(const std::string& html, size_t from) {
+    size_t i = skipWs(html, from);
+    if (i >= html.size()) return "";
+    char q = html[i];
+    if (q != '\'' && q != '"') return "";
+    size_t end = html.find(q, i + 1);
+    if (end == std::string::npos) return "";
+    return html.substr(i + 1, end - (i + 1));
+}
+
+// Extract URL from a JavaScript assignment such as:
+//   <lhs> = "..."
+// Example keys: "window.location", "location.href".
+static std::string extractJsAssignUrl(const std::string& html, const char* lhs) {
+    size_t pos = 0;
+    while ((pos = ifind(html, lhs, pos)) != std::string::npos) {
+        size_t i = skipWs(html, pos + std::strlen(lhs));
+        if (i < html.size() && html[i] == '.') {
+            // "window.location" is a prefix of ".href/.replace/..." forms;
+            // do not treat those as bare assignment matches here.
+            pos++;
+            continue;
         }
-        if (c == ';' || c == '\n' || c == '\r' || c == '<') return "";
+        if (i >= html.size() || html[i] != '=') {
+            pos++;
+            continue;
+        }
+        std::string url = quotedLiteralFrom(html, i + 1);
+        if (!url.empty()) return url;
+        pos++;
     }
     return "";
+}
+
+// Extract URL from a JavaScript call such as:
+//   <callee>("...")
+// Example keys: "location.replace", "location.assign".
+static std::string extractJsCallUrl(const std::string& html, const char* callee) {
+    size_t pos = 0;
+    while ((pos = ifind(html, callee, pos)) != std::string::npos) {
+        size_t i = skipWs(html, pos + std::strlen(callee));
+        if (i >= html.size() || html[i] != '(') {
+            pos++;
+            continue;
+        }
+        std::string url = quotedLiteralFrom(html, i + 1);
+        if (!url.empty()) return url;
+        pos++;
+    }
+    return "";
+}
+
+// Extract the surrounding quoted string that contains `needle`, if any.
+static std::string extractQuotedContaining(const std::string& html,
+                                           const std::string& needle) {
+    size_t pos = 0;
+    while ((pos = ifind(html, needle, pos)) != std::string::npos) {
+        if (pos == 0) { pos++; continue; }
+        size_t q = pos;
+        for (size_t span = 0; q > 0 && span < 512; span++) {
+            char c = html[q - 1];
+            if (c == '\'' || c == '"') {
+                char quote = c;
+                size_t end = html.find(quote, q);
+                if (end != std::string::npos && end > pos) {
+                    return html.substr(q, end - q);
+                }
+                break;
+            }
+            if (c == '\n' || c == '\r' || c == '<' || c == '>') break;
+            q--;
+        }
+        pos++;
+    }
+    return "";
+}
+
+// Many WordPress captive portals submit credentials to wp-admin/admin-ajax.php
+// from JavaScript even when the HTML <form> action is empty/current-page.
+static std::string extractAdminAjaxUrl(const std::string& html) {
+    std::string direct = extractQuotedContaining(html, "admin-ajax.php");
+    if (!direct.empty()) return direct;
+    std::string assigned = extractJsAssignUrl(html, "ajaxurl");
+    return ifind(assigned, "admin-ajax.php") != std::string::npos ? assigned : "";
+}
+
+static bool hasHiddenActionValue(const PortalForm& form, const char* value) {
+    std::string want = toLowerCopy(value);
+    for (const PortalFormField& h : form.hidden) {
+        if (toLowerCopy(h.name) == "action" && toLowerCopy(h.value) == want) {
+            return true;
+        }
+    }
+    return false;
 }
 
 // MikroTik hotspot login pages compute the CHAP response in JavaScript, inlining
@@ -254,21 +362,25 @@ static std::string extractRedirectUrl(const std::string& html) {
     }
 
     // 2. JavaScript redirects: window.location.href='…', location.replace('…'),
-    //    location.assign('…'), window.location='…'. The method forms carry a '.'
-    //    so they cannot be confused with a query-string parameter; the bare
-    //    assignment is matched as "window.location=" (rather than a naked
-    //    "location=") so a URL such as "/login?location=home" embedded in the
-    //    page is NOT mistaken for a redirect target.
-    static const char* jsKeys[] = {"location.href", "location.replace",
-                                   "location.assign", "window.location="};
-    for (const char* key : jsKeys) {
-        size_t k = ifind(html, key);
-        if (k == std::string::npos) continue;
-        std::string url = firstQuotedFrom(html, k + std::strlen(key));
-        if (!url.empty()) return url;
-    }
+    //    location.assign('…'), window.location='…'. Match only real assignment/
+    //    call syntax (not a random "location.href" token in JSON/content), else
+    //    unrelated pages can be misread as redirects.
+    std::string jsUrl = extractJsAssignUrl(html, "window.location.href");
+    if (!jsUrl.empty()) return jsUrl;
+    jsUrl = extractJsAssignUrl(html, "location.href");
+    if (!jsUrl.empty()) return jsUrl;
+    jsUrl = extractJsCallUrl(html, "location.replace");
+    if (!jsUrl.empty()) return jsUrl;
+    jsUrl = extractJsCallUrl(html, "location.assign");
+    if (!jsUrl.empty()) return jsUrl;
+    jsUrl = extractJsAssignUrl(html, "window.location");
+    if (!jsUrl.empty()) return jsUrl;
 
     // 3. A "continue"/login anchor: <a href="…">…continue…</a>.
+    std::string htmlLower = toLowerCopy(html);
+    bool hasRedirectCue = htmlLower.find("if you are not redirected") != std::string::npos ||
+                          htmlLower.find("redirected in a few seconds") != std::string::npos ||
+                          htmlLower.find("click continue") != std::string::npos;
     size_t a = 0;
     while ((a = ifind(html, "<a", a)) != std::string::npos) {
         size_t end = html.find('>', a);
@@ -281,9 +393,10 @@ static std::string extractRedirectUrl(const std::string& html) {
         a = end + 1;
         std::string href = getAttr(tag, "href");
         if (href.empty() || href == "#") continue;
-        if (text.find("continue") != std::string::npos ||
-            text.find("login") != std::string::npos ||
-            text.find("log in") != std::string::npos) {
+        bool continueLike = text.find("continue") != std::string::npos;
+        bool loginLike = text.find("login") != std::string::npos ||
+                         text.find("log in") != std::string::npos;
+        if (continueLike || (loginLike && hasRedirectCue)) {
             return href;
         }
     }
@@ -361,6 +474,13 @@ bool parseLoginForm(const std::string& html, PortalForm& out) {
 
     if (haveBest) {
         out = best;
+        if (hasHiddenActionValue(out, "existing_user_credentials_submit")) {
+            std::string ajaxUrl = extractAdminAjaxUrl(html);
+            if (!ajaxUrl.empty()) {
+                out.action = ajaxUrl;
+                out.method = "post";
+            }
+        }
         // A plain username+password form on a MikroTik-style page may still be a
         // CHAP login: the chap-id/chap-challenge live in the page's md5.js call,
         // not in <input>s. Detect that and hash locally (issue #44) rather than

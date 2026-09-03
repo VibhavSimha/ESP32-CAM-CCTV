@@ -380,6 +380,20 @@ static void test_redirect_ignores_querystring_location() {
     CHECK(f.redirectUrl.empty());
 }
 
+// A stray "location.href" token (e.g. in JSON/config text) is NOT a redirect.
+// Only real JS assignment/call syntax should produce a redirectUrl.
+static void test_redirect_ignores_non_redirect_location_href_token() {
+    std::printf("test_redirect_ignores_non_redirect_location_href_token\n");
+    const std::string html =
+        "<html><body>"
+        "<script>var cfg={\"location.href\":\"https://alpsmp.spectra.co/alepocp/?server=x\"};</script>"
+        "</body></html>";
+    PortalForm f;
+    CHECK(!parseLoginForm(html, f));
+    CHECK(!f.formFound);
+    CHECK(f.redirectUrl.empty());
+}
+
 // A landing page whose only next-hop hint is a "continue"/login anchor.
 static void test_redirect_page_continue_link() {
     std::printf("test_redirect_page_continue_link\n");
@@ -389,6 +403,23 @@ static void test_redirect_page_continue_link() {
     PortalForm f;
     CHECK(!parseLoginForm(html, f));
     CHECK(f.redirectUrl == "/login?token=1");
+}
+
+// A generic page with a "Log in" link (e.g. WordPress chrome) is NOT a captive-
+// portal landing redirect by itself. Without an explicit redirect cue, this link
+// must not be treated as the next hop.
+static void test_redirect_ignores_generic_log_in_anchor() {
+    std::printf("test_redirect_ignores_generic_log_in_anchor\n");
+    const std::string html =
+        "<html><body>"
+        "<form action=\"/search\" method=\"get\"><input type=\"search\" name=\"s\"></form>"
+        "<a href=\"https://alpsmp.spectra.co/alepocp/wp-login.php\">Log in</a>"
+        "</body></html>";
+    PortalForm f;
+    CHECK(!parseLoginForm(html, f));
+    CHECK(f.formFound);            // page has a form, but not a login form
+    CHECK(!f.valid);
+    CHECK(f.redirectUrl.empty());  // do not follow unrelated "Log in" chrome
 }
 
 // A page with a stub form FIRST (a bare submit button) and the real
@@ -558,6 +589,45 @@ static void test_issue48_spectra_https_redirect_post() {
     CHECK(body.find("link-login-only=http%3A%2F%2F10.201.125.1%2Flogin") != std::string::npos);
 }
 
+// Issue #50 — Spectra/ALEPO portal login is submitted by JavaScript to
+// wp-admin/admin-ajax.php and may use a PIN field that is text-like (not
+// type=password). The parser should still produce an automatable form with the
+// correct action URL and credential field mapping.
+static void test_issue50_spectra_ajax_pin_login() {
+    std::printf("test_issue50_spectra_ajax_pin_login\n");
+    const std::string html =
+        "<html><body>"
+        "<form id='existing-user-login' method='post'>"
+        "<input type='hidden' name='action' value='existing_user_credentials_submit'>"
+        "<input type='hidden' name='existing_user_login_nonse' value='529e700beb'>"
+        "<input type='hidden' name='_wp_http_referer' value='/alepocp/stanza/?CM=A8%3A42&ip=10.0.0.2&ref='>"
+        "<input type='hidden' name='postedForm' value='y'>"
+        "<input type='text' name='existing_userId'>"
+        "<input type='text' name='pin'>"
+        "<button type='submit'>Log in</button>"
+        "</form>"
+        "<script>"
+        "$.ajax({url:'https://alpsmp.spectra.co/alepocp/wp-admin/admin-ajax.php',type:'POST'});"
+        "</script>"
+        "</body></html>";
+    PortalForm f;
+    bool ok = parseLoginForm(html, f);
+    CHECK(ok);
+    CHECK(f.formFound);
+    CHECK(f.valid);
+    CHECK(!f.challenge);
+    CHECK(f.userField == "existing_userId");
+    CHECK(f.passField == "pin");
+    CHECK(f.method == "post");
+    CHECK(f.action == "https://alpsmp.spectra.co/alepocp/wp-admin/admin-ajax.php");
+
+    std::string body = buildFormBody(f, "STN-26LFTBA055", "2272");
+    CHECK(body.find("action=existing_user_credentials_submit") != std::string::npos);
+    CHECK(body.find("existing_userId=STN-26LFTBA055") != std::string::npos);
+    CHECK(body.find("pin=2272") != std::string::npos);
+    CHECK(body.find("existing_user_login_nonse=529e700beb") != std::string::npos);
+}
+
 int main() {
     test_generic_user_pass();
     test_email_field();
@@ -575,13 +645,16 @@ int main() {
     test_redirect_page_js_location();
     test_redirect_js_bare_window_location();
     test_redirect_ignores_querystring_location();
+    test_redirect_ignores_non_redirect_location_href_token();
     test_redirect_page_continue_link();
+    test_redirect_ignores_generic_log_in_anchor();
     test_multi_form_picks_login_form();
     test_js_chap_undecodable_is_challenge();
     test_issue46_mikrotik_redirect_form_post();
     test_issue46_mikrotik_redirect_form_get();
     test_issue46_meta_refresh_beats_redirect_form();
     test_issue48_spectra_https_redirect_post();
+    test_issue50_spectra_ajax_pin_login();
 
     if (g_failures == 0) {
         std::printf("\nAll captive-portal parser tests passed.\n");
