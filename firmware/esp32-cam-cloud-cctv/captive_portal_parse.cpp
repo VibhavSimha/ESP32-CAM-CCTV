@@ -86,6 +86,16 @@ static bool isTextLikeType(const std::string& type) {
            type == "number" || type == "search" || type == "url";
 }
 
+// Some captive portals ask for a short PIN/OTP in a plain text-like input
+// instead of using <input type="password">. Keep this narrow and additive:
+// it is used only as a fallback when no real password field was found.
+static bool looksPasswordLikeName(const std::string& lowerName) {
+    return lowerName.find("pass") != std::string::npos ||
+           lowerName.find("pwd") != std::string::npos ||
+           lowerName.find("pin") != std::string::npos ||
+           lowerName.find("otp") != std::string::npos;
+}
+
 // Decode an even-length hex string (e.g. a MikroTik chap-challenge) into raw
 // bytes. Returns false when `s` is empty, has an odd length, or contains a
 // non-hex digit — in which case the caller must NOT attempt an automated CHAP
@@ -133,6 +143,8 @@ static size_t parseSingleForm(const std::string& html, size_t formStart,
 
     size_t formEnd = ifind(html, "</form>", openEnd);
     size_t bodyEnd = (formEnd == std::string::npos) ? html.size() : formEnd;
+    std::string firstTextField;
+    std::string hintedPassField;
 
     // Walk every <input> tag inside the form body.
     size_t pos = openEnd + 1;
@@ -167,8 +179,16 @@ static size_t parseSingleForm(const std::string& html, size_t formStart,
                    type == "file") {
             // Not a credential field; ignore for auto-detection.
         } else if (isTextLikeType(type)) {
-            if (f.userField.empty()) f.userField = name;
+            if (firstTextField.empty()) firstTextField = name;
+            if (hintedPassField.empty() && looksPasswordLikeName(lname)) {
+                hintedPassField = name;
+            }
         }
+    }
+
+    if (f.userField.empty()) f.userField = firstTextField;
+    if (f.passField.empty() && !hintedPassField.empty() && hintedPassField != f.userField) {
+        f.passField = hintedPassField;
     }
 
     if (formEnd == std::string::npos) return html.size();
@@ -233,6 +253,50 @@ static std::string extractJsCallUrl(const std::string& html, const char* callee)
         pos++;
     }
     return "";
+}
+
+// Extract the surrounding quoted string that contains `needle`, if any.
+static std::string extractQuotedContaining(const std::string& html,
+                                           const std::string& needle) {
+    size_t pos = 0;
+    while ((pos = ifind(html, needle, pos)) != std::string::npos) {
+        if (pos == 0) { pos++; continue; }
+        size_t q = pos;
+        for (size_t span = 0; q > 0 && span < 512; span++) {
+            char c = html[q - 1];
+            if (c == '\'' || c == '"') {
+                char quote = c;
+                size_t end = html.find(quote, q);
+                if (end != std::string::npos && end > pos) {
+                    return html.substr(q, end - q);
+                }
+                break;
+            }
+            if (c == '\n' || c == '\r' || c == '<' || c == '>') break;
+            q--;
+        }
+        pos++;
+    }
+    return "";
+}
+
+// Many WordPress captive portals submit credentials to wp-admin/admin-ajax.php
+// from JavaScript even when the HTML <form> action is empty/current-page.
+static std::string extractAdminAjaxUrl(const std::string& html) {
+    std::string direct = extractQuotedContaining(html, "admin-ajax.php");
+    if (!direct.empty()) return direct;
+    std::string assigned = extractJsAssignUrl(html, "ajaxurl");
+    return ifind(assigned, "admin-ajax.php") != std::string::npos ? assigned : "";
+}
+
+static bool hasHiddenActionValue(const PortalForm& form, const char* value) {
+    std::string want = toLowerCopy(value);
+    for (const PortalFormField& h : form.hidden) {
+        if (toLowerCopy(h.name) == "action" && toLowerCopy(h.value) == want) {
+            return true;
+        }
+    }
+    return false;
 }
 
 // MikroTik hotspot login pages compute the CHAP response in JavaScript, inlining
@@ -410,6 +474,13 @@ bool parseLoginForm(const std::string& html, PortalForm& out) {
 
     if (haveBest) {
         out = best;
+        if (hasHiddenActionValue(out, "existing_user_credentials_submit")) {
+            std::string ajaxUrl = extractAdminAjaxUrl(html);
+            if (!ajaxUrl.empty()) {
+                out.action = ajaxUrl;
+                out.method = "post";
+            }
+        }
         // A plain username+password form on a MikroTik-style page may still be a
         // CHAP login: the chap-id/chap-challenge live in the page's md5.js call,
         // not in <input>s. Detect that and hash locally (issue #44) rather than

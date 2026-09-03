@@ -34,7 +34,11 @@
 #endif
 
 // Cap how much of a portal page we read into RAM (heap is precious here).
-#define CAPTIVE_MAX_PAGE_BYTES 12288
+// Some modern captive portals ship heavy WordPress pages where the login form /
+// JS config appears beyond the first 12 KB, so keep this overrideable.
+#ifndef CAPTIVE_MAX_PAGE_BYTES
+#define CAPTIVE_MAX_PAGE_BYTES 32768
+#endif
 
 // Some captive portals (notably MikroTik hotspots) do not serve the login form
 // directly: the first page is an rlogin-style LANDING page that only redirects
@@ -77,6 +81,9 @@ static String      s_portalUrl;        // URL of the portal login page
 // browser-facing URL, so the form action must be resolved against THIS page URL
 // instead, or a relative/empty action would post to the wrong host (issue #48).
 static String      s_formPageUrl;
+// Best-effort portal session cookie (typically PHPSESSID) captured from portal
+// responses and replayed on follow-up fetches + credential submit when present.
+static String      s_portalCookie;
 static String      s_lastMessage;      // human-readable status for the UI
 static int         s_attempts = 0;
 static bool        s_reprobePending = false;
@@ -154,6 +161,25 @@ static String resolveActionUrl(const String& base, const String& action) {
     // Relative to the page's directory.
     String dir = (pathStart < 0) ? origin + "/" : base.substring(0, base.lastIndexOf('/') + 1);
     return dir + action;
+}
+
+// scheme://host[:port]
+static String urlOrigin(const String& url) {
+    int schemeEnd = url.indexOf("://");
+    if (schemeEnd < 0) return "";
+    int hostStart = schemeEnd + 3;
+    int pathStart = url.indexOf('/', hostStart);
+    return (pathStart < 0) ? url : url.substring(0, pathStart);
+}
+
+static void rememberSetCookie(const String& setCookie) {
+    if (setCookie.length() == 0) return;
+    int semi = setCookie.indexOf(';');
+    String pair = (semi < 0) ? setCookie : setCookie.substring(0, semi);
+    pair.trim();
+    if (pair.length() == 0 || pair.indexOf('=') <= 0) return;
+    s_portalCookie = pair;
+    Serial.printf("[CaptivePortal] Captured portal session cookie: %s\n", s_portalCookie.c_str());
 }
 
 static String urlDecode(const String& in) {
@@ -387,11 +413,17 @@ static int fetchPortalPage(const String& url, String& html) {
     http.setConnectTimeout(CAPTIVE_PROBE_TIMEOUT_MS);
     http.setTimeout(CAPTIVE_PROBE_TIMEOUT_MS);
     http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
+    const char* headerKeys[] = {"Set-Cookie"};
+    http.collectHeaders(headerKeys, 1);
     if (!http.begin(client, url)) {
         return -1000;
     }
+    if (s_portalCookie.length()) {
+        http.addHeader("Cookie", s_portalCookie);
+    }
     int code = http.GET();
     if (code > 0) {
+        rememberSetCookie(http.header("Set-Cookie"));
         html = http.getString();
         if (html.length() > CAPTIVE_MAX_PAGE_BYTES) {
             html = html.substring(0, CAPTIVE_MAX_PAGE_BYTES);
@@ -426,12 +458,18 @@ static int fetchPortalPagePost(const String& url, const String& body, String& ht
     http.setConnectTimeout(CAPTIVE_PROBE_TIMEOUT_MS);
     http.setTimeout(CAPTIVE_PROBE_TIMEOUT_MS);
     http.setFollowRedirects(HTTPC_FORCE_FOLLOW_REDIRECTS);
+    const char* headerKeys[] = {"Set-Cookie"};
+    http.collectHeaders(headerKeys, 1);
     if (!http.begin(client, url)) {
         return -1000;
+    }
+    if (s_portalCookie.length()) {
+        http.addHeader("Cookie", s_portalCookie);
     }
     http.addHeader("Content-Type", "application/x-www-form-urlencoded");
     int code = http.POST(body);
     if (code > 0) {
+        rememberSetCookie(http.header("Set-Cookie"));
         html = http.getString();
         if (html.length() > CAPTIVE_MAX_PAGE_BYTES) {
             html = html.substring(0, CAPTIVE_MAX_PAGE_BYTES);
@@ -522,6 +560,7 @@ static void analyzePortalPage(const String& html) {
 // classify the portal identically instead of guessing (issue #40).
 static void handleCaptiveDetected(const String& body, const String& location) {
     s_portalUrl = location.length() ? location : String(CAPTIVE_PROBE_URL);
+    s_portalCookie = "";
     Serial.printf("[CaptivePortal] Captive portal detected. Portal URL: %s\n", s_portalUrl.c_str());
 
     String currentUrl = s_portalUrl;
@@ -717,21 +756,46 @@ static bool submitPortalLogin(const String& username, const String& password, St
     http.setConnectTimeout(CAPTIVE_PROBE_TIMEOUT_MS);
     http.setTimeout(CAPTIVE_PROBE_TIMEOUT_MS);
     http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
+    const char* headerKeys[] = {"Set-Cookie"};
+    http.collectHeaders(headerKeys, 1);
 
     int code;
     if (s_form.method == "get") {
         String url = actionUrl + (actionUrl.indexOf('?') >= 0 ? "&" : "?") + body;
         if (!http.begin(client, url)) { outMsg = "Could not connect to the portal."; return false; }
+        if (s_portalCookie.length()) {
+            http.addHeader("Cookie", s_portalCookie);
+        }
+        if (base.length()) {
+            http.addHeader("Referer", base);
+        }
         code = http.GET();
     } else {
         if (!http.begin(client, actionUrl)) { outMsg = "Could not connect to the portal."; return false; }
+        if (s_portalCookie.length()) {
+            http.addHeader("Cookie", s_portalCookie);
+        }
+        if (base.length()) {
+            http.addHeader("Referer", base);
+        }
+        String origin = urlOrigin(actionUrl);
+        if (origin.length()) {
+            http.addHeader("Origin", origin);
+        }
         http.addHeader("Content-Type", "application/x-www-form-urlencoded");
+        if (actionUrl.indexOf("admin-ajax.php") >= 0) {
+            http.addHeader("X-Requested-With", "XMLHttpRequest");
+            http.addHeader("Accept", "application/json, text/javascript, */*; q=0.01");
+        }
         code = http.POST(body);
     }
     if (code < 0) {
         Serial.printf("[CaptivePortal] Portal login response: HTTP %d (%s)\n", code, httpErrorName(code));
     } else {
         Serial.printf("[CaptivePortal] Portal login response: HTTP %d\n", code);
+    }
+    if (code > 0) {
+        rememberSetCookie(http.header("Set-Cookie"));
     }
     http.end();
 
