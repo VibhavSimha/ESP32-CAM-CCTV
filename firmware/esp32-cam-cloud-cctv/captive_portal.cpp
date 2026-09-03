@@ -413,11 +413,11 @@ static int fetchPortalPage(const String& url, String& html) {
     http.setConnectTimeout(CAPTIVE_PROBE_TIMEOUT_MS);
     http.setTimeout(CAPTIVE_PROBE_TIMEOUT_MS);
     http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
-    const char* headerKeys[] = {"Set-Cookie"};
-    http.collectHeaders(headerKeys, 1);
     if (!http.begin(client, url)) {
         return -1000;
     }
+    const char* headerKeys[] = {"Set-Cookie"};
+    http.collectHeaders(headerKeys, 1);
     if (s_portalCookie.length()) {
         http.addHeader("Cookie", s_portalCookie);
     }
@@ -458,11 +458,11 @@ static int fetchPortalPagePost(const String& url, const String& body, String& ht
     http.setConnectTimeout(CAPTIVE_PROBE_TIMEOUT_MS);
     http.setTimeout(CAPTIVE_PROBE_TIMEOUT_MS);
     http.setFollowRedirects(HTTPC_FORCE_FOLLOW_REDIRECTS);
-    const char* headerKeys[] = {"Set-Cookie"};
-    http.collectHeaders(headerKeys, 1);
     if (!http.begin(client, url)) {
         return -1000;
     }
+    const char* headerKeys[] = {"Set-Cookie"};
+    http.collectHeaders(headerKeys, 1);
     if (s_portalCookie.length()) {
         http.addHeader("Cookie", s_portalCookie);
     }
@@ -756,13 +756,13 @@ static bool submitPortalLogin(const String& username, const String& password, St
     http.setConnectTimeout(CAPTIVE_PROBE_TIMEOUT_MS);
     http.setTimeout(CAPTIVE_PROBE_TIMEOUT_MS);
     http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
-    const char* headerKeys[] = {"Set-Cookie"};
-    http.collectHeaders(headerKeys, 1);
 
     int code;
     if (s_form.method == "get") {
         String url = actionUrl + (actionUrl.indexOf('?') >= 0 ? "&" : "?") + body;
         if (!http.begin(client, url)) { outMsg = "Could not connect to the portal."; return false; }
+        const char* headerKeys[] = {"Set-Cookie"};
+        http.collectHeaders(headerKeys, 1);
         if (s_portalCookie.length()) {
             http.addHeader("Cookie", s_portalCookie);
         }
@@ -772,6 +772,8 @@ static bool submitPortalLogin(const String& username, const String& password, St
         code = http.GET();
     } else {
         if (!http.begin(client, actionUrl)) { outMsg = "Could not connect to the portal."; return false; }
+        const char* headerKeys[] = {"Set-Cookie"};
+        http.collectHeaders(headerKeys, 1);
         if (s_portalCookie.length()) {
             http.addHeader("Cookie", s_portalCookie);
         }
