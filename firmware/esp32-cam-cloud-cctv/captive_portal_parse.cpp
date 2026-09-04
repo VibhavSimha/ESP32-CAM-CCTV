@@ -210,7 +210,10 @@ static size_t parseSingleForm(const std::string& html, size_t formStart,
                    type == "file") {
             // Not a credential field; ignore for auto-detection.
         } else if (isTextLikeType(type)) {
-            if (isVisuallyHiddenTextField(tag, lname)) continue;
+            if (isVisuallyHiddenTextField(tag, lname)) {
+                f.hidden.push_back(PortalFormField{name, value});
+                continue;
+            }
             if (lname == "extuser_device_type") {
                 f.deviceTypeField = name;
                 continue;

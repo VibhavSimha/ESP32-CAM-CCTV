@@ -650,6 +650,9 @@ static void test_issue50_spectra_ajax_pin_login() {
         "<input type='hidden' name='postedForm' value='y'>"
         "<input type='text' name='error_message_incorrect_userid_password' value='Invalid Credentials.' style='display:none !important;'>"
         "<input type='text' name='error_message_couldnt_login_user' value='Could not Login user. Please contact System Administrator.' style='display:none !important;'>"
+        "<input type='text' name='error_message_wifi_access_not_allowed' value='You are not allowed to connect to this Wi-Fi.' style='display:none !important;'>"
+        "<input type='text' name='username_prefix_enabled' value='true' style='display:none !important;'>"
+        "<input type='text' name='is_preprovisioned' value='true' style='display:none !important;'>"
         "<input type='text' name='extuser_device_type'>"
         "<input type='text' name='existing_userId'>"
         "<input type='text' name='pin'>"
@@ -677,6 +680,10 @@ static void test_issue50_spectra_ajax_pin_login() {
     CHECK(body.find("pin=2272") != std::string::npos);
     CHECK(body.find("extuser_device_type=esp32-cam-48530C") != std::string::npos);
     CHECK(body.find("existing_user_login_nonse=529e700beb") != std::string::npos);
+    CHECK(body.find("error_message_incorrect_userid_password=Invalid%20Credentials.") != std::string::npos);
+    CHECK(body.find("error_message_couldnt_login_user=Could%20not%20Login%20user.%20Please%20contact%20System%20Administrator.") != std::string::npos);
+    CHECK(body.find("username_prefix_enabled=true") != std::string::npos);
+    CHECK(body.find("is_preprovisioned=true") != std::string::npos);
 }
 
 int main() {

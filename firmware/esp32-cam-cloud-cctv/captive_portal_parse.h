@@ -34,7 +34,7 @@ struct PortalForm {
     std::string chapId;            // decoded raw bytes of chap-id (CHAP only)
     std::string chapChallenge;     // decoded raw bytes of chap-challenge (CHAP only)
     std::string deviceTypeField;   // optional device-name field used by some portals
-    std::vector<PortalFormField> hidden; // hidden inputs to echo back on submit
+    std::vector<PortalFormField> hidden; // hidden and CSS-hidden inputs to echo back on submit
     // A (possibly relative) URL to follow when THIS page carries no usable login
     // form but is a redirect/landing page — e.g. a MikroTik hotspot serves an
     // rlogin-style page ("If you are not redirected… click continue") that only
