@@ -201,6 +201,35 @@ static size_t skipWs(const std::string& s, size_t i) {
     return i;
 }
 
+// Unescape the common JS string escape sequences that appear in captive portal
+// URLs embedded in script blocks or JSON blobs.
+static std::string unescapeJsString(const std::string& s) {
+    if (s.find('\\') == std::string::npos) return s;
+    std::string out;
+    out.reserve(s.size());
+    for (size_t i = 0; i < s.size(); i++) {
+        char c = s[i];
+        if (c == '\\' && i + 1 < s.size()) {
+            char next = s[++i];
+            switch (next) {
+                case '\\': out.push_back('\\'); break;
+                case '\'': out.push_back('\''); break;
+                case '"': out.push_back('"'); break;
+                case '/': out.push_back('/'); break;
+                case 'n': out.push_back('\n'); break;
+                case 'r': out.push_back('\r'); break;
+                case 't': out.push_back('\t'); break;
+                default:
+                    out.push_back(next);
+                    break;
+            }
+        } else {
+            out.push_back(c);
+        }
+    }
+    return out;
+}
+
 // Parse a quoted JS string literal that starts at/after `from` (after optional
 // whitespace). Returns "" when no quoted literal begins there.
 static std::string quotedLiteralFrom(const std::string& html, size_t from) {
@@ -210,7 +239,7 @@ static std::string quotedLiteralFrom(const std::string& html, size_t from) {
     if (q != '\'' && q != '"') return "";
     size_t end = html.find(q, i + 1);
     if (end == std::string::npos) return "";
-    return html.substr(i + 1, end - (i + 1));
+    return unescapeJsString(html.substr(i + 1, end - (i + 1)));
 }
 
 // Extract URL from a JavaScript assignment such as:
@@ -268,7 +297,7 @@ static std::string extractQuotedContaining(const std::string& html,
                 char quote = c;
                 size_t end = html.find(quote, q);
                 if (end != std::string::npos && end > pos) {
-                    return html.substr(q, end - q);
+                    return unescapeJsString(html.substr(q, end - q));
                 }
                 break;
             }

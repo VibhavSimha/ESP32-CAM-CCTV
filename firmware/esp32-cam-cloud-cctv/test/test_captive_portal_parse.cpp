@@ -653,7 +653,7 @@ static void test_issue50_spectra_ajax_pin_login() {
         "<button type='submit'>Log in</button>"
         "</form>"
         "<script>"
-        "$.ajax({url:'https://alpsmp.spectra.co/alepocp/wp-admin/admin-ajax.php',type:'POST'});"
+        "$.ajax({url:'https:\\/\\/alpsmp.spectra.co\\/alepocp\\/wp-admin\\/admin-ajax.php',type:'POST'});"
         "</script>"
         "</body></html>";
     PortalForm f;
