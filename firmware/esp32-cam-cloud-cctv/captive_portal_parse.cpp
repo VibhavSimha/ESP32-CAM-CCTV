@@ -96,6 +96,37 @@ static bool looksPasswordLikeName(const std::string& lowerName) {
            lowerName.find("otp") != std::string::npos;
 }
 
+// Some portals publish explanatory/error text in <input type="text"> fields
+// that are hidden with CSS or named like message placeholders. Those must not
+// be treated as credential candidates.
+static bool isVisuallyHiddenTextField(const std::string& tag,
+                                      const std::string& lowerName) {
+    if (lowerName.find("error_message_") == 0 ||
+        lowerName.find("message_") == 0 ||
+        lowerName.find("message") != std::string::npos) {
+        return true;
+    }
+
+    std::string lowerStyle = toLowerCopy(getAttr(tag, "style"));
+    if (lowerStyle.find("display:none") != std::string::npos ||
+        lowerStyle.find("display: none") != std::string::npos ||
+        lowerStyle.find("visibility:hidden") != std::string::npos ||
+        lowerStyle.find("visibility: hidden") != std::string::npos) {
+        return true;
+    }
+
+    std::string lowerClass = toLowerCopy(getAttr(tag, "class"));
+    if (lowerClass.find("hidden") != std::string::npos ||
+        lowerClass.find("sr-only") != std::string::npos) {
+        return true;
+    }
+
+    std::string ariaHidden = toLowerCopy(getAttr(tag, "aria-hidden"));
+    if (ariaHidden == "true") return true;
+
+    return false;
+}
+
 // Decode an even-length hex string (e.g. a MikroTik chap-challenge) into raw
 // bytes. Returns false when `s` is empty, has an odd length, or contains a
 // non-hex digit — in which case the caller must NOT attempt an automated CHAP
@@ -179,6 +210,7 @@ static size_t parseSingleForm(const std::string& html, size_t formStart,
                    type == "file") {
             // Not a credential field; ignore for auto-detection.
         } else if (isTextLikeType(type)) {
+            if (isVisuallyHiddenTextField(tag, lname)) continue;
             if (firstTextField.empty()) firstTextField = name;
             if (hintedPassField.empty() && looksPasswordLikeName(lname)) {
                 hintedPassField = name;

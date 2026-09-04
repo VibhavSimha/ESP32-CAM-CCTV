@@ -648,6 +648,8 @@ static void test_issue50_spectra_ajax_pin_login() {
         "<input type='hidden' name='existing_user_login_nonse' value='529e700beb'>"
         "<input type='hidden' name='_wp_http_referer' value='/alepocp/stanza/?CM=A8%3A42&ip=10.0.0.2&ref='>"
         "<input type='hidden' name='postedForm' value='y'>"
+        "<input type='text' name='error_message_incorrect_userid_password' value='Invalid Credentials.' style='display:none !important;'>"
+        "<input type='text' name='error_message_couldnt_login_user' value='Could not Login user. Please contact System Administrator.' style='display:none !important;'>"
         "<input type='text' name='existing_userId'>"
         "<input type='text' name='pin'>"
         "<button type='submit'>Log in</button>"
