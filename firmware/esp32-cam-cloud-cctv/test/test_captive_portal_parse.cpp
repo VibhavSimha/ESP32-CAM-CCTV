@@ -677,6 +677,9 @@ static void test_issue50_spectra_ajax_pin_login() {
     CHECK(body.find("pin=2272") != std::string::npos);
     CHECK(body.find("extuser_device_type=esp32-cam-48530C") != std::string::npos);
     CHECK(body.find("existing_user_login_nonse=529e700beb") != std::string::npos);
+
+    std::string bodyNoDevice = buildFormBody(f, "STN-26LFTBA055", "2272", "");
+    CHECK(bodyNoDevice.find("extuser_device_type=") == std::string::npos);
 }
 
 // Issue #55 — Spectra's real login form includes hidden-by-style text inputs that

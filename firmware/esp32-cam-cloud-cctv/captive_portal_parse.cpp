@@ -764,7 +764,7 @@ std::string buildFormBody(const PortalForm& form,
         if (!body.empty()) body += "&";
         body += urlEncode(form.passField) + "=" + urlEncode(effectivePassword);
     }
-    if (!form.deviceTypeField.empty()) {
+    if (!form.deviceTypeField.empty() && !deviceType.empty()) {
         if (!body.empty()) body += "&";
         body += urlEncode(form.deviceTypeField) + "=" + urlEncode(deviceType);
     }
