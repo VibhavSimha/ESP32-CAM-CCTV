@@ -71,7 +71,7 @@ static std::string getAttr(const std::string& tag, const std::string& attr) {
         // Unquoted value: read until whitespace or tag end.
         size_t end = v;
         while (end < tag.size() && !std::isspace((unsigned char)tag[end]) &&
-               tag[end] != '>' && tag[end] != '/') {
+               tag[end] != '>') {
             end++;
         }
         return tag.substr(v, end - v);
@@ -159,6 +159,11 @@ static size_t parseSingleForm(const std::string& html, size_t formStart,
         std::string type = toLowerCopy(getAttr(tag, "type"));
         std::string name = getAttr(tag, "name");
         std::string value = getAttr(tag, "value");
+        std::string style = toLowerCopy(getAttr(tag, "style"));
+        bool inlineHidden = style.find("display:none") != std::string::npos ||
+                            style.find("display: none") != std::string::npos ||
+                            style.find("visibility:hidden") != std::string::npos ||
+                            style.find("visibility: hidden") != std::string::npos;
 
         // A MikroTik hotspot CHAP portal may carry hidden chap-id / chap-challenge
         // fields and expects password = MD5(chap-id + password + chap-challenge).
@@ -171,6 +176,7 @@ static size_t parseSingleForm(const std::string& html, size_t formStart,
         if (name.empty()) continue; // Cannot submit a nameless field.
 
         if (type == "password") {
+            if (inlineHidden) continue;
             if (f.passField.empty()) f.passField = name;
         } else if (type == "hidden") {
             f.hidden.push_back(PortalFormField{name, value});
@@ -179,6 +185,7 @@ static size_t parseSingleForm(const std::string& html, size_t formStart,
                    type == "file") {
             // Not a credential field; ignore for auto-detection.
         } else if (isTextLikeType(type)) {
+            if (inlineHidden) continue;
             if (firstTextField.empty()) firstTextField = name;
             if (hintedPassField.empty() && looksPasswordLikeName(lname)) {
                 hintedPassField = name;

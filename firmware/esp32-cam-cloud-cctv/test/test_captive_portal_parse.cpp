@@ -674,6 +674,38 @@ static void test_issue50_spectra_ajax_pin_login() {
     CHECK(body.find("existing_user_login_nonse=529e700beb") != std::string::npos);
 }
 
+// Issue #55 — Spectra's real login form includes hidden-by-style text inputs that
+// carry static error messages. They are not operator-editable credentials and must
+// not be picked as the username field.
+static void test_issue55_spectra_ignores_hidden_error_text_inputs() {
+    std::printf("test_issue55_spectra_ignores_hidden_error_text_inputs\n");
+    const std::string html =
+        "<html><body>"
+        "<form method='POST' id='alepo-existing_user-form' action=/alepocp/stanza/?CM=A8&ip=10.0.0.2&ref= class='alepo-ajax-form'>"
+        "<input type='hidden' class='alepo-ajax-action' name='action' value='existing_user_credentials_submit'>"
+        "<input type='text' name='error_message_incorrect_userid_password' value='Invalid Credentials.' style='display:none !important;'>"
+        "<input type='text' name='error_message_user_not_found' value='Invalid Credentials.' style='display:none !important;'>"
+        "<input required='required' type='text' name='existing_userId' value=''>"
+        "<input required='required' type='password' name='pin' value=''>"
+        "</form>"
+        "<script>var alepo={\"alepourl\":\"https:\\/\\/alpsmp.spectra.co\\/alepocp\\/wp-admin\\/admin-ajax.php\"};</script>"
+        "</body></html>";
+    PortalForm f;
+    CHECK(parseLoginForm(html, f));
+    CHECK(f.formFound);
+    CHECK(f.valid);
+    CHECK(!f.challenge);
+    CHECK(f.userField == "existing_userId");
+    CHECK(f.passField == "pin");
+    CHECK(f.action == "https://alpsmp.spectra.co/alepocp/wp-admin/admin-ajax.php");
+    CHECK(f.method == "post");
+
+    std::string body = buildFormBody(f, "STN-26LFTBA055", "2272");
+    CHECK(body.find("existing_userId=STN-26LFTBA055") != std::string::npos);
+    CHECK(body.find("pin=2272") != std::string::npos);
+    CHECK(body.find("error_message_incorrect_userid_password=") == std::string::npos);
+}
+
 int main() {
     test_generic_user_pass();
     test_email_field();
@@ -702,6 +734,7 @@ int main() {
     test_issue48_spectra_https_redirect_post();
     test_issue53_spectra_landing_form_full_hidden_echo();
     test_issue50_spectra_ajax_pin_login();
+    test_issue55_spectra_ignores_hidden_error_text_inputs();
 
     if (g_failures == 0) {
         std::printf("\nAll captive-portal parser tests passed.\n");
