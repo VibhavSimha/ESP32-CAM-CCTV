@@ -211,6 +211,10 @@ static size_t parseSingleForm(const std::string& html, size_t formStart,
             // Not a credential field; ignore for auto-detection.
         } else if (isTextLikeType(type)) {
             if (isVisuallyHiddenTextField(tag, lname)) continue;
+            if (lname == "extuser_device_type") {
+                f.deviceTypeField = name;
+                continue;
+            }
             if (firstTextField.empty()) firstTextField = name;
             if (hintedPassField.empty() && looksPasswordLikeName(lname)) {
                 hintedPassField = name;
@@ -733,7 +737,8 @@ std::string mikrotikChapPassword(const std::string& chapId,
 
 std::string buildFormBody(const PortalForm& form,
                           const std::string& username,
-                          const std::string& password) {
+                          const std::string& password,
+                          const std::string& deviceType) {
     // For a MikroTik CHAP portal the router expects the MD5 challenge response,
     // never the plaintext password (issue #42).
     std::string effectivePassword = form.chapLogin
@@ -752,6 +757,10 @@ std::string buildFormBody(const PortalForm& form,
     if (!form.passField.empty()) {
         if (!body.empty()) body += "&";
         body += urlEncode(form.passField) + "=" + urlEncode(effectivePassword);
+    }
+    if (!form.deviceTypeField.empty() && !deviceType.empty()) {
+        if (!body.empty()) body += "&";
+        body += urlEncode(form.deviceTypeField) + "=" + urlEncode(deviceType);
     }
     return body;
 }

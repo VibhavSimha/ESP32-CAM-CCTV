@@ -211,6 +211,12 @@ static String urlDecode(const String& in) {
     return out;
 }
 
+static String bestEffortDeviceName() {
+    String hostname = WiFi.getHostname();
+    if (hostname.length()) return hostname;
+    return String("ESP32-CAM-") + WiFi.macAddress();
+}
+
 // -----------------------------------------------------------------------------
 // Persistence — Wi-Fi is already stored by WiFiManager; we only remember that a
 // captive network was handled so we can annotate status. Portal credentials are
@@ -817,9 +823,11 @@ static bool submitPortalLogin(const String& username, const String& password, St
     // to s_portalUrl when no distinct form-page URL was recorded.
     String base = s_formPageUrl.length() ? s_formPageUrl : s_portalUrl;
     String actionUrl = resolveActionUrl(base, String(s_form.action.c_str()));
+    String deviceType = bestEffortDeviceName();
     std::string bodyStd = buildFormBody(s_form,
                                         std::string(username.c_str(), username.length()),
-                                        std::string(password.c_str(), password.length()));
+                                        std::string(password.c_str(), password.length()),
+                                        std::string(deviceType.c_str(), deviceType.length()));
     String body(bodyStd.c_str());
 
     Serial.printf("[CaptivePortal] Submitting login to %s (method %s, %s)\n",
@@ -1204,53 +1212,21 @@ static esp_err_t portal_login_handler(httpd_req_t* req) {
         return ESP_OK;
     }
 
-    // If we do NOT yet have an automatable login form (e.g. the boot-time HTTPS
-    // redirect fetch failed, or the operator opened /portal on an "unsupported"
-    // portal), defer a fresh re-detect + submit to captivePortalLoop() instead of
-    // giving up. This is what lets the user "just enter a username/password" and
-    // have the camera try, even when the exact fields were not detected at boot
-    // (issue #48). The blocking work is deferred so the httpd task is not frozen
-    // (issue #46). Credentials are stashed briefly, then wiped after the submit.
-    if (!s_form.valid) {
-        s_pendingUser = username;
-        s_pendingPass = password;
-        s_redetectLoginPending = true;
-        s_attempts++;
-        setStatus(PORTAL_STATE_SUBMITTED,
-                  "Scanning the portal for a login form and submitting your credentials…");
-        // s_pendingUser/Pass now hold a COPY of the credentials (String assignment
-        // copies the buffer) and are wiped after the deferred submit runs
-        // (wipePendingCredentials in doRedetectAndSubmit). Scrub the local copies
-        // here too so no plaintext lingers in this handler's freed buffers.
-        secureZeroString(username);
-        secureZeroString(password);
-        sendStatusJson(req);
-        return ESP_OK;
-    }
-
+    // Never run the actual portal submit inline from the httpd task. TLS and
+    // HTTPClient can consume enough stack to trip the httpd canary, so we always
+    // queue the work for captivePortalLoop() and ACK immediately.
+    // The loop re-detects the portal when needed and submits from the main task.
     s_attempts++;
-    setStatus(PORTAL_STATE_SUBMITTED, "Submitting your credentials to the portal…");
-    String msg;
-    bool sent = submitPortalLogin(username, password, msg);
+    s_pendingUser = username;
+    s_pendingPass = password;
+    s_redetectLoginPending = true;
+    setStatus(PORTAL_STATE_SUBMITTED,
+              "Submitting your credentials to the portal…");
 
-    // Wipe the credentials from RAM as soon as they are used — we do not keep or
-    // persist portal credentials.
+    // Wipe the local copies immediately; the deferred path keeps its own copy in
+    // RAM only until doRedetectAndSubmit() consumes it.
     secureZeroString(username);
     secureZeroString(password);
-
-    if (!sent) {
-        if (s_attempts >= CAPTIVE_MAX_LOGIN_ATTEMPTS) {
-            setStatus(PORTAL_STATE_FAILED, msg + " (max attempts reached — log in from your browser instead).");
-        } else {
-            setStatus(PORTAL_STATE_FAILED, msg);
-        }
-        sendStatusJson(req);
-        return ESP_OK;
-    }
-
-    // Verify by re-probing after a short settle delay (handled in the loop).
-    s_reprobePending = true;
-    s_reprobeAt = millis() + 1500;
     sendStatusJson(req);
     return ESP_OK;
 }
