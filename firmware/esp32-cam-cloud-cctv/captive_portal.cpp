@@ -823,11 +823,10 @@ static bool submitPortalLogin(const String& username, const String& password, St
     // to s_portalUrl when no distinct form-page URL was recorded.
     String base = s_formPageUrl.length() ? s_formPageUrl : s_portalUrl;
     String actionUrl = resolveActionUrl(base, String(s_form.action.c_str()));
-    String deviceType = bestEffortDeviceName();
     std::string bodyStd = buildFormBody(s_form,
                                         std::string(username.c_str(), username.length()),
                                         std::string(password.c_str(), password.length()),
-                                        std::string(deviceType.c_str(), deviceType.length()));
+                                        std::string());
     String body(bodyStd.c_str());
 
     Serial.printf("[CaptivePortal] Submitting login to %s (method %s, %s)\n",
