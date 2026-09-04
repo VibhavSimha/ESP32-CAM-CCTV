@@ -1076,7 +1076,7 @@ static void doRedetectAndSubmit() {
     // Submit immediately instead of re-detecting again, because a second probe can
     // intermittently land on an unsupported intermediate page and drop us from
     // CAPTIVE->UNSUPPORTED before we even attempt the login.
-    if (s_form.valid) {
+    if (s_form.valid && !captivePortalIsOnline()) {
         setStatus(PORTAL_STATE_SUBMITTED, "Login form found — submitting your credentials…");
         String msg;
         bool sent = submitPortalLogin(s_pendingUser, s_pendingPass, msg);
@@ -1239,7 +1239,8 @@ static esp_err_t portal_login_handler(httpd_req_t* req) {
     s_pendingUser = username;
     s_pendingPass = password;
     s_redetectLoginPending = true;
-    setStatus(PORTAL_STATE_SUBMITTED, s_form.valid
+    bool canDirectSubmit = s_form.valid && !captivePortalIsOnline();
+    setStatus(PORTAL_STATE_SUBMITTED, canDirectSubmit
                   ? "Login form found — submitting your credentials…"
                   : "Submitting your credentials to the portal…");
 
