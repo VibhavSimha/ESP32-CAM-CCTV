@@ -95,10 +95,10 @@ static unsigned long s_reprobeAt = 0;
 // by the reporter's HAR: GET /portal took 13,380 ms). We ACK immediately and let
 // captivePortalLoop() do the work; the page's existing poll surfaces the result.
 static bool        s_manualReprobePending = false;
-// Set by the /portal/login handler when the operator submits credentials but no
-// automatable login form has been detected yet (e.g. the boot-time HTTPS redirect
-// fetch failed). The blocking re-detect + submit is deferred to captivePortalLoop()
-// so the httpd task stays responsive (issue #46). The credentials are held only
+// Set by the /portal/login handler when the operator submits credentials. The
+// actual submit is deferred to captivePortalLoop() so the httpd task stays
+// responsive (issue #46). If a valid form is already known we submit directly;
+// otherwise we re-detect the portal first, then submit. Credentials are held only
 // until that deferred submit runs, then wiped (issue #48).
 static bool        s_redetectLoginPending = false;
 static String      s_pendingUser;
@@ -1066,13 +1066,32 @@ static void wipePendingCredentials() {
     secureZeroString(s_pendingPass);
 }
 
-// Deferred handler for a /portal/login submit made while no automatable form was
-// known yet (s_form.valid == false). Runs in the main-loop task, so the blocking
-// probe + TLS handshake never freeze the web server (issue #46). It re-probes and
-// re-detects the portal — now able to follow HTTPS redirects to the real login
-// page (issue #48) — and, if a usable form emerges, submits the operator's
-// credentials to it. Either way the stashed credentials are wiped before return.
+// Deferred /portal/login submit handler. Runs in the main-loop task so blocking
+// network work never freezes the web server (issue #46). If an automatable form is
+// already known, submit to it directly. Otherwise re-probe/re-detect first (able
+// to follow HTTPS redirects — issue #48), then submit when a usable form emerges.
+// Either way the stashed credentials are wiped before return.
 static void doRedetectAndSubmit() {
+    // Common case: boot-time/heartbeat probe already detected a usable form.
+    // Submit immediately instead of re-detecting again, because a second probe can
+    // intermittently land on an unsupported intermediate page and drop us from
+    // CAPTIVE->UNSUPPORTED before we even attempt the login.
+    if (s_form.valid) {
+        setStatus(PORTAL_STATE_SUBMITTED, "Login form found — submitting your credentials…");
+        String msg;
+        bool sent = submitPortalLogin(s_pendingUser, s_pendingPass, msg);
+        if (sent) {
+            s_reprobePending = true;
+            s_reprobeAt = millis() + 1500;
+            setStatus(PORTAL_STATE_SUBMITTED, "Credentials submitted — verifying connectivity…");
+        } else {
+            setStatus(PORTAL_STATE_FAILED, msg);
+        }
+        wipePendingCredentials();
+        s_periodicReprobeAt = millis() + CAPTIVE_PERIODIC_REPROBE_MS;
+        return;
+    }
+
     String body, location;
     int code = probeInternet(body, location);
     if (code < 0) {
@@ -1220,8 +1239,9 @@ static esp_err_t portal_login_handler(httpd_req_t* req) {
     s_pendingUser = username;
     s_pendingPass = password;
     s_redetectLoginPending = true;
-    setStatus(PORTAL_STATE_SUBMITTED,
-              "Submitting your credentials to the portal…");
+    setStatus(PORTAL_STATE_SUBMITTED, s_form.valid
+                  ? "Login form found — submitting your credentials…"
+                  : "Submitting your credentials to the portal…");
 
     // Wipe the local copies immediately; the deferred path keeps its own copy in
     // RAM only until doRedetectAndSubmit() consumes it.
