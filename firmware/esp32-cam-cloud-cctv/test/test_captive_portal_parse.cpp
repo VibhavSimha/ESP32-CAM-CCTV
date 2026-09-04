@@ -589,6 +589,52 @@ static void test_issue48_spectra_https_redirect_post() {
     CHECK(body.find("link-login-only=http%3A%2F%2F10.201.125.1%2Flogin") != std::string::npos);
 }
 
+// Issue #53 — Spectra landing page captured from the failing ESP32 logs.
+// It is a browser-auto-submitted POST form with many hidden fields (including
+// empty ones like username/chap-id/chap-challenge). The parser must expose this
+// as a POST redirect hop and preserve every hidden field so the firmware can
+// replay the same submit before parsing the real login page.
+static void test_issue53_spectra_landing_form_full_hidden_echo() {
+    std::printf("test_issue53_spectra_landing_form_full_hidden_echo\n");
+    const std::string html =
+        "<html><head><title>...</title></head><body>"
+        "<center>If you are not redirected in a few seconds, click 'continue' below<br>"
+        "<form name=\"redirect\" action=\"https://alpsmp.spectra.co/alepocp/?server=HS_STNZ_BAN_LFYTE_DATA&CM=A8:42:E3:48:53:0C&ip=10.201.125.127\" method=\"post\">"
+        "<input type=\"hidden\" name=\"CM\" value=\"A8:42:E3:48:53:0C\">"
+        "<input type=\"hidden\" name=\"ip\" value=\"10.201.125.127\">"
+        "<input type=\"hidden\" name=\"username\" value=\"\">"
+        "<input type=\"hidden\" name=\"link-login\" value=\"http://10.201.125.1/login?dst=http%3A%2F%2Fconnectivitycheck.gstatic.com%2Fgenerate%5F204\">"
+        "<input type=\"hidden\" name=\"link-orig\" value=\"http://connectivitycheck.gstatic.com/generate_204\">"
+        "<input type=\"hidden\" name=\"error\" value=\"\">"
+        "<input type=\"hidden\" name=\"chap-id\" value=\"\">"
+        "<input type=\"hidden\" name=\"chap-challenge\" value=\"\">"
+        "<input type=\"hidden\" name=\"link-login-only\" value=\"http://10.201.125.1/login\">"
+        "<input type=\"hidden\" name=\"link-orig-esc\" value=\"http%3A%2F%2Fconnectivitycheck.gstatic.com%2Fgenerate%5F204\">"
+        "<input type=\"hidden\" name=\"mac-esc\" value=\"A8%3A42%3AE3%3A48%3A53%3A0C\">"
+        "<input type=\"hidden\" name=\"nasid\" value=\"STNZ_BAN_LFYTE_M75\">"
+        "<input type=\"hidden\" name=\"server\" value=\"HS_STNZ_BAN_LFYTE_DATA\">"
+        "<input type=\"submit\" value=\"continue\">"
+        "</form></center></body></html>";
+
+    PortalForm f;
+    CHECK(!parseLoginForm(html, f));
+    CHECK(f.formFound);
+    CHECK(!f.valid);
+    CHECK(f.redirectMethod == "post");
+    CHECK(f.redirectUrl ==
+          "https://alpsmp.spectra.co/alepocp/?server=HS_STNZ_BAN_LFYTE_DATA&CM=A8:42:E3:48:53:0C&ip=10.201.125.127");
+    CHECK(f.redirectFields.size() == 13);
+
+    PortalForm hop;
+    hop.hidden = f.redirectFields;
+    std::string body = buildFormBody(hop, "", "");
+    CHECK(body.find("CM=A8%3A42%3AE3%3A48%3A53%3A0C") != std::string::npos);
+    CHECK(body.find("username=") != std::string::npos);
+    CHECK(body.find("chap-id=") != std::string::npos);
+    CHECK(body.find("chap-challenge=") != std::string::npos);
+    CHECK(body.find("link-orig-esc=http%253A%252F%252Fconnectivitycheck.gstatic.com%252Fgenerate%255F204") != std::string::npos);
+}
+
 // Issue #50 — Spectra/ALEPO portal login is submitted by JavaScript to
 // wp-admin/admin-ajax.php and may use a PIN field that is text-like (not
 // type=password). The parser should still produce an automatable form with the
@@ -654,6 +700,7 @@ int main() {
     test_issue46_mikrotik_redirect_form_get();
     test_issue46_meta_refresh_beats_redirect_form();
     test_issue48_spectra_https_redirect_post();
+    test_issue53_spectra_landing_form_full_hidden_echo();
     test_issue50_spectra_ajax_pin_login();
 
     if (g_failures == 0) {

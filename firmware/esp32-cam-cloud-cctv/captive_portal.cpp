@@ -361,6 +361,10 @@ static void logFetchResult(const char* what, const String& url, int code, size_t
     }
 }
 
+static bool isHttpRedirectCode(int code) {
+    return code == 301 || code == 302 || code == 303 || code == 307 || code == 308;
+}
+
 // Perform the connectivity probe. Returns the HTTP status code (or a negative
 // HTTPClient error), fills `body` and, on a redirect, `location`.
 static int probeInternet(String& body, String& location) {
@@ -397,40 +401,73 @@ static int probeInternet(String& body, String& location) {
 }
 
 // GET the portal login page at `url`, following redirects. Returns HTTP status
-// and fills `html`. Transparently uses TLS for https:// targets (issue #48).
-static int fetchPortalPage(const String& url, String& html) {
+// and fills `html`. `finalUrl` (when provided) receives the URL that produced
+// that final response body after redirects. Transparently uses TLS for https://
+// targets (issue #48).
+static int fetchPortalPage(const String& url, String& html, String* finalUrl = nullptr) {
     html = "";
-    if (isHttpsUrl(url) && ESP.getFreeHeap() < CAPTIVE_MIN_HEAP_FOR_TLS) {
-        Serial.printf("[CaptivePortal] Skipping HTTPS GET of %s — free heap %u < %lu needed for TLS.\n",
-                      url.c_str(), (unsigned)ESP.getFreeHeap(), (unsigned long)CAPTIVE_MIN_HEAP_FOR_TLS);
-        return -1001;
-    }
-    // The transport client(s) must outlive the HTTPClient (see probeInternet).
-    WiFiClient plainClient;
-    WiFiClientSecure secureClient;
-    WiFiClient& client = selectPortalClient(url, plainClient, secureClient);
-    HTTPClient http;
-    http.setConnectTimeout(CAPTIVE_PROBE_TIMEOUT_MS);
-    http.setTimeout(CAPTIVE_PROBE_TIMEOUT_MS);
-    http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
-    if (!http.begin(client, url)) {
-        return -1000;
-    }
-    const char* headerKeys[] = {"Set-Cookie"};
-    http.collectHeaders(headerKeys, 1);
-    if (s_portalCookie.length()) {
-        http.addHeader("Cookie", s_portalCookie);
-    }
-    int code = http.GET();
-    if (code > 0) {
-        rememberSetCookie(http.header("Set-Cookie"));
-        html = http.getString();
-        if (html.length() > CAPTIVE_MAX_PAGE_BYTES) {
-            html = html.substring(0, CAPTIVE_MAX_PAGE_BYTES);
+    String currentUrl = url;
+    for (int hop = 0; ; hop++) {
+        if (isHttpsUrl(currentUrl) && ESP.getFreeHeap() < CAPTIVE_MIN_HEAP_FOR_TLS) {
+            Serial.printf("[CaptivePortal] Skipping HTTPS GET of %s — free heap %u < %lu needed for TLS.\n",
+                          currentUrl.c_str(), (unsigned)ESP.getFreeHeap(), (unsigned long)CAPTIVE_MIN_HEAP_FOR_TLS);
+            if (finalUrl) *finalUrl = currentUrl;
+            return -1001;
         }
+
+        // The transport client(s) must outlive the HTTPClient (see probeInternet).
+        WiFiClient plainClient;
+        WiFiClientSecure secureClient;
+        WiFiClient& client = selectPortalClient(currentUrl, plainClient, secureClient);
+        HTTPClient http;
+        http.setConnectTimeout(CAPTIVE_PROBE_TIMEOUT_MS);
+        http.setTimeout(CAPTIVE_PROBE_TIMEOUT_MS);
+        // Follow redirects manually so each hop can pick the right transport
+        // (HTTP vs HTTPS). Auto-follow can keep a plain client across an HTTPS
+        // hop (or vice versa), which yields NO_HTTP_SERVER on some portals.
+        http.setFollowRedirects(HTTPC_DISABLE_FOLLOW_REDIRECTS);
+        if (!http.begin(client, currentUrl)) {
+            if (finalUrl) *finalUrl = currentUrl;
+            return -1000;
+        }
+        const char* headerKeys[] = {"Set-Cookie", "Location"};
+        http.collectHeaders(headerKeys, 2);
+        if (s_portalCookie.length()) {
+            http.addHeader("Cookie", s_portalCookie);
+        }
+        int code = http.GET();
+        String location = (code > 0) ? http.header("Location") : String();
+        if (code > 0) {
+            rememberSetCookie(http.header("Set-Cookie"));
+            html = http.getString();
+            if (html.length() > CAPTIVE_MAX_PAGE_BYTES) {
+                html = html.substring(0, CAPTIVE_MAX_PAGE_BYTES);
+            }
+        }
+        http.end();
+
+        if (code > 0 && isHttpRedirectCode(code) && location.length()) {
+            if (hop >= CAPTIVE_MAX_REDIRECT_HOPS) {
+                Serial.printf("[CaptivePortal] HTTP redirect hop limit (%d) reached while fetching %s\n",
+                              CAPTIVE_MAX_REDIRECT_HOPS, currentUrl.c_str());
+                if (finalUrl) *finalUrl = currentUrl;
+                return code;
+            }
+            String nextUrl = resolveActionUrl(currentUrl, location);
+            if (nextUrl == currentUrl) {
+                Serial.println("[CaptivePortal] HTTP redirect target is the current page — stopping to avoid a loop.");
+                if (finalUrl) *finalUrl = currentUrl;
+                return code;
+            }
+            Serial.printf("[CaptivePortal] Following HTTP redirect hop %d via GET: %s\n",
+                          hop + 1, nextUrl.c_str());
+            currentUrl = nextUrl;
+            continue;
+        }
+
+        if (finalUrl) *finalUrl = currentUrl;
+        return code;
     }
-    http.end();
-    return code;
 }
 
 // POST a MikroTik-style "redirect"/"continue" landing form (application/x-www-
@@ -440,43 +477,87 @@ static int fetchPortalPage(const String& url, String& html) {
 // "post"> that the browser auto-submits — a GET to its action does not reproduce
 // what the browser does, so we replay it as a POST here (issue #46). The action
 // is frequently an https:// external portal, so TLS is used transparently when
-// needed (issue #48). Redirects are FORCE-followed so the 302 the portal issues
-// after the POST is chased to the real login page (which is then re-parsed for an
-// automatable form).
-static int fetchPortalPagePost(const String& url, const String& body, String& html) {
+// needed (issue #48). HTTP redirects are followed manually so each hop can pick
+// the correct transport (HTTP vs HTTPS). `finalUrl` (when provided) receives the
+// URL that produced the final response body after redirects.
+static int fetchPortalPagePost(const String& url, const String& body, String& html,
+                               String* finalUrl = nullptr) {
     html = "";
-    if (isHttpsUrl(url) && ESP.getFreeHeap() < CAPTIVE_MIN_HEAP_FOR_TLS) {
-        Serial.printf("[CaptivePortal] Skipping HTTPS POST to %s — free heap %u < %lu needed for TLS.\n",
-                      url.c_str(), (unsigned)ESP.getFreeHeap(), (unsigned long)CAPTIVE_MIN_HEAP_FOR_TLS);
-        return -1001;
-    }
-    // The transport client(s) must outlive the HTTPClient (see probeInternet).
-    WiFiClient plainClient;
-    WiFiClientSecure secureClient;
-    WiFiClient& client = selectPortalClient(url, plainClient, secureClient);
-    HTTPClient http;
-    http.setConnectTimeout(CAPTIVE_PROBE_TIMEOUT_MS);
-    http.setTimeout(CAPTIVE_PROBE_TIMEOUT_MS);
-    http.setFollowRedirects(HTTPC_FORCE_FOLLOW_REDIRECTS);
-    if (!http.begin(client, url)) {
-        return -1000;
-    }
-    const char* headerKeys[] = {"Set-Cookie"};
-    http.collectHeaders(headerKeys, 1);
-    if (s_portalCookie.length()) {
-        http.addHeader("Cookie", s_portalCookie);
-    }
-    http.addHeader("Content-Type", "application/x-www-form-urlencoded");
-    int code = http.POST(body);
-    if (code > 0) {
-        rememberSetCookie(http.header("Set-Cookie"));
-        html = http.getString();
-        if (html.length() > CAPTIVE_MAX_PAGE_BYTES) {
-            html = html.substring(0, CAPTIVE_MAX_PAGE_BYTES);
+    String currentUrl = url;
+    bool usePost = true;
+
+    for (int hop = 0; ; hop++) {
+        if (isHttpsUrl(currentUrl) && ESP.getFreeHeap() < CAPTIVE_MIN_HEAP_FOR_TLS) {
+            Serial.printf("[CaptivePortal] Skipping HTTPS %s to %s — free heap %u < %lu needed for TLS.\n",
+                          usePost ? "POST" : "GET", currentUrl.c_str(),
+                          (unsigned)ESP.getFreeHeap(), (unsigned long)CAPTIVE_MIN_HEAP_FOR_TLS);
+            if (finalUrl) *finalUrl = currentUrl;
+            return -1001;
         }
+
+        // The transport client(s) must outlive the HTTPClient (see probeInternet).
+        WiFiClient plainClient;
+        WiFiClientSecure secureClient;
+        WiFiClient& client = selectPortalClient(currentUrl, plainClient, secureClient);
+        HTTPClient http;
+        http.setConnectTimeout(CAPTIVE_PROBE_TIMEOUT_MS);
+        http.setTimeout(CAPTIVE_PROBE_TIMEOUT_MS);
+        // Follow redirects manually so each hop can switch transport scheme.
+        http.setFollowRedirects(HTTPC_DISABLE_FOLLOW_REDIRECTS);
+        if (!http.begin(client, currentUrl)) {
+            if (finalUrl) *finalUrl = currentUrl;
+            return -1000;
+        }
+        const char* headerKeys[] = {"Set-Cookie", "Location"};
+        http.collectHeaders(headerKeys, 2);
+        if (s_portalCookie.length()) {
+            http.addHeader("Cookie", s_portalCookie);
+        }
+
+        int code;
+        if (usePost) {
+            http.addHeader("Content-Type", "application/x-www-form-urlencoded");
+            code = http.POST(body);
+        } else {
+            code = http.GET();
+        }
+
+        String location = (code > 0) ? http.header("Location") : String();
+        if (code > 0) {
+            rememberSetCookie(http.header("Set-Cookie"));
+            html = http.getString();
+            if (html.length() > CAPTIVE_MAX_PAGE_BYTES) {
+                html = html.substring(0, CAPTIVE_MAX_PAGE_BYTES);
+            }
+        }
+        http.end();
+
+        if (code > 0 && isHttpRedirectCode(code) && location.length()) {
+            if (hop >= CAPTIVE_MAX_REDIRECT_HOPS) {
+                Serial.printf("[CaptivePortal] HTTP redirect hop limit (%d) reached while fetching %s\n",
+                              CAPTIVE_MAX_REDIRECT_HOPS, currentUrl.c_str());
+                if (finalUrl) *finalUrl = currentUrl;
+                return code;
+            }
+            String nextUrl = resolveActionUrl(currentUrl, location);
+            if (nextUrl == currentUrl) {
+                Serial.println("[CaptivePortal] HTTP redirect target is the current page — stopping to avoid a loop.");
+                if (finalUrl) *finalUrl = currentUrl;
+                return code;
+            }
+            // Browser semantics: 301/302/303 after a POST become a GET to the
+            // redirect target; 307/308 preserve method + body.
+            bool keepPost = usePost && (code == 307 || code == 308);
+            Serial.printf("[CaptivePortal] Following HTTP redirect hop %d via %s: %s\n",
+                          hop + 1, keepPost ? "POST" : "GET", nextUrl.c_str());
+            currentUrl = nextUrl;
+            usePost = keepPost;
+            continue;
+        }
+
+        if (finalUrl) *finalUrl = currentUrl;
+        return code;
     }
-    http.end();
-    return code;
 }
 
 // Dump the exact portal HTML we are about to parse to the serial console, in
@@ -567,9 +648,13 @@ static void handleCaptiveDetected(const String& body, const String& location) {
     String html = body;
     if (location.length()) {
         String page;
-        int pcode = fetchPortalPage(currentUrl, page);
+        String fetchedUrl = currentUrl;
+        int pcode = fetchPortalPage(currentUrl, page, &fetchedUrl);
         logFetchResult("Fetch portal page", currentUrl, pcode, page.length());
-        if (page.length()) html = page;
+        if (page.length()) {
+            html = page;
+            currentUrl = fetchedUrl;
+        }
     }
 
     // Follow up to CAPTIVE_MAX_REDIRECT_HOPS landing-page redirects to reach the
@@ -617,8 +702,9 @@ static void handleCaptiveDetected(const String& body, const String& location) {
                       hop + 1, postHop ? "POST" : "GET", nextUrl.c_str());
 
         String page;
-        int pcode = postHop ? fetchPortalPagePost(nextUrl, postBody, page)
-                            : fetchPortalPage(nextUrl, page);
+        String fetchedUrl = nextUrl;
+        int pcode = postHop ? fetchPortalPagePost(nextUrl, postBody, page, &fetchedUrl)
+                            : fetchPortalPage(nextUrl, page, &fetchedUrl);
         logFetchResult("Fetch redirect target", nextUrl, pcode, page.length());
         if (pcode <= 0 || page.length() == 0) {
             Serial.println("[CaptivePortal] Could not fetch the redirect target — staying on manual fallback.");
@@ -628,12 +714,12 @@ static void handleCaptiveDetected(const String& body, const String& location) {
             }
             break;
         }
-        currentUrl = nextUrl;
+        currentUrl = fetchedUrl;
         // Point the manual-browser fallback at the real login page for a GET hop
         // (a URL a human can open directly). For a POST hop the target is a
         // browser-detection endpoint that only makes sense as a form submission, so
         // keep the original portal URL — that is what the operator's browser hits.
-        if (!postHop) s_portalUrl = nextUrl;
+        if (!postHop) s_portalUrl = fetchedUrl;
         html = page;
     }
 
