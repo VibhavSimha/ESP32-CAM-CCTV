@@ -650,6 +650,7 @@ static void test_issue50_spectra_ajax_pin_login() {
         "<input type='hidden' name='postedForm' value='y'>"
         "<input type='text' name='error_message_incorrect_userid_password' value='Invalid Credentials.' style='display:none !important;'>"
         "<input type='text' name='error_message_couldnt_login_user' value='Could not Login user. Please contact System Administrator.' style='display:none !important;'>"
+        "<input type='text' name='extuser_device_type'>"
         "<input type='text' name='existing_userId'>"
         "<input type='text' name='pin'>"
         "<button type='submit'>Log in</button>"
@@ -666,13 +667,15 @@ static void test_issue50_spectra_ajax_pin_login() {
     CHECK(!f.challenge);
     CHECK(f.userField == "existing_userId");
     CHECK(f.passField == "pin");
+    CHECK(f.deviceTypeField == "extuser_device_type");
     CHECK(f.method == "post");
     CHECK(f.action == "https://alpsmp.spectra.co/alepocp/wp-admin/admin-ajax.php");
 
-    std::string body = buildFormBody(f, "STN-26LFTBA055", "2272");
+    std::string body = buildFormBody(f, "STN-26LFTBA055", "2272", "esp32-cam-48530C");
     CHECK(body.find("action=existing_user_credentials_submit") != std::string::npos);
     CHECK(body.find("existing_userId=STN-26LFTBA055") != std::string::npos);
     CHECK(body.find("pin=2272") != std::string::npos);
+    CHECK(body.find("extuser_device_type=esp32-cam-48530C") != std::string::npos);
     CHECK(body.find("existing_user_login_nonse=529e700beb") != std::string::npos);
 }
 

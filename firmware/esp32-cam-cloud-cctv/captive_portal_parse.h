@@ -33,6 +33,7 @@ struct PortalForm {
     std::string passField;         // auto-detected password input name
     std::string chapId;            // decoded raw bytes of chap-id (CHAP only)
     std::string chapChallenge;     // decoded raw bytes of chap-challenge (CHAP only)
+    std::string deviceTypeField;   // optional device-name field used by some portals
     std::vector<PortalFormField> hidden; // hidden inputs to echo back on submit
     // A (possibly relative) URL to follow when THIS page carries no usable login
     // form but is a redirect/landing page — e.g. a MikroTik hotspot serves an
@@ -79,7 +80,8 @@ bool looksLikeCaptivePortal(int status, const std::string& body);
 // never sent. Exposed for host testing.
 std::string buildFormBody(const PortalForm& form,
                           const std::string& username,
-                          const std::string& password);
+                          const std::string& password,
+                          const std::string& deviceType = std::string());
 
 // Compute the MikroTik hotspot CHAP login response:
 //   hex( MD5( chapId + password + chapChallenge ) )
