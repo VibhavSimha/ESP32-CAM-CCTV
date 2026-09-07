@@ -1319,7 +1319,23 @@ static void doReprobe() {
     } else if (code <= 0) {
         setStatus(s_state, "Could not reach the internet. If you have logged in via your browser, try again in a moment.");
     } else {
-        setStatus(s_state, "Still behind the captive portal. Please complete the login in your browser, then tap Check again.");
+        // The probe can flap between "transport error" and "portal redirect" on
+        // some hotspots. If we have no usable portal context yet (FAILED/UNKNOWN)
+        // or only a stale unsupported snapshot, refresh portal detection now so
+        // /portal can offer the real login route instead of staying generic.
+        bool shouldRefreshPortalContext =
+            (s_state == PORTAL_STATE_UNKNOWN) ||
+            (s_state == PORTAL_STATE_FAILED) ||
+            (s_state == PORTAL_STATE_UNSUPPORTED && !s_form.formFound) ||
+            (s_state != PORTAL_STATE_CAPTIVE &&
+             location.length() > 0 &&
+             location != s_portalUrl);
+        if (shouldRefreshPortalContext) {
+            Serial.println("[CaptivePortal] Captive probe intercepted — refreshing portal details.");
+            handleCaptiveDetected(body, location);
+        } else {
+            setStatus(s_state, "Still behind the captive portal. Please complete the login in your browser, then tap Check again.");
+        }
     }
     // Schedule the next periodic re-probe from now.
     s_periodicReprobeAt = millis() + CAPTIVE_PERIODIC_REPROBE_MS;
