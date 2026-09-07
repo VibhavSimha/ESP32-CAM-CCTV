@@ -196,8 +196,13 @@
 // detect the portal. Keep it HTTP (not HTTPS) so interception is observable.
 #define CAPTIVE_PROBE_URL           "http://connectivitycheck.gstatic.com/generate_204"
 
-// Per-request timeout (ms) for the probe and portal submit.
+// Timeout (ms) for the plain internet connectivity probe. Keep this modest so
+// offline checks fail fast and the main loop stays responsive.
 #define CAPTIVE_PROBE_TIMEOUT_MS    6000
+
+// Timeout (ms) for captive-portal landing-page fetches and login submits.
+// External HTTPS portal pages are often slower than the probe endpoint.
+#define CAPTIVE_PORTAL_HTTP_TIMEOUT_MS 12000
 
 // Give up automated submission after this many failed attempts and steer the
 // user to the manual browser fallback.
@@ -218,6 +223,11 @@
 // It only prints when a captive portal is actually detected, so it stays silent
 // on open networks. Set to 0 to disable.
 #define CAPTIVE_LOG_PORTAL_PAGE      1
+
+// Extra per-request HTTP trace logs for diagnostics (DNS lookup result/latency,
+// timeout budget, response headers, elapsed time, and short response preview).
+// Helpful when a portal seems reachable in a browser but flaky from ESP32.
+#define CAPTIVE_LOG_HTTP_TRACE       1
 
 // Some hotspots (MikroTik especially) do not serve the login form directly: the
 // first page is an rlogin-style LANDING page that only redirects to the real
