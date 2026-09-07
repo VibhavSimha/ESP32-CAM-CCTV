@@ -900,10 +900,28 @@ static void handleCaptiveDetected(const String& body, const String& location) {
         int pcode = postHop ? fetchPortalPagePost(nextUrl, postBody, page, &fetchedUrl)
                             : fetchPortalPage(nextUrl, page, &fetchedUrl);
         logFetchResult("Fetch redirect target", nextUrl, pcode, page.length());
+        if (postHop && (pcode <= 0 || page.length() == 0)) {
+            // Some external portals expose a POST landing form but still serve a
+            // usable login page on a plain GET to the same URL. If the POST hop
+            // times out/fails, retry once as GET before giving up.
+            Serial.println("[CaptivePortal] Redirect POST hop returned no page — retrying same URL via GET.");
+            page = "";
+            fetchedUrl = nextUrl;
+            int gcode = fetchPortalPage(nextUrl, page, &fetchedUrl);
+            logFetchResult("Fetch redirect target (GET fallback)", nextUrl, gcode, page.length());
+            pcode = gcode;
+        }
         if (pcode <= 0 || page.length() == 0) {
             Serial.println("[CaptivePortal] Could not fetch the redirect target — staying on manual fallback.");
-            if (isHttpsUrl(nextUrl) && pcode == HTTPC_ERROR_CONNECTION_LOST) {
-                Serial.println("[CaptivePortal] (HTTPS target dropped the connection — the portal's TLS "
+            if (pcode <= 0) {
+                setStatus(PORTAL_STATE_FAILED,
+                          String("Could not reach the captive-portal redirect target (") +
+                          httpErrorName(pcode) +
+                          "). Open the portal link in your browser, finish login, then tap Check again.");
+            }
+            if (isHttpsUrl(nextUrl) &&
+                (pcode == HTTPC_ERROR_CONNECTION_LOST || pcode == HTTPC_ERROR_READ_TIMEOUT)) {
+                Serial.println("[CaptivePortal] (HTTPS target timed out/dropped the connection — the portal's TLS "
                                "may be incompatible with the ESP32; use the /portal form or a browser.)");
             }
             break;
