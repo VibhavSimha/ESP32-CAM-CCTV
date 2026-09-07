@@ -29,6 +29,13 @@
 #define CAPTIVE_PROBE_TIMEOUT_MS 6000
 #endif
 
+// Connectivity probes should fail fast so the main loop stays responsive.
+// Portal landing/login fetches (especially HTTPS external pages) are often
+// slower, so they use a separate timeout budget.
+#ifndef CAPTIVE_PORTAL_HTTP_TIMEOUT_MS
+#define CAPTIVE_PORTAL_HTTP_TIMEOUT_MS 12000
+#endif
+
 #ifndef CAPTIVE_MAX_LOGIN_ATTEMPTS
 #define CAPTIVE_MAX_LOGIN_ATTEMPTS 3
 #endif
@@ -67,6 +74,12 @@
 // (rare), so it does not add noise on open networks.
 #ifndef CAPTIVE_LOG_PORTAL_PAGE
 #define CAPTIVE_LOG_PORTAL_PAGE 1
+#endif
+
+// Extra per-request HTTP diagnostics (DNS lookup, timeout budget, headers,
+// elapsed time). Useful when portal flows are flaky/intermittent in the field.
+#ifndef CAPTIVE_LOG_HTTP_TRACE
+#define CAPTIVE_LOG_HTTP_TRACE 1
 #endif
 
 // -----------------------------------------------------------------------------
@@ -139,6 +152,9 @@ static void setStatus(PortalState st, const String& msg) {
     s_lastMessage = msg;
 }
 
+// Forward declaration (defined later with full HTTPClient error mapping).
+static const char* httpErrorName(int code);
+
 // -----------------------------------------------------------------------------
 // URL helpers
 // -----------------------------------------------------------------------------
@@ -170,6 +186,129 @@ static String urlOrigin(const String& url) {
     int hostStart = schemeEnd + 3;
     int pathStart = url.indexOf('/', hostStart);
     return (pathStart < 0) ? url : url.substring(0, pathStart);
+}
+
+// Extract host (without port) from a URL for DNS diagnostics.
+static String urlHost(const String& url) {
+    int schemeEnd = url.indexOf("://");
+    int hostStart = (schemeEnd < 0) ? 0 : (schemeEnd + 3);
+    if (hostStart >= (int)url.length()) return "";
+
+    int hostEnd = url.indexOf('/', hostStart);
+    if (hostEnd < 0) hostEnd = url.length();
+
+    // Drop optional userinfo@ prefix if present.
+    int at = url.lastIndexOf('@', hostEnd - 1);
+    if (at >= hostStart) hostStart = at + 1;
+
+    int portSep = url.indexOf(':', hostStart);
+    if (portSep >= 0 && portSep < hostEnd) hostEnd = portSep;
+    if (hostEnd <= hostStart) return "";
+    return url.substring(hostStart, hostEnd);
+}
+
+static const char* wifiStatusName(wl_status_t st) {
+    switch (st) {
+        case WL_CONNECTED:      return "CONNECTED";
+        case WL_NO_SSID_AVAIL:  return "NO_SSID";
+        case WL_CONNECT_FAILED: return "CONNECT_FAILED";
+        case WL_CONNECTION_LOST:return "CONNECTION_LOST";
+        case WL_DISCONNECTED:   return "DISCONNECTED";
+        case WL_IDLE_STATUS:    return "IDLE";
+#ifdef WL_SCAN_COMPLETED
+        case WL_SCAN_COMPLETED: return "SCAN_COMPLETED";
+#endif
+#ifdef WL_NO_SHIELD
+        case WL_NO_SHIELD:      return "NO_SHIELD";
+#endif
+        default:                return "UNKNOWN";
+    }
+}
+
+static String cookieNameForLog(const String& setCookie) {
+    int eq = setCookie.indexOf('=');
+    if (eq <= 0) return "";
+    String name = setCookie.substring(0, eq);
+    name.trim();
+    return name;
+}
+
+static void logDnsResolution(const char* what, const String& url) {
+#if CAPTIVE_LOG_HTTP_TRACE
+    String host = urlHost(url);
+    if (host.length() == 0) return;
+    IPAddress ip;
+    unsigned long t0 = millis();
+    int ok = WiFi.hostByName(host.c_str(), ip);
+    unsigned long dt = millis() - t0;
+    if (ok == 1) {
+        Serial.printf("[CaptivePortal] %s DNS %s -> %s (%lu ms)\n",
+                      what, host.c_str(), ip.toString().c_str(), dt);
+    } else {
+        Serial.printf("[CaptivePortal] %s DNS %s -> lookup failed (%lu ms)\n",
+                      what, host.c_str(), dt);
+    }
+#else
+    (void)what;
+    (void)url;
+#endif
+}
+
+static void logHttpRequestStart(const char* what, const char* method,
+                                const String& url, int timeoutMs,
+                                bool withCookie) {
+#if CAPTIVE_LOG_HTTP_TRACE
+    wl_status_t ws = WiFi.status();
+    Serial.printf("[CaptivePortal] %s %s %s (timeout=%d ms, wifi=%d/%s, rssi=%d dBm, heap=%u, cookie=%s)\n",
+                  what, method, url.c_str(), timeoutMs, (int)ws,
+                  wifiStatusName(ws), (int)WiFi.RSSI(), (unsigned)ESP.getFreeHeap(),
+                  withCookie ? "yes" : "no");
+    logDnsResolution(what, url);
+#else
+    (void)what;
+    (void)method;
+    (void)url;
+    (void)timeoutMs;
+    (void)withCookie;
+#endif
+}
+
+static void logHttpResultDetail(const char* what, int code, unsigned long elapsedMs,
+                                size_t bodyBytes, const String& location,
+                                const String& setCookie, const String& contentType) {
+#if CAPTIVE_LOG_HTTP_TRACE
+    String cookieName = cookieNameForLog(setCookie);
+    Serial.printf("[CaptivePortal] %s result: HTTP %d (%s), elapsed=%lu ms, body=%u, location=%s, set-cookie=%s, content-type=%s\n",
+                  what, code, httpErrorName(code), elapsedMs, (unsigned)bodyBytes,
+                  location.length() ? location.c_str() : "(none)",
+                  cookieName.length() ? cookieName.c_str() : "none",
+                  contentType.length() ? contentType.c_str() : "(none)");
+#else
+    (void)what;
+    (void)code;
+    (void)elapsedMs;
+    (void)bodyBytes;
+    (void)location;
+    (void)setCookie;
+    (void)contentType;
+#endif
+}
+
+static void logBodyPreview(const char* what, const String& body, size_t maxChars = 220) {
+#if CAPTIVE_LOG_HTTP_TRACE
+    if (body.length() == 0) return;
+    String preview = body;
+    preview.replace('\n', ' ');
+    preview.replace('\r', ' ');
+    if (preview.length() > maxChars) {
+        preview = preview.substring(0, maxChars) + "...";
+    }
+    Serial.printf("[CaptivePortal] %s body preview: %s\n", what, preview.c_str());
+#else
+    (void)what;
+    (void)body;
+    (void)maxChars;
+#endif
 }
 
 static void rememberSetCookie(const String& setCookie) {
@@ -376,22 +515,28 @@ static bool isHttpRedirectCode(int code) {
 static int probeInternet(String& body, String& location) {
     body = "";
     location = "";
+    const String probeUrl = String(CAPTIVE_PROBE_URL);
+    logHttpRequestStart("Probe", "GET", probeUrl, CAPTIVE_PROBE_TIMEOUT_MS, false);
     // Declare the WiFiClient BEFORE the HTTPClient. Locals are destroyed in
     // reverse order, so this guarantees the HTTPClient (which holds a pointer to
     // the client via http.begin()) is torn down first, while the client is still
     // alive. The reverse order is a use-after-free that corrupts lwIP's pbuf
     // refcounts and later trips "assert failed: pbuf_free: p->ref > 0".
+    unsigned long t0 = millis();
     WiFiClient client;
     HTTPClient http;
     http.setConnectTimeout(CAPTIVE_PROBE_TIMEOUT_MS);
     http.setTimeout(CAPTIVE_PROBE_TIMEOUT_MS);
     http.setFollowRedirects(HTTPC_DISABLE_FOLLOW_REDIRECTS);
-    if (!http.begin(client, CAPTIVE_PROBE_URL)) {
+    if (!http.begin(client, probeUrl)) {
+        logHttpResultDetail("Probe", -1000, millis() - t0, 0, String(), String(), String());
         return -1000;
     }
-    const char* headerKeys[] = {"Location"};
-    http.collectHeaders(headerKeys, 1);
+    const char* headerKeys[] = {"Location", "Set-Cookie", "Content-Type"};
+    http.collectHeaders(headerKeys, 3);
     int code = http.GET();
+    String setCookie = (code > 0) ? http.header("Set-Cookie") : String();
+    String contentType = (code > 0) ? http.header("Content-Type") : String();
     if (code > 0) {
         location = http.header("Location");
         // Only read the body for non-204 responses (portal pages).
@@ -401,6 +546,10 @@ static int probeInternet(String& body, String& location) {
                 body = body.substring(0, CAPTIVE_MAX_PAGE_BYTES);
             }
         }
+    }
+    logHttpResultDetail("Probe", code, millis() - t0, body.length(), location, setCookie, contentType);
+    if (code > 0 && code != 204 && body.length()) {
+        logBodyPreview("Probe", body);
     }
     http.end();
     return code;
@@ -426,30 +575,39 @@ static int fetchPortalPage(const String& url, String& html, String* finalUrl = n
         WiFiClientSecure secureClient;
         WiFiClient& client = selectPortalClient(currentUrl, plainClient, secureClient);
         HTTPClient http;
-        http.setConnectTimeout(CAPTIVE_PROBE_TIMEOUT_MS);
-        http.setTimeout(CAPTIVE_PROBE_TIMEOUT_MS);
+        logHttpRequestStart("Fetch portal GET", "GET", currentUrl,
+                            CAPTIVE_PORTAL_HTTP_TIMEOUT_MS,
+                            s_portalCookie.length() > 0);
+        unsigned long t0 = millis();
+        http.setConnectTimeout(CAPTIVE_PORTAL_HTTP_TIMEOUT_MS);
+        http.setTimeout(CAPTIVE_PORTAL_HTTP_TIMEOUT_MS);
         // Follow redirects manually so each hop can pick the right transport
         // (HTTP vs HTTPS). Auto-follow can keep a plain client across an HTTPS
         // hop (or vice versa), which yields NO_HTTP_SERVER on some portals.
         http.setFollowRedirects(HTTPC_DISABLE_FOLLOW_REDIRECTS);
         if (!http.begin(client, currentUrl)) {
+            logHttpResultDetail("Fetch portal GET", -1000, millis() - t0, 0, String(), String(), String());
             if (finalUrl) *finalUrl = currentUrl;
             return -1000;
         }
-        const char* headerKeys[] = {"Set-Cookie", "Location"};
-        http.collectHeaders(headerKeys, 2);
+        const char* headerKeys[] = {"Set-Cookie", "Location", "Content-Type"};
+        http.collectHeaders(headerKeys, 3);
         if (s_portalCookie.length()) {
             http.addHeader("Cookie", s_portalCookie);
         }
         int code = http.GET();
         String location = (code > 0) ? http.header("Location") : String();
+        String setCookie = (code > 0) ? http.header("Set-Cookie") : String();
+        String contentType = (code > 0) ? http.header("Content-Type") : String();
         if (code > 0) {
-            rememberSetCookie(http.header("Set-Cookie"));
+            rememberSetCookie(setCookie);
             html = http.getString();
             if (html.length() > CAPTIVE_MAX_PAGE_BYTES) {
                 html = html.substring(0, CAPTIVE_MAX_PAGE_BYTES);
             }
         }
+        logHttpResultDetail("Fetch portal GET", code, millis() - t0, html.length(),
+                            location, setCookie, contentType);
         http.end();
 
         if (code > 0 && isHttpRedirectCode(code) && location.length()) {
@@ -506,16 +664,21 @@ static int fetchPortalPagePost(const String& url, const String& body, String& ht
         WiFiClientSecure secureClient;
         WiFiClient& client = selectPortalClient(currentUrl, plainClient, secureClient);
         HTTPClient http;
-        http.setConnectTimeout(CAPTIVE_PROBE_TIMEOUT_MS);
-        http.setTimeout(CAPTIVE_PROBE_TIMEOUT_MS);
+        logHttpRequestStart("Fetch portal redirect", usePost ? "POST" : "GET",
+                            currentUrl, CAPTIVE_PORTAL_HTTP_TIMEOUT_MS,
+                            s_portalCookie.length() > 0);
+        unsigned long t0 = millis();
+        http.setConnectTimeout(CAPTIVE_PORTAL_HTTP_TIMEOUT_MS);
+        http.setTimeout(CAPTIVE_PORTAL_HTTP_TIMEOUT_MS);
         // Follow redirects manually so each hop can switch transport scheme.
         http.setFollowRedirects(HTTPC_DISABLE_FOLLOW_REDIRECTS);
         if (!http.begin(client, currentUrl)) {
+            logHttpResultDetail("Fetch portal redirect", -1000, millis() - t0, 0, String(), String(), String());
             if (finalUrl) *finalUrl = currentUrl;
             return -1000;
         }
-        const char* headerKeys[] = {"Set-Cookie", "Location"};
-        http.collectHeaders(headerKeys, 2);
+        const char* headerKeys[] = {"Set-Cookie", "Location", "Content-Type"};
+        http.collectHeaders(headerKeys, 3);
         if (s_portalCookie.length()) {
             http.addHeader("Cookie", s_portalCookie);
         }
@@ -529,13 +692,17 @@ static int fetchPortalPagePost(const String& url, const String& body, String& ht
         }
 
         String location = (code > 0) ? http.header("Location") : String();
+        String setCookie = (code > 0) ? http.header("Set-Cookie") : String();
+        String contentType = (code > 0) ? http.header("Content-Type") : String();
         if (code > 0) {
-            rememberSetCookie(http.header("Set-Cookie"));
+            rememberSetCookie(setCookie);
             html = http.getString();
             if (html.length() > CAPTIVE_MAX_PAGE_BYTES) {
                 html = html.substring(0, CAPTIVE_MAX_PAGE_BYTES);
             }
         }
+        logHttpResultDetail("Fetch portal redirect", code, millis() - t0, html.length(),
+                            location, setCookie, contentType);
         http.end();
 
         if (code > 0 && isHttpRedirectCode(code) && location.length()) {
@@ -833,6 +1000,11 @@ static bool submitPortalLogin(const String& username, const String& password, St
     Serial.printf("[CaptivePortal] Submitting login to %s (method %s, %s)\n",
                   actionUrl.c_str(), s_form.method.c_str(),
                   isHttpsUrl(actionUrl) ? "https" : "http");
+    Serial.printf("[CaptivePortal] Login payload stats: bytes=%u hidden=%u userField='%s'(len=%u) passField='%s'(len=%u) deviceField='%s'\n",
+                  (unsigned)body.length(), (unsigned)s_form.hidden.size(),
+                  s_form.userField.c_str(), (unsigned)username.length(),
+                  s_form.passField.c_str(), (unsigned)password.length(),
+                  s_form.deviceTypeField.size() ? s_form.deviceTypeField.c_str() : "(none)");
 
     if (isHttpsUrl(actionUrl) && ESP.getFreeHeap() < CAPTIVE_MIN_HEAP_FOR_TLS) {
         Serial.printf("[CaptivePortal] Skipping HTTPS login submit — free heap %u < %lu needed for TLS.\n",
@@ -847,16 +1019,26 @@ static bool submitPortalLogin(const String& username, const String& password, St
     WiFiClientSecure secureClient;
     WiFiClient& client = selectPortalClient(actionUrl, plainClient, secureClient);
     HTTPClient http;
-    http.setConnectTimeout(CAPTIVE_PROBE_TIMEOUT_MS);
-    http.setTimeout(CAPTIVE_PROBE_TIMEOUT_MS);
+    http.setConnectTimeout(CAPTIVE_PORTAL_HTTP_TIMEOUT_MS);
+    http.setTimeout(CAPTIVE_PORTAL_HTTP_TIMEOUT_MS);
     http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
+    unsigned long t0 = millis();
 
     int code;
     if (s_form.method == "get") {
         String url = actionUrl + (actionUrl.indexOf('?') >= 0 ? "&" : "?") + body;
-        if (!http.begin(client, url)) { outMsg = "Could not connect to the portal."; return false; }
-        const char* headerKeys[] = {"Set-Cookie"};
-        http.collectHeaders(headerKeys, 1);
+        Serial.printf("[CaptivePortal] Portal login GET query bytes=%u (credentials redacted)\n",
+                      (unsigned)body.length());
+        logHttpRequestStart("Portal login submit", "GET", actionUrl,
+                            CAPTIVE_PORTAL_HTTP_TIMEOUT_MS,
+                            s_portalCookie.length() > 0);
+        if (!http.begin(client, url)) {
+            logHttpResultDetail("Portal login submit", -1000, millis() - t0, 0, String(), String(), String());
+            outMsg = "Could not connect to the portal.";
+            return false;
+        }
+        const char* headerKeys[] = {"Set-Cookie", "Location", "Content-Type"};
+        http.collectHeaders(headerKeys, 3);
         if (s_portalCookie.length()) {
             http.addHeader("Cookie", s_portalCookie);
         }
@@ -865,9 +1047,16 @@ static bool submitPortalLogin(const String& username, const String& password, St
         }
         code = http.GET();
     } else {
-        if (!http.begin(client, actionUrl)) { outMsg = "Could not connect to the portal."; return false; }
-        const char* headerKeys[] = {"Set-Cookie"};
-        http.collectHeaders(headerKeys, 1);
+        logHttpRequestStart("Portal login submit", "POST", actionUrl,
+                            CAPTIVE_PORTAL_HTTP_TIMEOUT_MS,
+                            s_portalCookie.length() > 0);
+        if (!http.begin(client, actionUrl)) {
+            logHttpResultDetail("Portal login submit", -1000, millis() - t0, 0, String(), String(), String());
+            outMsg = "Could not connect to the portal.";
+            return false;
+        }
+        const char* headerKeys[] = {"Set-Cookie", "Location", "Content-Type"};
+        http.collectHeaders(headerKeys, 3);
         if (s_portalCookie.length()) {
             http.addHeader("Cookie", s_portalCookie);
         }
@@ -885,13 +1074,26 @@ static bool submitPortalLogin(const String& username, const String& password, St
         }
         code = http.POST(body);
     }
+    String setCookie = (code > 0) ? http.header("Set-Cookie") : String();
+    String location = (code > 0) ? http.header("Location") : String();
+    String contentType = (code > 0) ? http.header("Content-Type") : String();
+    String responseBody;
     if (code < 0) {
         Serial.printf("[CaptivePortal] Portal login response: HTTP %d (%s)\n", code, httpErrorName(code));
     } else {
         Serial.printf("[CaptivePortal] Portal login response: HTTP %d\n", code);
     }
     if (code > 0) {
-        rememberSetCookie(http.header("Set-Cookie"));
+        rememberSetCookie(setCookie);
+        responseBody = http.getString();
+        if (responseBody.length() > 4096) {
+            responseBody = responseBody.substring(0, 4096);
+        }
+    }
+    logHttpResultDetail("Portal login submit", code, millis() - t0, responseBody.length(),
+                        location, setCookie, contentType);
+    if (code > 0) {
+        logBodyPreview("Portal login submit", responseBody);
     }
     http.end();
 
@@ -987,9 +1189,11 @@ static void buildPortalDiagnostics(String& d) {
     d += "-- config (captive portal) --\n";
     d += "probeUrl        : "; d += CAPTIVE_PROBE_URL; d += "\n";
     d += "probeTimeout_ms : "; d += (int)CAPTIVE_PROBE_TIMEOUT_MS; d += "\n";
+    d += "portalTimeout_ms: "; d += (int)CAPTIVE_PORTAL_HTTP_TIMEOUT_MS; d += "\n";
     d += "maxLoginAttempts: "; d += (int)CAPTIVE_MAX_LOGIN_ATTEMPTS; d += "\n";
     d += "maxRedirectHops : "; d += (int)CAPTIVE_MAX_REDIRECT_HOPS; d += "\n";
     d += "logPortalPage   : "; d += (int)CAPTIVE_LOG_PORTAL_PAGE; d += "\n";
+    d += "logHttpTrace    : "; d += (int)CAPTIVE_LOG_HTTP_TRACE; d += "\n";
 }
 
 static esp_err_t portal_diag_handler(httpd_req_t* req) {

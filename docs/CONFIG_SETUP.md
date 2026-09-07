@@ -150,11 +150,13 @@ is reachable:
 | --- | --- | --- |
 | `ENABLE_CAPTIVE_PORTAL_LOGIN` | `1` | Set to `0` to disable the whole feature (cloud uploads are then never gated). |
 | `CAPTIVE_PROBE_URL` | `http://connectivitycheck.gstatic.com/generate_204` | Plain-HTTP 204 probe used to detect interception. |
-| `CAPTIVE_PROBE_TIMEOUT_MS` | `6000` | Per-request timeout for the probe/submit. |
+| `CAPTIVE_PROBE_TIMEOUT_MS` | `6000` | Timeout for the connectivity probe (`CAPTIVE_PROBE_URL`), kept short so offline checks fail fast. |
+| `CAPTIVE_PORTAL_HTTP_TIMEOUT_MS` | `12000` | Timeout for captive-portal landing-page fetches and login submits (often slower, especially HTTPS external portals). |
 | `CAPTIVE_MAX_LOGIN_ATTEMPTS` | `3` | Attempts before steering the user to the manual browser fallback. |
 | `CAPTIVE_PERIODIC_REPROBE_MS` | `30000` | Heartbeat cadence while **offline** (waiting for the portal login). |
 | `CAPTIVE_ONLINE_HEARTBEAT_MS` | `60000` | Heartbeat cadence while **online** (to catch a portal that re-appears). |
 | `CAPTIVE_LOG_PORTAL_PAGE` | `1` | Dump the full fetched portal login page to the serial console when a portal is detected (diagnostic — see the exact HTML/fields to parse). Set to `0` to silence. |
+| `CAPTIVE_LOG_HTTP_TRACE` | `1` | Emit per-request HTTP trace diagnostics (DNS result/latency, timeout used, response metadata, elapsed time, short response preview). |
 | `CAPTIVE_MAX_REDIRECT_HOPS` | `3` | How many landing-page redirects (`<meta refresh>` / JS `location` / "continue" link / auto-submitted `<form name="redirect">`, GET or POST) the firmware will follow to reach the real login form (issues #44, #46). |
 | `CAPTIVE_MIN_HEAP_FOR_TLS` | `60000` | Minimum free heap (bytes) before the firmware opens a **TLS** connection to follow/submit an `https://` portal page. Below this the HTTPS hop is skipped (to avoid a brown-out) and the manual-browser fallback is used (issue #48). |
 
