@@ -99,6 +99,10 @@ static String      s_formPageUrl;
 static String      s_portalCookie;
 static String      s_lastMessage;      // human-readable status for the UI
 static int         s_attempts = 0;
+// Last non-zero station IP seen while connected. Some captive networks briefly
+// make WiFi.localIP() read as 0.0.0.0 during reprobes/reconnect churn; keep a
+// stable fallback so operator guidance never prints an unusable /portal URL.
+static IPAddress   s_lastGoodLocalIp;
 static bool        s_reprobePending = false;
 static unsigned long s_reprobeAt = 0;
 // Set by the /portal/reprobe HTTP handler ("Check again" button) so the actual
@@ -158,6 +162,23 @@ static const char* httpErrorName(int code);
 // -----------------------------------------------------------------------------
 // URL helpers
 // -----------------------------------------------------------------------------
+
+static String bestEffortDeviceIpForPortal() {
+    IPAddress ip = WiFi.localIP();
+    if ((uint32_t)ip != 0) {
+        s_lastGoodLocalIp = ip;
+        return ip.toString();
+    }
+    if ((uint32_t)s_lastGoodLocalIp != 0) {
+        return s_lastGoodLocalIp.toString();
+    }
+    // Last fallback: if a softAP is active, that address is at least reachable.
+    IPAddress ap = WiFi.softAPIP();
+    if ((uint32_t)ap != 0) {
+        return ap.toString();
+    }
+    return ip.toString();
+}
 
 // Resolve a (possibly relative) form action against the portal page URL.
 static String resolveActionUrl(const String& base, const String& action) {
@@ -397,7 +418,7 @@ static String bestEffortPortalUrl() {
 // the per-MAC "already logged in" gotcha so operators do not waste time logging
 // in on the wrong device (issue #44).
 static void printPortalInstructions() {
-    String ip  = WiFi.localIP().toString();
+    String ip  = bestEffortDeviceIpForPortal();
     String mac = WiFi.macAddress();
     Serial.println();
     Serial.println("========= ACTION REQUIRED: Wi-Fi captive-portal login =========");
@@ -965,8 +986,9 @@ void captivePortalBegin() {
         // the /portal helper never points back at the device itself (issue #46).
         if (s_portalUrl.length() == 0) s_portalUrl = bestEffortPortalUrl();
         Serial.println("[CaptivePortal] Probe failed (network/DNS). Staying recoverable.");
+        String helperIp = bestEffortDeviceIpForPortal();
         Serial.printf("[CaptivePortal] Cloud uploads paused. Open http://%s/portal on another "
-                      "device to check/retry.\n", WiFi.localIP().toString().c_str());
+                      "device to check/retry.\n", helperIp.c_str());
         return;
     }
 
@@ -1399,8 +1421,9 @@ static void onlineHeartbeat() {
         // Give the manual fallback a working link (gateway root) rather than a
         // possibly-stale/empty URL (issue #46).
         if (s_portalUrl.length() == 0) s_portalUrl = bestEffortPortalUrl();
+        String helperIp = bestEffortDeviceIpForPortal();
         Serial.printf("[CaptivePortal] Cloud uploads paused. Open http://%s/portal on "
-                      "another device to check/retry.\n", WiFi.localIP().toString().c_str());
+                      "another device to check/retry.\n", helperIp.c_str());
     }
 }
 
@@ -1638,9 +1661,10 @@ void captivePortalLoop() {
             if (!captivePortalIsOnline()) {
                 // Still offline — remind the operator, with the exact URL, how to
                 // clear the portal from another device.
+                String helperIp = bestEffortDeviceIpForPortal();
                 Serial.printf("[CaptivePortal] Still offline. Open http://%s/portal on a "
                               "phone/laptop on this Wi-Fi to log in.\n",
-                              WiFi.localIP().toString().c_str());
+                              helperIp.c_str());
             }
         }
     } else if (online && WiFi.status() == WL_CONNECTED) {
