@@ -1127,8 +1127,34 @@ static void doRedetectAndSubmit() {
                       "finish the login in your browser, then tap Check again.");
         }
     } else {
-        setStatus(PORTAL_STATE_FAILED,
-                  "Could not reach the portal to submit your login. Please try again in a moment.");
+        // The internet-probe endpoint can time out on some captive networks before
+        // login, even though the gateway portal itself is reachable. If that
+        // happens while the operator has explicitly submitted credentials, fall
+        // back to a direct portal fetch (known URL or gateway root) instead of
+        // bailing out immediately with "could not reach portal".
+        String fallbackUrl = s_portalUrl.length() ? s_portalUrl : bestEffortPortalUrl();
+        if (fallbackUrl.length()) {
+            Serial.printf("[CaptivePortal] Manual submit: probe endpoint unreachable; trying direct portal fetch: %s\n",
+                          fallbackUrl.c_str());
+            handleCaptiveDetected(String(), fallbackUrl);
+            if (s_state == PORTAL_STATE_CAPTIVE && s_form.valid) {
+                setStatus(PORTAL_STATE_SUBMITTED, "Login form found — submitting your credentials…");
+                String msg;
+                bool sent = submitPortalLogin(s_pendingUser, s_pendingPass, msg);
+                if (sent) {
+                    s_reprobePending = true;
+                    s_reprobeAt = millis() + 1500;
+                    setStatus(PORTAL_STATE_SUBMITTED, "Credentials submitted — verifying connectivity…");
+                } else {
+                    setStatus(PORTAL_STATE_FAILED, msg);
+                }
+            }
+            // Else: keep the status set by handleCaptiveDetected() (usually
+            // UNSUPPORTED with manual-browser guidance).
+        } else {
+            setStatus(PORTAL_STATE_FAILED,
+                      "Could not reach the portal to submit your login. Please try again in a moment.");
+        }
     }
 
     wipePendingCredentials();
