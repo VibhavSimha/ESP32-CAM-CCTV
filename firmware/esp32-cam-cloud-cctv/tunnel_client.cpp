@@ -214,6 +214,10 @@ void handleTunnel() {
   }
 }
 
+void tunnelStopNow() {
+  tunnelStop();
+}
+
 bool isTunnelSlotBusy() {
   return tunnelBusy();
 }

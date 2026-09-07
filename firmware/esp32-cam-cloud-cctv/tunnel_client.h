@@ -1,6 +1,7 @@
 #pragma once
 
 void tunnelBegin();
+void tunnelStopNow();
 void handleTunnel();
 // Returns true when the bore tunnel has at least one proxy slot actively
 // handling a remote connection. Use this to defer heap-intensive background

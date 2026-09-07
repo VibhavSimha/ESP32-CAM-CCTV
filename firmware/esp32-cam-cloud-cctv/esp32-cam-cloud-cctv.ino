@@ -66,6 +66,8 @@ static void logConfigStatus() {
     Serial.println("===========================================================");
 }
 
+static bool g_tunnelStarted = false;
+
 void setup() {
     Serial.begin(115200);
     Serial.setDebugOutput(true);
@@ -115,8 +117,15 @@ void setup() {
     // 6. Start Local Stream Server
     startCameraServer();
 
-    // 7. Initialize Localtunnel
-    tunnelBegin();
+    // 7. Initialize the remote tunnel only when internet reachability is
+    // confirmed. Behind a captive portal this is deferred until login succeeds.
+    if (captivePortalIsOnline()) {
+        tunnelBegin();
+        g_tunnelStarted = true;
+    } else {
+        Serial.println("[Tunnel] Internet not reachable yet (captive portal/offline). "
+                       "Deferring tunnel startup.");
+    }
 
     // 8. Initialize PIR Motion Sensor (no-op when ENABLE_PIR_MOTION == 0)
     setupPIR();
@@ -131,8 +140,20 @@ void loop() {
         Serial.printf("[Heartbeat] Uptime: %lu ms. Free Heap: %u\n", millis(), ESP.getFreeHeap());
     }
 
-    // Keep localtunnel alive
-    handleTunnel();
+    // Keep tunnel alive only when internet connectivity is confirmed. Otherwise
+    // keep it paused so captive-portal logins are not disrupted by tunnel retries.
+    if (captivePortalIsOnline()) {
+        if (!g_tunnelStarted) {
+            Serial.println("[Tunnel] Internet reachable again. Starting deferred tunnel.");
+            tunnelBegin();
+            g_tunnelStarted = true;
+        }
+        handleTunnel();
+    } else if (g_tunnelStarted) {
+        Serial.println("[Tunnel] Internet no longer reachable. Pausing tunnel until portal login succeeds.");
+        tunnelStopNow();
+        g_tunnelStarted = false;
+    }
 
     // Post-connect captive-portal state machine tick (verify/recover). No-op
     // unless a portal login was just submitted.
