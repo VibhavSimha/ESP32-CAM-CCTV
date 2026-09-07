@@ -99,6 +99,10 @@ static String      s_formPageUrl;
 static String      s_portalCookie;
 static String      s_lastMessage;      // human-readable status for the UI
 static int         s_attempts = 0;
+// Last non-zero station IP seen while connected. Some captive networks briefly
+// make WiFi.localIP() read as 0.0.0.0 during reprobes/reconnect churn; keep a
+// stable fallback so operator guidance never prints an unusable /portal URL.
+static IPAddress   s_lastGoodLocalIp;
 static bool        s_reprobePending = false;
 static unsigned long s_reprobeAt = 0;
 // Set by the /portal/reprobe HTTP handler ("Check again" button) so the actual
@@ -147,17 +151,41 @@ bool captivePortalIsOnline() {
 #endif
 }
 
+// Forward declarations (defined later in this file).
+static const char* stateName(PortalState st);
+static const char* httpErrorName(int code);
+
 static void setStatus(PortalState st, const String& msg) {
+    PortalState prev = s_state;
+    String prevMsg = s_lastMessage;
     s_state = st;
     s_lastMessage = msg;
+    if (prev != st || prevMsg != msg) {
+        Serial.printf("[CaptivePortal] State transition: %s -> %s | %s\n",
+                      stateName(prev), stateName(st), msg.c_str());
+    }
 }
-
-// Forward declaration (defined later with full HTTPClient error mapping).
-static const char* httpErrorName(int code);
 
 // -----------------------------------------------------------------------------
 // URL helpers
 // -----------------------------------------------------------------------------
+
+static String bestEffortDeviceIpForPortal() {
+    IPAddress ip = WiFi.localIP();
+    if ((uint32_t)ip != 0) {
+        s_lastGoodLocalIp = ip;
+        return ip.toString();
+    }
+    if ((uint32_t)s_lastGoodLocalIp != 0) {
+        return s_lastGoodLocalIp.toString();
+    }
+    // Last fallback: if a softAP is active, that address is at least reachable.
+    IPAddress ap = WiFi.softAPIP();
+    if ((uint32_t)ap != 0) {
+        return ap.toString();
+    }
+    return ip.toString();
+}
 
 // Resolve a (possibly relative) form action against the portal page URL.
 static String resolveActionUrl(const String& base, const String& action) {
@@ -273,6 +301,18 @@ static void logHttpRequestStart(const char* what, const char* method,
 #endif
 }
 
+static void logHttpFailureSnapshot(const char* what, int code) {
+    if (code >= 0) return;
+    wl_status_t ws = WiFi.status();
+    String localIp = WiFi.localIP().toString();
+    String helperIp = bestEffortDeviceIpForPortal();
+    Serial.printf("[CaptivePortal] %s failure snapshot: wifi=%d/%s local-ip=%s helper-ip=%s gateway=%s dns0=%s dns1=%s rssi=%d heap=%u\n",
+                  what, (int)ws, wifiStatusName(ws), localIp.c_str(),
+                  helperIp.c_str(), WiFi.gatewayIP().toString().c_str(),
+                  WiFi.dnsIP(0).toString().c_str(), WiFi.dnsIP(1).toString().c_str(),
+                  (int)WiFi.RSSI(), (unsigned)ESP.getFreeHeap());
+}
+
 static void logHttpResultDetail(const char* what, int code, unsigned long elapsedMs,
                                 size_t bodyBytes, const String& location,
                                 const String& setCookie, const String& contentType) {
@@ -283,6 +323,9 @@ static void logHttpResultDetail(const char* what, int code, unsigned long elapse
                   location.length() ? location.c_str() : "(none)",
                   cookieName.length() ? cookieName.c_str() : "none",
                   contentType.length() ? contentType.c_str() : "(none)");
+    if (code < 0) {
+        logHttpFailureSnapshot(what, code);
+    }
 #else
     (void)what;
     (void)code;
@@ -397,7 +440,7 @@ static String bestEffortPortalUrl() {
 // the per-MAC "already logged in" gotcha so operators do not waste time logging
 // in on the wrong device (issue #44).
 static void printPortalInstructions() {
-    String ip  = WiFi.localIP().toString();
+    String ip  = bestEffortDeviceIpForPortal();
     String mac = WiFi.macAddress();
     Serial.println();
     Serial.println("========= ACTION REQUIRED: Wi-Fi captive-portal login =========");
@@ -500,6 +543,11 @@ static void logFetchResult(const char* what, const String& url, int code, size_t
         Serial.printf("[CaptivePortal] %s [%s] -> HTTP %d (%s), %u bytes\n",
                       what, isHttpsUrl(url) ? "https" : "http", code,
                       httpErrorName(code), (unsigned)bytes);
+        if (isHttpsUrl(url)) {
+            Serial.printf("[CaptivePortal] %s HTTPS detail: code=%d(%s) heap=%u minTlsHeap=%lu\n",
+                          what, code, httpErrorName(code), (unsigned)ESP.getFreeHeap(),
+                          (unsigned long)CAPTIVE_MIN_HEAP_FOR_TLS);
+        }
     } else {
         Serial.printf("[CaptivePortal] %s [%s] -> HTTP %d, %u bytes\n",
                       what, isHttpsUrl(url) ? "https" : "http", code, (unsigned)bytes);
@@ -871,6 +919,9 @@ static void handleCaptiveDetected(const String& body, const String& location) {
             redirectForm.hidden = s_form.redirectFields;
             postBody = String(buildFormBody(redirectForm, std::string(), std::string()).c_str());
         }
+        Serial.printf("[CaptivePortal] Redirect hop trace: hop=%d method=%s from=%s to=%s hidden=%u bodyBytes=%u\n",
+                      hop + 1, postHop ? "POST" : "GET", currentUrl.c_str(), nextUrl.c_str(),
+                      (unsigned)s_form.redirectFields.size(), (unsigned)postBody.length());
         Serial.printf("[CaptivePortal] Landing page redirects (no login form here) — following hop %d via %s: %s\n",
                       hop + 1, postHop ? "POST" : "GET", nextUrl.c_str());
 
@@ -878,11 +929,33 @@ static void handleCaptiveDetected(const String& body, const String& location) {
         String fetchedUrl = nextUrl;
         int pcode = postHop ? fetchPortalPagePost(nextUrl, postBody, page, &fetchedUrl)
                             : fetchPortalPage(nextUrl, page, &fetchedUrl);
+        Serial.printf("[CaptivePortal] Redirect hop result: hop=%d code=%d finalUrl=%s bytes=%u\n",
+                      hop + 1, pcode, fetchedUrl.c_str(), (unsigned)page.length());
         logFetchResult("Fetch redirect target", nextUrl, pcode, page.length());
+        if (postHop && (pcode <= 0 || page.length() == 0)) {
+            // Some external portals expose a POST landing form but still serve a
+            // usable login page on a plain GET to the same URL. If the POST hop
+            // times out/fails, retry once as GET before giving up.
+            Serial.println("[CaptivePortal] Redirect POST hop returned no page — retrying same URL via GET.");
+            page = "";
+            fetchedUrl = nextUrl;
+            int gcode = fetchPortalPage(nextUrl, page, &fetchedUrl);
+            Serial.printf("[CaptivePortal] Redirect hop GET-fallback result: hop=%d code=%d finalUrl=%s bytes=%u\n",
+                          hop + 1, gcode, fetchedUrl.c_str(), (unsigned)page.length());
+            logFetchResult("Fetch redirect target (GET fallback)", nextUrl, gcode, page.length());
+            pcode = gcode;
+        }
         if (pcode <= 0 || page.length() == 0) {
             Serial.println("[CaptivePortal] Could not fetch the redirect target — staying on manual fallback.");
-            if (isHttpsUrl(nextUrl) && pcode == HTTPC_ERROR_CONNECTION_LOST) {
-                Serial.println("[CaptivePortal] (HTTPS target dropped the connection — the portal's TLS "
+            if (pcode <= 0) {
+                setStatus(PORTAL_STATE_FAILED,
+                          String("Could not reach the captive-portal redirect target (") +
+                          httpErrorName(pcode) +
+                          "). Open the portal link in your browser, finish login, then tap Check again.");
+            }
+            if (isHttpsUrl(nextUrl) &&
+                (pcode == HTTPC_ERROR_CONNECTION_LOST || pcode == HTTPC_ERROR_READ_TIMEOUT)) {
+                Serial.println("[CaptivePortal] (HTTPS target timed out/dropped the connection — the portal's TLS "
                                "may be incompatible with the ESP32; use the /portal form or a browser.)");
             }
             break;
@@ -965,8 +1038,9 @@ void captivePortalBegin() {
         // the /portal helper never points back at the device itself (issue #46).
         if (s_portalUrl.length() == 0) s_portalUrl = bestEffortPortalUrl();
         Serial.println("[CaptivePortal] Probe failed (network/DNS). Staying recoverable.");
+        String helperIp = bestEffortDeviceIpForPortal();
         Serial.printf("[CaptivePortal] Cloud uploads paused. Open http://%s/portal on another "
-                      "device to check/retry.\n", WiFi.localIP().toString().c_str());
+                      "device to check/retry.\n", helperIp.c_str());
         return;
     }
 
@@ -990,6 +1064,12 @@ static bool submitPortalLogin(const String& username, const String& password, St
     // to s_portalUrl when no distinct form-page URL was recorded.
     String base = s_formPageUrl.length() ? s_formPageUrl : s_portalUrl;
     String actionUrl = resolveActionUrl(base, String(s_form.action.c_str()));
+    Serial.printf("[CaptivePortal] Submit route: portalUrl=%s formPageUrl=%s base=%s action=%s method=%s\n",
+                  s_portalUrl.length() ? s_portalUrl.c_str() : "(none)",
+                  s_formPageUrl.length() ? s_formPageUrl.c_str() : "(none)",
+                  base.length() ? base.c_str() : "(none)",
+                  actionUrl.length() ? actionUrl.c_str() : "(none)",
+                  s_form.method.size() ? s_form.method.c_str() : "(none)");
     String deviceType = bestEffortDeviceName();
     std::string bodyStd = buildFormBody(s_form,
                                         std::string(username.c_str(), username.length()),
@@ -1399,8 +1479,9 @@ static void onlineHeartbeat() {
         // Give the manual fallback a working link (gateway root) rather than a
         // possibly-stale/empty URL (issue #46).
         if (s_portalUrl.length() == 0) s_portalUrl = bestEffortPortalUrl();
+        String helperIp = bestEffortDeviceIpForPortal();
         Serial.printf("[CaptivePortal] Cloud uploads paused. Open http://%s/portal on "
-                      "another device to check/retry.\n", WiFi.localIP().toString().c_str());
+                      "another device to check/retry.\n", helperIp.c_str());
     }
 }
 
@@ -1638,9 +1719,10 @@ void captivePortalLoop() {
             if (!captivePortalIsOnline()) {
                 // Still offline — remind the operator, with the exact URL, how to
                 // clear the portal from another device.
+                String helperIp = bestEffortDeviceIpForPortal();
                 Serial.printf("[CaptivePortal] Still offline. Open http://%s/portal on a "
                               "phone/laptop on this Wi-Fi to log in.\n",
-                              WiFi.localIP().toString().c_str());
+                              helperIp.c_str());
             }
         }
     } else if (online && WiFi.status() == WL_CONNECTED) {
