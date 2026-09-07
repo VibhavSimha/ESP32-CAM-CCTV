@@ -216,6 +216,22 @@ static String urlOrigin(const String& url) {
     return (pathStart < 0) ? url : url.substring(0, pathStart);
 }
 
+// True when `url` points at an origin root (no path or "/").
+static bool urlPathIsRoot(const String& url) {
+    int schemeEnd = url.indexOf("://");
+    int hostStart = (schemeEnd < 0) ? 0 : (schemeEnd + 3);
+    int pathStart = url.indexOf('/', hostStart);
+    if (pathStart < 0) return true; // origin with no explicit path
+
+    int pathEnd = url.indexOf('?', pathStart);
+    int frag = url.indexOf('#', pathStart);
+    if (pathEnd < 0 || (frag >= 0 && frag < pathEnd)) pathEnd = frag;
+    if (pathEnd < 0) pathEnd = url.length();
+
+    String path = url.substring(pathStart, pathEnd);
+    return path.length() == 0 || path == "/";
+}
+
 // Extract host (without port) from a URL for DNS diagnostics.
 static String urlHost(const String& url) {
     int schemeEnd = url.indexOf("://");
@@ -872,9 +888,28 @@ static void handleCaptiveDetected(const String& body, const String& location) {
         String fetchedUrl = currentUrl;
         int pcode = fetchPortalPage(currentUrl, page, &fetchedUrl);
         logFetchResult("Fetch portal page", currentUrl, pcode, page.length());
+        // Some hotspots refuse plain GET / on the gateway while still serving the
+        // real portal at /login. When probe fallback lands on http://<gw>/ and the
+        // first fetch returns no page, try /login once before giving up.
+        if ((pcode <= 0 || page.length() == 0) && urlPathIsRoot(currentUrl)) {
+            String loginUrl = resolveActionUrl(currentUrl, "/login");
+            if (loginUrl != currentUrl) {
+                Serial.printf("[CaptivePortal] Root portal URL returned no page; trying %s\n",
+                              loginUrl.c_str());
+                String loginPage;
+                String loginFetchedUrl = loginUrl;
+                int lcode = fetchPortalPage(loginUrl, loginPage, &loginFetchedUrl);
+                logFetchResult("Fetch portal page fallback", loginUrl, lcode, loginPage.length());
+                if (loginPage.length()) {
+                    page = loginPage;
+                    fetchedUrl = loginFetchedUrl;
+                }
+            }
+        }
         if (page.length()) {
             html = page;
             currentUrl = fetchedUrl;
+            s_portalUrl = fetchedUrl;
         }
     }
 
