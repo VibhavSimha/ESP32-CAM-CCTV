@@ -216,6 +216,22 @@ static String urlOrigin(const String& url) {
     return (pathStart < 0) ? url : url.substring(0, pathStart);
 }
 
+// True when `url` points at an origin root (no path or "/").
+static bool urlPathIsRoot(const String& url) {
+    int schemeEnd = url.indexOf("://");
+    int hostStart = (schemeEnd < 0) ? 0 : (schemeEnd + 3);
+    int pathStart = url.indexOf('/', hostStart);
+    if (pathStart < 0) return true; // origin with no explicit path
+
+    int pathEnd = url.indexOf('?', pathStart);
+    int frag = url.indexOf('#', pathStart);
+    if (pathEnd < 0 || (frag >= 0 && frag < pathEnd)) pathEnd = frag;
+    if (pathEnd < 0) pathEnd = url.length();
+
+    String path = url.substring(pathStart, pathEnd);
+    return path.length() == 0 || path == "/";
+}
+
 // Extract host (without port) from a URL for DNS diagnostics.
 static String urlHost(const String& url) {
     int schemeEnd = url.indexOf("://");
@@ -872,9 +888,28 @@ static void handleCaptiveDetected(const String& body, const String& location) {
         String fetchedUrl = currentUrl;
         int pcode = fetchPortalPage(currentUrl, page, &fetchedUrl);
         logFetchResult("Fetch portal page", currentUrl, pcode, page.length());
+        // Some hotspots refuse plain GET / on the gateway while still serving the
+        // real portal at /login. When probe fallback lands on http://<gw>/ and the
+        // first fetch returns no page, try /login once before giving up.
+        if ((pcode <= 0 || page.length() == 0) && urlPathIsRoot(currentUrl)) {
+            String loginUrl = resolveActionUrl(currentUrl, "/login");
+            if (loginUrl != currentUrl) {
+                Serial.printf("[CaptivePortal] Root portal URL returned no page; trying %s\n",
+                              loginUrl.c_str());
+                String loginPage;
+                String loginFetchedUrl = loginUrl;
+                int lcode = fetchPortalPage(loginUrl, loginPage, &loginFetchedUrl);
+                logFetchResult("Fetch portal page fallback", loginUrl, lcode, loginPage.length());
+                if (loginPage.length()) {
+                    page = loginPage;
+                    fetchedUrl = loginFetchedUrl;
+                }
+            }
+        }
         if (page.length()) {
             html = page;
             currentUrl = fetchedUrl;
+            s_portalUrl = fetchedUrl;
         }
     }
 
@@ -1319,7 +1354,23 @@ static void doReprobe() {
     } else if (code <= 0) {
         setStatus(s_state, "Could not reach the internet. If you have logged in via your browser, try again in a moment.");
     } else {
-        setStatus(s_state, "Still behind the captive portal. Please complete the login in your browser, then tap Check again.");
+        // The probe can flap between "transport error" and "portal redirect" on
+        // some hotspots. If we have no usable portal context yet (FAILED/UNKNOWN)
+        // or only a stale unsupported snapshot, refresh portal detection now so
+        // /portal can offer the real login route instead of staying generic.
+        bool shouldRefreshPortalContext =
+            (s_state == PORTAL_STATE_UNKNOWN) ||
+            (s_state == PORTAL_STATE_FAILED) ||
+            (s_state == PORTAL_STATE_UNSUPPORTED && !s_form.formFound) ||
+            (s_state != PORTAL_STATE_CAPTIVE &&
+             location.length() > 0 &&
+             location != s_portalUrl);
+        if (shouldRefreshPortalContext) {
+            Serial.println("[CaptivePortal] Captive probe intercepted — refreshing portal details.");
+            handleCaptiveDetected(body, location);
+        } else {
+            setStatus(s_state, "Still behind the captive portal. Please complete the login in your browser, then tap Check again.");
+        }
     }
     // Schedule the next periodic re-probe from now.
     s_periodicReprobeAt = millis() + CAPTIVE_PERIODIC_REPROBE_MS;
