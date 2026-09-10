@@ -51,7 +51,7 @@ volatile int active_stream_clients = 0;
 // Global, NVS-persisted flash (LED) state. This is a GLOBAL setting: it applies
 // whether or not a client is connected and survives client disconnect + reboot.
 // -----------------------------------------------------------------------------
-static bool g_flash_on = false;
+static volatile bool g_flash_on = false;
 
 static void flashApply(bool on) {
     pinMode(FLASH_GPIO, OUTPUT);
@@ -207,8 +207,12 @@ static esp_err_t stream_handler(httpd_req_t *req) {
 
         int64_t fr_end = esp_timer_get_time();
         int64_t frame_time = (fr_end - fr_start) / 1000;
-        if (frame_time < 150) {
-            vTaskDelay((150 - frame_time) / portTICK_PERIOD_MS);
+        // Flash ON usually increases JPEG payload size, which can trigger WAN
+        // backpressure on bore. Pace a bit slower in that mode to reduce
+        // watchdog-triggered proxy kills and keep the stream alive.
+        int64_t target_frame_ms = g_flash_on ? 220 : 150;
+        if (frame_time < target_frame_ms) {
+            vTaskDelay((target_frame_ms - frame_time) / portTICK_PERIOD_MS);
         } else {
             vTaskDelay(10 / portTICK_PERIOD_MS);
         }

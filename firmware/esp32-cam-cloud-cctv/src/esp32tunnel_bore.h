@@ -29,6 +29,20 @@
 #define BORE_MAX_PROXY 2
 #endif
 
+// Watchdog thresholds (ms): detect likely stalls quickly, but only force-kill if
+// the condition persists through an extra grace window.
+#ifndef BORE_BP_STUCK_MS
+#define BORE_BP_STUCK_MS 8000UL
+#endif
+
+#ifndef BORE_FROZEN_MS
+#define BORE_FROZEN_MS 12000UL
+#endif
+
+#ifndef BORE_WATCHDOG_GRACE_MS
+#define BORE_WATCHDOG_GRACE_MS 6000UL
+#endif
+
 // ---------------------------------------------------------------------------
 // MARK: State
 // ---------------------------------------------------------------------------
@@ -50,6 +64,8 @@ static volatile unsigned long _slotLastActive[BORE_MAX_PROXY] = {0};
 static volatile bool _slotWatchdogArmed[BORE_MAX_PROXY] = {false};
 static volatile bool _slotBackpressured[BORE_MAX_PROXY] = {false};
 static volatile unsigned long _slotBackpressureSince[BORE_MAX_PROXY] = {0};
+static volatile unsigned long _slotStallSince[BORE_MAX_PROXY] = {0};
+static volatile uint8_t _slotStallReason[BORE_MAX_PROXY] = {0}; // 0=none,1=bpStuck,2=frozen
 static TaskHandle_t _boreProxyTaskHandle[BORE_MAX_PROXY] = {nullptr};
 
 // Per-slot task argument (static so it outlives the launching function)
@@ -115,6 +131,8 @@ static void _boreProxyConn(WiFiClient &remote, WiFiClient &local, int slot) {
     _slotBackpressureSince[slot] = 0;
     _slotWatchdogArmed[slot] = false;
     _slotLastActive[slot] = 0;
+    _slotStallSince[slot] = 0;
+    _slotStallReason[slot] = 0;
     _slotBusy[slot] = false;
     return;
   }
@@ -136,6 +154,8 @@ static void _boreProxyConn(WiFiClient &remote, WiFiClient &local, int slot) {
   _slotBackpressureSince[slot] = 0;
   _slotLastActive[slot] = start;
   _slotWatchdogArmed[slot] = true;
+  _slotStallSince[slot] = 0;
+  _slotStallReason[slot] = 0;
   Serial.printf("[Tunnel] Slot %d watchdog armed at %lums.\n", slot, start);
 
   const char *exitReason = "unknown";
@@ -294,6 +314,8 @@ static void _boreProxyConn(WiFiClient &remote, WiFiClient &local, int slot) {
   _slotBackpressureSince[slot] = 0;
   _slotWatchdogArmed[slot] = false;
   _slotLastActive[slot] = 0;
+  _slotStallSince[slot] = 0;
+  _slotStallReason[slot] = 0;
   _slotBusy[slot] = false;
   Serial.printf("[Tunnel] Slot %d: released.\n", slot);
 }
@@ -329,25 +351,45 @@ static void _boreWatchdog(const char *source) {
     // genuinely blocks for 8s with no progress — a real hang.
     bool bpStuck = _slotBackpressured[i] &&
                    bpSince > 0 &&
-                   (now - bpSince > 8000) &&
-                   (age > 8000);
+                   (now - bpSince > BORE_BP_STUCK_MS) &&
+                   (age > BORE_BP_STUCK_MS);
 
     // Normal freeze: task blocked inside write() with no progress for 12s,
     // and not currently in a (legitimate, short) backpressure spell.
-    bool frozen = (age > 12000) && !_slotBackpressured[i];
+    bool frozen = (age > BORE_FROZEN_MS) && !_slotBackpressured[i];
 
-    if (frozen || bpStuck) {
-      Serial.printf("[Tunnel] WATCHDOG(%s): Slot %d KILL. reason=%s age=%lums bpSince=%lums heap=%u wifi=%d r=%d l=%d\n",
-                    source, i, frozen ? "frozen12s" : "bpStuck8s",
-                    age, bpSince ? (now - bpSince) : 0UL,
-                    ESP.getFreeHeap(), WiFi.status(),
-                    _boreProxy[i].connected(), _boreLocal[i].connected());
-      _boreProxy[i].stop();
-      _boreLocal[i].stop();
-      _slotWatchdogArmed[i] = false;
-      _slotLastActive[i] = 0;
-      _slotBackpressured[i] = false;
-      _slotBackpressureSince[i] = 0;
+    uint8_t stallReason = bpStuck ? 1 : (frozen ? 2 : 0);
+    if (stallReason == 0) {
+      _slotStallSince[i] = 0;
+      _slotStallReason[i] = 0;
+      continue;
+    }
+
+    if (_slotStallReason[i] != stallReason || _slotStallSince[i] == 0 || now < _slotStallSince[i]) {
+      _slotStallReason[i] = stallReason;
+      _slotStallSince[i] = now;
+      Serial.printf("[Tunnel] WATCHDOG(%s): Slot %d WARN. reason=%s age=%lums bpSince=%lums heap=%u\n",
+                    source, i, stallReason == 1 ? "bpStuck" : "frozen",
+                    age, bpSince ? (now - bpSince) : 0UL, ESP.getFreeHeap());
+      continue;
+    }
+
+    unsigned long stalledFor = now - _slotStallSince[i];
+    if (stalledFor < BORE_WATCHDOG_GRACE_MS) continue;
+
+    Serial.printf("[Tunnel] WATCHDOG(%s): Slot %d KILL. reason=%s age=%lums bpSince=%lums grace=%lums heap=%u wifi=%d r=%d l=%d\n",
+                  source, i, stallReason == 1 ? "bpStuck+grace" : "frozen+grace",
+                  age, bpSince ? (now - bpSince) : 0UL, stalledFor,
+                  ESP.getFreeHeap(), WiFi.status(),
+                  _boreProxy[i].connected(), _boreLocal[i].connected());
+    _boreProxy[i].stop();
+    _boreLocal[i].stop();
+    _slotWatchdogArmed[i] = false;
+    _slotLastActive[i] = 0;
+    _slotBackpressured[i] = false;
+    _slotBackpressureSince[i] = 0;
+    _slotStallSince[i] = 0;
+    _slotStallReason[i] = 0;
     }
   }
 }
@@ -359,11 +401,15 @@ static void _boreAccept(const String &uuid, int slot) {
 
   _slotWatchdogArmed[slot] = false;
   _slotLastActive[slot] = 0;
+  _slotStallSince[slot] = 0;
+  _slotStallReason[slot] = 0;
   Serial.printf("[Tunnel] Slot %d: Connecting proxy socket to bore.pub...\n", slot);
   if (!_tcpConnectHost(proxy, _bore.host.c_str(), BORE_CONTROL_PORT)) {
     Serial.printf("[Tunnel] Slot %d: FAILED to connect proxy socket to bore.pub! Releasing slot.\n", slot);
     _slotWatchdogArmed[slot] = false;
     _slotLastActive[slot] = 0;
+    _slotStallSince[slot] = 0;
+    _slotStallReason[slot] = 0;
     _slotBusy[slot] = false;
     return;
   }
@@ -376,6 +422,8 @@ static void _boreAccept(const String &uuid, int slot) {
     proxy.stop();
     _slotWatchdogArmed[slot] = false;
     _slotLastActive[slot] = 0;
+    _slotStallSince[slot] = 0;
+    _slotStallReason[slot] = 0;
     _slotBusy[slot] = false;
     return;
   }
@@ -433,6 +481,8 @@ static void _boreAccept(const String &uuid, int slot) {
     _boreProxyTaskHandle[slot] = nullptr;
     _slotWatchdogArmed[slot] = false;
     _slotLastActive[slot] = 0;
+    _slotStallSince[slot] = 0;
+    _slotStallReason[slot] = 0;
     _slotBusy[slot] = false;
   }
 }
@@ -673,6 +723,8 @@ static void _boreStop() {
     _boreLocal[i].stop();
     _slotWatchdogArmed[i] = false;
     _slotLastActive[i] = 0;
+    _slotStallSince[i] = 0;
+    _slotStallReason[i] = 0;
     _slotBusy[i] = false;
   }
   _bore.ready   = false;
