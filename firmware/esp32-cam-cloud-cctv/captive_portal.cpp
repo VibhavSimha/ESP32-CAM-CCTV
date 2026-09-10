@@ -300,20 +300,23 @@ static void logDnsResolution(const char* what, const String& url) {
 
 static void logHttpRequestStart(const char* what, const char* method,
                                 const String& url, int timeoutMs,
-                                bool withCookie) {
+                                bool withCookie, bool includeDns = true) {
 #if CAPTIVE_LOG_HTTP_TRACE
     wl_status_t ws = WiFi.status();
     Serial.printf("[CaptivePortal] %s %s %s (timeout=%d ms, wifi=%d/%s, rssi=%d dBm, heap=%u, cookie=%s)\n",
                   what, method, url.c_str(), timeoutMs, (int)ws,
                   wifiStatusName(ws), (int)WiFi.RSSI(), (unsigned)ESP.getFreeHeap(),
                   withCookie ? "yes" : "no");
-    logDnsResolution(what, url);
+    if (includeDns) {
+        logDnsResolution(what, url);
+    }
 #else
     (void)what;
     (void)method;
     (void)url;
     (void)timeoutMs;
     (void)withCookie;
+    (void)includeDns;
 #endif
 }
 
@@ -580,7 +583,10 @@ static int probeInternet(String& body, String& location) {
     body = "";
     location = "";
     const String probeUrl = String(CAPTIVE_PROBE_URL);
-    logHttpRequestStart("Probe", "GET", probeUrl, CAPTIVE_PROBE_TIMEOUT_MS, false);
+    // Keep probe latency bounded by CAPTIVE_PROBE_TIMEOUT_MS. DNS trace lookups
+    // can block for many seconds on some networks, so skip that diagnostic on the
+    // hot-path probe itself.
+    logHttpRequestStart("Probe", "GET", probeUrl, CAPTIVE_PROBE_TIMEOUT_MS, false, false);
     // Declare the WiFiClient BEFORE the HTTPClient. Locals are destroyed in
     // reverse order, so this guarantees the HTTPClient (which holds a pointer to
     // the client via http.begin()) is torn down first, while the client is still
@@ -1073,6 +1079,12 @@ void captivePortalBegin() {
         // the /portal helper never points back at the device itself (issue #46).
         if (s_portalUrl.length() == 0) s_portalUrl = bestEffortPortalUrl();
         Serial.println("[CaptivePortal] Probe failed (network/DNS). Staying recoverable.");
+        // The very first post-connect probe can race DNS bring-up on some ISPs.
+        // Re-check once quickly instead of waiting a full heartbeat interval so
+        // already-online networks are recognised sooner.
+        const unsigned long earlyRetryMs = min(5000UL, (unsigned long)CAPTIVE_PERIODIC_REPROBE_MS);
+        s_periodicReprobeAt = millis() + earlyRetryMs;
+        Serial.printf("[CaptivePortal] Scheduling early connectivity re-check in %lums.\n", earlyRetryMs);
         String helperIp = bestEffortDeviceIpForPortal();
         Serial.printf("[CaptivePortal] Cloud uploads paused. Open http://%s/portal on another "
                       "device to check/retry.\n", helperIp.c_str());
