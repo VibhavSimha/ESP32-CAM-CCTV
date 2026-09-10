@@ -615,6 +615,161 @@ bool looksLikeCaptivePortal(int status, const std::string& body) {
     return false;
 }
 
+static std::string trimCopy(const std::string& s) {
+    size_t b = 0;
+    while (b < s.size() && std::isspace((unsigned char)s[b])) b++;
+    size_t e = s.size();
+    while (e > b && std::isspace((unsigned char)s[e - 1])) e--;
+    return s.substr(b, e - b);
+}
+
+static bool parseJsonString(const std::string& s, size_t quotePos,
+                            std::string& out) {
+    if (quotePos >= s.size() || s[quotePos] != '"') return false;
+    out.clear();
+    size_t i = quotePos + 1;
+    while (i < s.size()) {
+        char c = s[i++];
+        if (c == '"') return true;
+        if (c != '\\') {
+            out.push_back(c);
+            continue;
+        }
+        if (i >= s.size()) return false;
+        char esc = s[i++];
+        switch (esc) {
+            case '"': out.push_back('"'); break;
+            case '\\': out.push_back('\\'); break;
+            case '/': out.push_back('/'); break;
+            case 'b': out.push_back('\b'); break;
+            case 'f': out.push_back('\f'); break;
+            case 'n': out.push_back('\n'); break;
+            case 'r': out.push_back('\r'); break;
+            case 't': out.push_back('\t'); break;
+            case 'u': {
+                if (i + 3 >= s.size()) return false;
+                int cp = 0;
+                for (int k = 0; k < 4; k++) {
+                    char h = s[i++];
+                    int v = -1;
+                    if (h >= '0' && h <= '9') v = h - '0';
+                    else if (h >= 'a' && h <= 'f') v = h - 'a' + 10;
+                    else if (h >= 'A' && h <= 'F') v = h - 'A' + 10;
+                    if (v < 0) return false;
+                    cp = (cp << 4) | v;
+                }
+                // Keep this lightweight: preserve printable ASCII, map the rest
+                // to '?' so user-facing diagnostics never contain raw escapes.
+                out.push_back((cp >= 32 && cp <= 126) ? (char)cp : '?');
+                break;
+            }
+            default:
+                out.push_back(esc);
+                break;
+        }
+    }
+    return false;
+}
+
+static bool startsWithCi(const std::string& s, size_t pos, const char* lit) {
+    if (!lit) return false;
+    size_t i = 0;
+    while (lit[i]) {
+        if (pos + i >= s.size()) return false;
+        if (!ciEqualChar(s[pos + i], lit[i])) return false;
+        i++;
+    }
+    return true;
+}
+
+static bool findJsonFieldValueStart(const std::string& json,
+                                    const std::string& key,
+                                    size_t& valuePos) {
+    std::string lower = toLowerCopy(json);
+    std::string needle = "\"" + toLowerCopy(key) + "\"";
+    size_t pos = 0;
+    while ((pos = lower.find(needle, pos)) != std::string::npos) {
+        size_t prev = pos;
+        while (prev > 0 && std::isspace((unsigned char)json[prev - 1])) prev--;
+        if (prev > 0 && json[prev - 1] != '{' && json[prev - 1] != ',') {
+            pos += needle.size();
+            continue;
+        }
+        size_t colon = skipWs(json, pos + needle.size());
+        if (colon >= json.size() || json[colon] != ':') {
+            pos += needle.size();
+            continue;
+        }
+        valuePos = skipWs(json, colon + 1);
+        return true;
+    }
+    return false;
+}
+
+static bool extractJsonLongField(const std::string& json,
+                                 const std::string& key,
+                                 long& out) {
+    size_t pos = 0;
+    if (!findJsonFieldValueStart(json, key, pos)) return false;
+    bool neg = false;
+    if (pos < json.size() && (json[pos] == '-' || json[pos] == '+')) {
+        neg = json[pos] == '-';
+        pos++;
+    }
+    if (pos >= json.size() || !std::isdigit((unsigned char)json[pos])) return false;
+    long v = 0;
+    while (pos < json.size() && std::isdigit((unsigned char)json[pos])) {
+        v = (v * 10) + (json[pos] - '0');
+        pos++;
+    }
+    out = neg ? -v : v;
+    return true;
+}
+
+static bool extractJsonBoolField(const std::string& json,
+                                 const std::string& key,
+                                 bool& out) {
+    size_t pos = 0;
+    if (!findJsonFieldValueStart(json, key, pos)) return false;
+    if (startsWithCi(json, pos, "true")) {
+        out = true;
+        return true;
+    }
+    if (startsWithCi(json, pos, "false")) {
+        out = false;
+        return true;
+    }
+    return false;
+}
+
+static bool extractJsonStringField(const std::string& json,
+                                   const std::string& key,
+                                   std::string& out) {
+    size_t pos = 0;
+    if (!findJsonFieldValueStart(json, key, pos)) return false;
+    return parseJsonString(json, pos, out);
+}
+
+std::string extractPortalLoginErrorMessage(const std::string& responseBody) {
+    std::string body = trimCopy(responseBody);
+    if (body.empty() || body[0] != '{') return "";
+
+    long code = 0;
+    bool success = true;
+    bool hasCode = extractJsonLongField(body, "code", code);
+    bool hasSuccess = extractJsonBoolField(body, "success", success);
+    bool rejected = (hasCode && code < 0) || (hasSuccess && !success);
+    if (!rejected) return "";
+
+    std::string msg;
+    if (!extractJsonStringField(body, "message", msg) &&
+        !extractJsonStringField(body, "error", msg)) {
+        return "Portal rejected the login.";
+    }
+    msg = trimCopy(msg);
+    return msg.empty() ? std::string("Portal rejected the login.") : msg;
+}
+
 // Minimal RFC3986-ish form-url-encoder for a single component.
 static std::string urlEncode(const std::string& s) {
     static const char hex[] = "0123456789ABCDEF";
