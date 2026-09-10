@@ -215,6 +215,11 @@
 // uploads are paused again (issue #40).
 #define CAPTIVE_PERIODIC_REPROBE_MS  30000UL
 #define CAPTIVE_ONLINE_HEARTBEAT_MS  60000UL
+// While ONLINE, tolerate this many consecutive failed probes as transient before
+// flipping to OFFLINE. Each failure is retried after CAPTIVE_ONLINE_RETRY_MS.
+// This avoids "fail hard" behavior on brief Wi-Fi/power jitter.
+#define CAPTIVE_ONLINE_RETRY_ATTEMPTS 2
+#define CAPTIVE_ONLINE_RETRY_MS       5000UL
 
 // Diagnostic: dump the FULL fetched captive-portal login page to the serial
 // console when a portal is detected. This is the fastest way to see the exact

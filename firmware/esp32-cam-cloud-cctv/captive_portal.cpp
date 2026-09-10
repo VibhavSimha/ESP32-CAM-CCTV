@@ -134,6 +134,17 @@ static unsigned long s_periodicReprobeAt = 0;
 #define CAPTIVE_ONLINE_HEARTBEAT_MS 60000UL
 #endif
 static unsigned long s_onlineHeartbeatAt = 0;
+// When already ONLINE, a single failed probe can be a transient network blip
+// (or probe-endpoint hiccup), especially under brief Wi-Fi/power jitter. Keep
+// serving for a few short retries before flipping to OFFLINE and pausing cloud
+// uploads / stopping the tunnel.
+#ifndef CAPTIVE_ONLINE_RETRY_ATTEMPTS
+#define CAPTIVE_ONLINE_RETRY_ATTEMPTS 2
+#endif
+#ifndef CAPTIVE_ONLINE_RETRY_MS
+#define CAPTIVE_ONLINE_RETRY_MS 5000UL
+#endif
+static uint8_t s_onlineFailStreak = 0;
 // Tracks the previous connectivity state so captivePortalLoop() can reset the
 // heartbeat timers exactly once on an offline<->online transition, rather than
 // on every loop tick (issue #40).
@@ -1332,6 +1343,8 @@ static void buildPortalDiagnostics(String& d) {
     d += "portalTimeout_ms: "; d += (int)CAPTIVE_PORTAL_HTTP_TIMEOUT_MS; d += "\n";
     d += "maxLoginAttempts: "; d += (int)CAPTIVE_MAX_LOGIN_ATTEMPTS; d += "\n";
     d += "maxRedirectHops : "; d += (int)CAPTIVE_MAX_REDIRECT_HOPS; d += "\n";
+    d += "onlineRetryTrys : "; d += (int)CAPTIVE_ONLINE_RETRY_ATTEMPTS; d += "\n";
+    d += "onlineRetry_ms  : "; d += (unsigned long)CAPTIVE_ONLINE_RETRY_MS; d += "\n";
     d += "logPortalPage   : "; d += (int)CAPTIVE_LOG_PORTAL_PAGE; d += "\n";
     d += "logHttpTrace    : "; d += (int)CAPTIVE_LOG_HTTP_TRACE; d += "\n";
 }
@@ -1531,8 +1544,27 @@ static void onlineHeartbeat() {
     int code = probeInternet(body, location);
     std::string b(body.c_str(), body.length());
     if (code > 0 && !looksLikeCaptivePortal(code, b)) {
+        if (s_onlineFailStreak > 0) {
+            Serial.printf("[CaptivePortal] Online heartbeat recovered after %u transient failure(s).\n",
+                          (unsigned)s_onlineFailStreak);
+            s_onlineFailStreak = 0;
+        }
         return; // still online — stay quiet to avoid log noise
     }
+
+    s_onlineFailStreak++;
+    if (s_onlineFailStreak <= CAPTIVE_ONLINE_RETRY_ATTEMPTS) {
+        s_onlineHeartbeatAt = millis() + CAPTIVE_ONLINE_RETRY_MS;
+        Serial.printf("[CaptivePortal] Online heartbeat transient failure (HTTP %d). "
+                      "Retry %u/%u in %lums before pausing uploads.\n",
+                      code,
+                      (unsigned)s_onlineFailStreak,
+                      (unsigned)CAPTIVE_ONLINE_RETRY_ATTEMPTS,
+                      (unsigned long)CAPTIVE_ONLINE_RETRY_MS);
+        return;
+    }
+
+    s_onlineFailStreak = 0;
     // Connectivity lost. Pause cloud uploads (captivePortalIsOnline() flips to
     // false) and steer the operator back to /portal. The offline heartbeat in
     // captivePortalLoop() then re-probes until access is restored, at which point
@@ -1783,6 +1815,7 @@ void captivePortalLoop() {
         // each mode's timer is initialised once per transition, not every tick.
         s_periodicReprobeAt = 0;
         s_onlineHeartbeatAt = 0;
+        s_onlineFailStreak = 0;
         s_prevOnline = online;
     }
     if (!online && WiFi.status() == WL_CONNECTED) {
