@@ -392,7 +392,7 @@ static void _boreWatchdog(const char *source) {
     _slotStallReason[i] = 0;
     }
   }
-}
+
 
 // MARK: Handle a single Connection message — open accept stream + proxy
 static void _boreAccept(const String &uuid, int slot) {
