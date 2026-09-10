@@ -1212,6 +1212,19 @@ static bool submitPortalLogin(const String& username, const String& password, St
     }
     http.end();
 
+    if (code > 0 && responseBody.length() > 0) {
+        std::string rejection = extractPortalLoginErrorMessage(
+            std::string(responseBody.c_str(), responseBody.length()));
+        if (!rejection.empty()) {
+            // Surface the portal's own rejection reason (issue #67) so the user
+            // sees actionable feedback (e.g. "Device Limit Exceeded") immediately
+            // instead of only the generic post-submit re-probe failure.
+            outMsg = "Portal rejected the login: ";
+            outMsg += rejection.c_str();
+            return false;
+        }
+    }
+
     if (code <= 0) {
         outMsg = "The portal did not respond. Please try again.";
         return false;

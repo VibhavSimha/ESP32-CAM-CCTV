@@ -73,6 +73,12 @@ bool parseLoginForm(const std::string& html, PortalForm& out);
 // returned 204 with an empty body (e.g. connectivitycheck generate_204).
 bool looksLikeCaptivePortal(int status, const std::string& body);
 
+// Inspect a portal-login HTTP response body for an explicit, machine-readable
+// rejection reason. Returns empty when no definite rejection is found.
+// Example (issue #67):
+//   {"code":-1,"message":"Device Limit Exceeded ..."}
+std::string extractPortalLoginErrorMessage(const std::string& responseBody);
+
 // Build an application/x-www-form-urlencoded body from the detected form,
 // substituting the user-supplied username/password into the auto-detected
 // fields and echoing every hidden field. For a MikroTik CHAP form (issue #42)

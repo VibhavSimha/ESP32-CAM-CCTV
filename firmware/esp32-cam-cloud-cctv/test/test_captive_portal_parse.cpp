@@ -218,6 +218,34 @@ static void test_captive_detection() {
     CHECK(!looksLikeCaptivePortal(200, ""));            // empty 200, no redirect
 }
 
+// Issue #67: some portals return an explicit JSON rejection reason even when the
+// HTTP status is 200. Surface that reason immediately instead of waiting for a
+// generic post-submit re-probe failure.
+static void test_issue67_extract_portal_login_error_message() {
+    std::printf("test_issue67_extract_portal_login_error_message\n");
+    const std::string body =
+        "{\"code\":-1,\"message\":\"Device Limit Exceeded , Remove existing device from user profile.\"}";
+    CHECK(extractPortalLoginErrorMessage(body) ==
+          "Device Limit Exceeded , Remove existing device from user profile.");
+    CHECK(extractPortalLoginErrorMessage("{\"code\":-1,\"message\":\"Line1\\nLine2\"}") ==
+          "Line1 Line2");
+}
+
+static void test_extract_portal_login_error_message_success_ignored() {
+    std::printf("test_extract_portal_login_error_message_success_ignored\n");
+    CHECK(extractPortalLoginErrorMessage("{\"code\":1,\"message\":\"ok\"}").empty());
+    CHECK(extractPortalLoginErrorMessage("{\"success\":true,\"message\":\"ok\"}").empty());
+    CHECK(extractPortalLoginErrorMessage("<html>ok</html>").empty());
+}
+
+static void test_extract_portal_login_error_message_success_false() {
+    std::printf("test_extract_portal_login_error_message_success_false\n");
+    CHECK(extractPortalLoginErrorMessage("{\"success\":false,\"message\":\"Invalid credentials\"}") ==
+          "Invalid credentials");
+    CHECK(extractPortalLoginErrorMessage("{\"success\":false}") ==
+          "Portal rejected the login.");
+}
+
 // Issue #42 (follows on from #40): the exact field-report scenario — the
 // generate_204 probe is intercepted with an HTTP 302 to a MikroTik ISP portal.
 // Its login page is a CHAP form; instead of giving up, the firmware now decodes
@@ -732,6 +760,9 @@ int main() {
     test_no_form_fallback();
     test_attribute_order();
     test_captive_detection();
+    test_issue67_extract_portal_login_error_message();
+    test_extract_portal_login_error_message_success_ignored();
+    test_extract_portal_login_error_message_success_false();
     test_issue42_mikrotik_chap_login();
     test_issue44_mikrotik_default_template_chap_js();
     test_redirect_page_meta_refresh();

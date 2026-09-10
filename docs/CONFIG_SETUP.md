@@ -127,8 +127,11 @@ hostel / campus / ISP hotspots). When `ENABLE_CAPTIVE_PORTAL_LOGIN` is `1`
    when the exact login fields could not be auto-detected — so you can always
    type your ISP portal credentials and have the camera try. On submit the board
    re-scans the portal (following HTTPS redirects), submits the login for you and
-   re-checks connectivity. The credentials are held in RAM only for that one
-   submit and then wiped.
+   re-checks connectivity. If the portal returns an explicit rejection payload
+   (for example a JSON `{"code":-1,"message":"..."}`), that message is surfaced
+   directly in `/portal` instead of only a generic "did not unlock internet"
+   failure. The credentials are held in RAM only for that one submit and then
+   wiped.
 
 ### Connectivity heartbeat gates the cloud (issue #40)
 Behind a captive portal the board is *joined* to Wi-Fi but the internet is still
