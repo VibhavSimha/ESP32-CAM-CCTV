@@ -10,6 +10,10 @@
 #include "crypto_auth.h"
 #include "motion_pir.h"
 
+#ifndef IDLE_UPLOAD_MAX_TUNNEL_BUSY_MS
+#define IDLE_UPLOAD_MAX_TUNNEL_BUSY_MS 15000UL
+#endif
+
 // Print one aligned "[Config] <label> <status>" line (helper for logConfigStatus).
 static void logConfigLine(const char* label, bool ok, const char* okText, const char* badText) {
     Serial.printf("[Config] %-24s %s\n", label, ok ? okText : badText);
@@ -184,12 +188,25 @@ void loop() {
     // and lets the operator see the /portal login instructions instead. Uploads
     // resume automatically once the captive-portal heartbeat clears.
     static unsigned long lastIdleUpload = 0;
+    static unsigned long tunnelBusySince = 0;
+    bool tunnelBusy = isTunnelSlotBusy();
+    if (tunnelBusy) {
+        if (tunnelBusySince == 0) tunnelBusySince = millis();
+    } else {
+        tunnelBusySince = 0;
+    }
+    bool tunnelBusyDeferExceeded =
+        tunnelBusy && (millis() - tunnelBusySince >= IDLE_UPLOAD_MAX_TUNNEL_BUSY_MS);
     if (active_stream_clients == 0 &&
         millis() - lastIdleUpload > 3000 &&
         ESP.getFreeHeap() >= MIN_HEAP_FOR_UPLOAD &&
-        !isTunnelSlotBusy() &&
+        (!tunnelBusy || tunnelBusyDeferExceeded) &&
         captivePortalIsOnline()) {
         lastIdleUpload = millis();
+        if (tunnelBusy && tunnelBusyDeferExceeded) {
+            Serial.printf("[Idle] Tunnel busy for %lums. Forcing guarded upload.\n",
+                          millis() - tunnelBusySince);
+        }
         Serial.println("[Idle] No clients streaming. Performing autonomous background upload.");
         uploadFrameToCloud();
     }
