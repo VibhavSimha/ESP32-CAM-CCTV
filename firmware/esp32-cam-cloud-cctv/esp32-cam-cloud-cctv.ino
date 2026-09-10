@@ -173,13 +173,14 @@ void loop() {
     // When a browser client connects it becomes the uploader (best-effort per
     // frame) and this stops via active_stream_clients.
     //
-    // Issue #27: skip the upload when heap is below MIN_HEAP_FOR_UPLOAD or
+    // Issue #27: defer the upload when heap is below MIN_HEAP_FOR_UPLOAD or
     // while the bore tunnel has an active proxy slot. An idle HTTPS upload
     // takes ~20 KB of heap for the TLS connection; running it concurrently
     // with a tunnel proxy (which holds its own socket buffers + 2 KB copy
     // buffer + task stack) can collapse free heap to ~34 KB, causing crypto
-    // login rejections and tunnel write stalls. Deferring the upload when
-    // the tunnel is busy or heap is tight prevents these collisions.
+    // login rejections and tunnel write stalls. The tunnel-busy defer is
+    // bounded (IDLE_UPLOAD_MAX_TUNNEL_BUSY_MS) so a stale busy slot cannot
+    // starve autonomous uploads forever.
     //
     // Issue #40: only attempt Supabase once the internet-connectivity heartbeat
     // has CONFIRMED reachability (captivePortalIsOnline()). Behind an ISP captive
