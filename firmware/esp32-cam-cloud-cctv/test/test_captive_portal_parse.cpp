@@ -227,6 +227,8 @@ static void test_issue67_extract_portal_login_error_message() {
         "{\"code\":-1,\"message\":\"Device Limit Exceeded , Remove existing device from user profile.\"}";
     CHECK(extractPortalLoginErrorMessage(body) ==
           "Device Limit Exceeded , Remove existing device from user profile.");
+    CHECK(extractPortalLoginErrorMessage("{\"code\":-1,\"message\":\"Line1\\nLine2\"}") ==
+          "Line1 Line2");
 }
 
 static void test_extract_portal_login_error_message_success_ignored() {

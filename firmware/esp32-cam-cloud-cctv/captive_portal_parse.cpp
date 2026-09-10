@@ -623,6 +623,15 @@ static std::string trimCopy(const std::string& s) {
     return s.substr(b, e - b);
 }
 
+static std::string flattenControlChars(const std::string& s) {
+    std::string out(s);
+    for (size_t i = 0; i < out.size(); i++) {
+        unsigned char c = (unsigned char)out[i];
+        if (c < 32 || c == 127) out[i] = ' ';
+    }
+    return trimCopy(out);
+}
+
 static bool parseJsonString(const std::string& s, size_t quotePos,
                             std::string& out) {
     if (quotePos >= s.size() || s[quotePos] != '"') return false;
@@ -766,7 +775,7 @@ std::string extractPortalLoginErrorMessage(const std::string& responseBody) {
         !extractJsonStringField(body, "error", msg)) {
         return "Portal rejected the login.";
     }
-    msg = trimCopy(msg);
+    msg = flattenControlChars(msg);
     return msg.empty() ? std::string("Portal rejected the login.") : msg;
 }
 
