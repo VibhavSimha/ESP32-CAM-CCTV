@@ -129,6 +129,7 @@ static esp_err_t stream_handler(httpd_req_t *req) {
     uint8_t * _jpg_buf = NULL;
     char part_buf[64];
     uint32_t frame_num = 0;
+    uint32_t bad_frame_streak = 0;
 
     res = httpd_resp_set_type(req, _STREAM_CONTENT_TYPE);
     if (res != ESP_OK) {
@@ -140,38 +141,48 @@ static esp_err_t stream_handler(httpd_req_t *req) {
 
     while (true) {
         int64_t fr_start = esp_timer_get_time();
+        esp_err_t frame_res = ESP_OK;
+        bool frame_ready = false;
 
         fb = esp_camera_fb_get();
         if (!fb) {
-            Serial.println("[/stream] ERROR: esp_camera_fb_get() returned NULL");
-            res = ESP_FAIL;
+            Serial.println("[/stream] WARN: esp_camera_fb_get() returned NULL; dropping frame and retrying.");
+            frame_res = ESP_FAIL;
         } else if (fb->format != PIXFORMAT_JPEG) {
-            Serial.printf("[/stream] ERROR: unexpected pixel format %d (expected JPEG)\n", fb->format);
-            res = ESP_FAIL;
+            Serial.printf("[/stream] WARN: unexpected pixel format %d (expected JPEG); dropping frame.\n", fb->format);
+            frame_res = ESP_FAIL;
+        } else if (fb->len < 4 ||
+                   fb->buf[0] != 0xFF || fb->buf[1] != 0xD8 ||
+                   fb->buf[fb->len - 2] != 0xFF || fb->buf[fb->len - 1] != 0xD9) {
+            // Fail-soft guard: skip clearly corrupt/truncated JPEGs instead of
+            // poisoning the browser's MJPEG decoder and killing the live view.
+            Serial.printf("[/stream] WARN: JPEG frame failed SOI/EOI check (len=%u); dropping frame.\n", fb->len);
+            frame_res = ESP_FAIL;
         } else {
             _jpg_buf_len = fb->len;
             _jpg_buf = fb->buf;
+            frame_ready = true;
         }
 
         unsigned long frameStart = millis();
 
-        if (res == ESP_OK) {
+        if (frame_ready && frame_res == ESP_OK) {
             size_t hlen = snprintf((char *)part_buf, 64, _STREAM_PART, _jpg_buf_len);
-            res = httpd_resp_send_chunk(req, (const char *)part_buf, hlen);
-            if (res != ESP_OK) {
-                Serial.printf("[/stream] ERROR: send_chunk(header) failed on frame %u: %d\n", frame_num, res);
+            frame_res = httpd_resp_send_chunk(req, (const char *)part_buf, hlen);
+            if (frame_res != ESP_OK) {
+                Serial.printf("[/stream] ERROR: send_chunk(header) failed on frame %u: %d\n", frame_num, frame_res);
             }
         }
-        if (res == ESP_OK) {
-            res = httpd_resp_send_chunk(req, (const char *)_jpg_buf, _jpg_buf_len);
-            if (res != ESP_OK) {
-                Serial.printf("[/stream] ERROR: send_chunk(jpeg %u bytes) failed on frame %u: %d\n", _jpg_buf_len, frame_num, res);
+        if (frame_ready && frame_res == ESP_OK) {
+            frame_res = httpd_resp_send_chunk(req, (const char *)_jpg_buf, _jpg_buf_len);
+            if (frame_res != ESP_OK) {
+                Serial.printf("[/stream] ERROR: send_chunk(jpeg %u bytes) failed on frame %u: %d\n", _jpg_buf_len, frame_num, frame_res);
             }
         }
-        if (res == ESP_OK) {
-            res = httpd_resp_send_chunk(req, _STREAM_BOUNDARY, strlen(_STREAM_BOUNDARY));
-            if (res != ESP_OK) {
-                Serial.printf("[/stream] ERROR: send_chunk(boundary) failed on frame %u: %d\n", frame_num, res);
+        if (frame_ready && frame_res == ESP_OK) {
+            frame_res = httpd_resp_send_chunk(req, _STREAM_BOUNDARY, strlen(_STREAM_BOUNDARY));
+            if (frame_res != ESP_OK) {
+                Serial.printf("[/stream] ERROR: send_chunk(boundary) failed on frame %u: %d\n", frame_num, frame_res);
             }
         }
 
@@ -184,15 +195,34 @@ static esp_err_t stream_handler(httpd_req_t *req) {
             _jpg_buf = NULL;
         }
 
-        if (res != ESP_OK) {
-            if (res == HTTPD_SOCK_ERR_TIMEOUT) {
+        if (!frame_ready) {
+            bad_frame_streak++;
+            if (bad_frame_streak % 5 == 0) {
+                Serial.printf("[/stream] WARN: %u consecutive bad frames; continuing soft-retry.\n", bad_frame_streak);
+            }
+            if (bad_frame_streak >= 40) {
+                Serial.printf("[/stream] ERROR: %u consecutive bad frames; ending stream so client can reconnect cleanly.\n", bad_frame_streak);
+                res = ESP_FAIL;
+                break;
+            }
+            vTaskDelay(30 / portTICK_PERIOD_MS);
+            continue;
+        }
+
+        bad_frame_streak = 0;
+
+        if (frame_res != ESP_OK) {
+            if (frame_res == HTTPD_SOCK_ERR_TIMEOUT) {
                 Serial.printf("[/stream] Fatal: Network timeout (send_wait_timeout). Connection dropped due to extreme lag!\n");
-            } else if (res == HTTPD_SOCK_ERR_FAIL) {
+            } else if (frame_res == HTTPD_SOCK_ERR_FAIL) {
                 Serial.printf("[/stream] Fatal: Socket closed by client or proxy.\n");
             }
             Serial.printf("[/stream] Stream ended after %u frames. Heap: %u\n", frame_num, ESP.getFreeHeap());
+            res = frame_res;
             break;
         }
+
+        res = frame_res;
 
         unsigned long frameTime = millis() - frameStart;
         if (frame_num % 10 == 0) {
@@ -361,6 +391,7 @@ static esp_err_t view_handler(httpd_req_t *req) {
         // where XSS is not the primary threat vector, but operators should ensure the
         // /view page is not served alongside untrusted third-party content.
         "let SID=localStorage.getItem('esp32_sid');"
+        "const FLASH_PREF_KEY='esp32_flash_pref';"
         // Module-level Supabase client — needed both for the frame uploader (initUpload)
         // and the reconnect URL check (reconnectWithUrlCheck), so it is created once
         // here rather than inside initUpload().
@@ -427,7 +458,7 @@ static esp_err_t view_handler(httpd_req_t *req) {
         // Stop any lingering stream request and clear the retry guard so a
         // subsequent login can immediately trigger scheduleReconnect if needed.
         "document.getElementById('cam').removeAttribute('src');"
-        "reconnectPending=false;"
+        "reconnectPending=false;streamPaused=false;failedReconnects=0;"
         "document.getElementById('app').style.display='none';"
         "document.getElementById('loginBox').style.display='';"
         "document.getElementById('lerr').textContent=msg||'Session expired \u2014 please log in again.';"
@@ -460,7 +491,7 @@ static esp_err_t view_handler(httpd_req_t *req) {
         "let streamPaused=false;let reconnectPending=false;let failedReconnects=0;"
         "function connectStream(){"
         "reconnectPending=false;"
-        "if(streamPaused)return;"
+        "if(streamPaused||!SID)return;"
         "document.getElementById('cam').src=streamUrl()+'&_='+Date.now();"
         "}"
         // Issue #25: after 3 consecutive failures, query Supabase for the latest
@@ -519,7 +550,7 @@ static esp_err_t view_handler(httpd_req_t *req) {
         "connectStream();"
         "}"
         "function scheduleReconnect(){"
-        "if(reconnectPending||streamPaused)return;"
+        "if(!SID||reconnectPending||streamPaused)return;"
         "reconnectPending=true;"
         "failedReconnects++;"
         // After many consecutive failures show a manual refresh affordance so
@@ -548,7 +579,7 @@ static esp_err_t view_handler(httpd_req_t *req) {
         "document.getElementById('app').style.display='flex';"
         // Issue #25: reset counter so re-login after auth failure doesn't trigger an
         // immediate URL check on the very first stream error.
-        "failedReconnects=0;"
+        "failedReconnects=0;reconnectPending=false;streamPaused=false;"
         // Issue #25: logout button clears the persisted session and returns to login.
         "document.getElementById('logoutBtn').onclick=handleLogout;"
         "const cam=document.getElementById('cam');"
@@ -561,9 +592,16 @@ static esp_err_t view_handler(httpd_req_t *req) {
         "async function initFlash(){"
         "const btn=document.getElementById('flashBtn');"
         "const cam=document.getElementById('cam');"
-        "async function sync(state){btn.className=state?'on':'off';btn.textContent=(state?'\\u26A1 Flash: ON':'\\u26A1 Flash: OFF');btn.dataset.s=state?1:0;}"
-        // Read current global flash state from firmware on load.
-        "try{const j=await (await auth('/flash')).json();sync(!!j.flash);}catch(e){}"
+        "async function sync(state){btn.className=state?'on':'off';btn.textContent=(state?'\\u26A1 Flash: ON':'\\u26A1 Flash: OFF');btn.dataset.s=state?1:0;localStorage.setItem(FLASH_PREF_KEY,state?'1':'0');}"
+        // Keep the user's last choice sticky in the UI, then fetch the firmware's
+        // authoritative global state with retries so transient tunnel hiccups on
+        // load do not silently reset the button visual to OFF.
+        "const cachedFlash=localStorage.getItem(FLASH_PREF_KEY);"
+        "if(cachedFlash==='1'||cachedFlash==='0')sync(cachedFlash==='1');"
+        "for(let fr=0;fr<3;fr++){"
+        "try{const j=await (await auth('/flash')).json();sync(!!j.flash);break;}"
+        "catch(e){if(fr<2)await new Promise(r=>setTimeout(r,300));}"
+        "}"
         // The firmware HTTPD serves requests on a single task, so the long-lived
         // MJPEG /stream handler blocks it. Issuing /flash while streaming forces
         // the server to purge the live stream socket, dropping the stream
@@ -590,12 +628,14 @@ static esp_err_t view_handler(httpd_req_t *req) {
         "btn.dataset.busy='1';btn.disabled=true;"
         "const ns=(btn.dataset.s==='1')?0:1;"
         "sync(!!ns);" // optimistic: update UI before async /flash request completes
+        "const sid=SID;"
+        "const authForFlash=u=>fetch(u,{headers:{'X-Session':sid}});"
         "const wasStreaming=!!cam.getAttribute('src');"
         "if(wasStreaming){streamPaused=true;cam.removeAttribute('src');"
         "await new Promise(r=>setTimeout(r,750));}" // proxy exits ~150-200ms after FIN; heap recovers to ~70KB by ~300ms; 750ms is well clear of both
         "let flashOk=false;"
         "for(let ft=0;ft<3&&!flashOk;ft++){"
-        "try{const j=await (await auth('/flash?s='+ns)).json();sync(!!j.flash);flashOk=true;}"
+        "try{const j=await (await authForFlash('/flash?s='+ns)).json();sync(!!j.flash);flashOk=true;}"
         "catch(e){if(ft<2)await new Promise(r=>setTimeout(r,500));else console.error(e);}"
         "}"
         "if(!flashOk)sync(!ns);" // revert visual when all retries exhausted
@@ -623,10 +663,11 @@ static esp_err_t view_handler(httpd_req_t *req) {
         "const c=document.createElement('canvas');c.width=cam.naturalWidth;c.height=cam.naturalHeight;"
         "c.getContext('2d').drawImage(cam,0,0);"
         "const blob=await new Promise(r=>c.toBlob(r,'image/jpeg'));"
+        "if(!blob)throw new Error('corrupt or truncated frame');"
         // Issue #11: unique timestamped names; server-side pg_cron caps retention.
         "const n='events/frame_'+Date.now()+'_'+(idx++)+'.jpg';"
         "await sb.storage.from(bkt).upload(n,blob,{upsert:true});"
-        "}catch(e){/*best effort*/}"
+        "}catch(e){const msg=((e&&e.message)?e.message:String(e||'')).toLowerCase();if(msg.indexOf('corrupt')>=0||msg.indexOf('truncated')>=0){document.getElementById('st').textContent='Stream decode error \u2014 retrying...';scheduleReconnect();}}"
         "lastDone=performance.now();"
         "inflight=false;"
         "}"
