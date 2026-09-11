@@ -19,7 +19,7 @@
 #endif
 
 #ifndef CAMERA_INIT_REBOOT_AFTER_MS
-#define CAMERA_INIT_REBOOT_AFTER_MS (10UL * 60UL * 1000UL)
+#define CAMERA_INIT_REBOOT_AFTER_MS (15UL * 60UL * 1000UL)
 #endif
 
 #ifndef CRYPTO_AUTH_RETRY_DELAY_MS
@@ -27,7 +27,7 @@
 #endif
 
 #ifndef CRYPTO_AUTH_REBOOT_AFTER_MS
-#define CRYPTO_AUTH_REBOOT_AFTER_MS (10UL * 60UL * 1000UL)
+#define CRYPTO_AUTH_REBOOT_AFTER_MS (15UL * 60UL * 1000UL)
 #endif
 
 static void rebootForPersistentFailure(const char* component, unsigned long downForMs) {

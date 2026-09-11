@@ -129,7 +129,7 @@ static unsigned long s_periodicReprobeAt = 0;
 // When offline (still captive / internet unreachable), keep re-probing forever
 // but escalate to a full reboot after a very long sustained outage window.
 #ifndef CAPTIVE_OFFLINE_REBOOT_AFTER_MS
-#define CAPTIVE_OFFLINE_REBOOT_AFTER_MS (30UL * 60UL * 1000UL)
+#define CAPTIVE_OFFLINE_REBOOT_AFTER_MS (15UL * 60UL * 1000UL)
 #endif
 static unsigned long s_offlineSince = 0;
 // Heartbeat interval while the internet IS confirmed reachable. We keep probing

@@ -12,7 +12,7 @@
 #endif
 
 #ifndef WIFI_MANAGER_REBOOT_AFTER_MS
-#define WIFI_MANAGER_REBOOT_AFTER_MS (20UL * 60UL * 1000UL)
+#define WIFI_MANAGER_REBOOT_AFTER_MS (15UL * 60UL * 1000UL)
 #endif
 
 void setupWiFiManager() {

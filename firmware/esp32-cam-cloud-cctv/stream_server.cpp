@@ -26,7 +26,7 @@ static const char* _STREAM_PART = "Content-Type: image/jpeg\r\nContent-Length: %
 #endif
 
 #ifndef CAMERA_SERVER_REBOOT_AFTER_MS
-#define CAMERA_SERVER_REBOOT_AFTER_MS (10UL * 60UL * 1000UL)
+#define CAMERA_SERVER_REBOOT_AFTER_MS (15UL * 60UL * 1000UL)
 #endif
 
 // Issue #12: the pinned device pubkey may be undefined on older config.h files.

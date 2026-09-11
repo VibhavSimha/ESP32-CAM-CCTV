@@ -32,7 +32,7 @@ static unsigned long uploadFailSince = 0;
 #endif
 
 #ifndef SUPABASE_UPLOAD_FAIL_REBOOT_AFTER_MS
-#define SUPABASE_UPLOAD_FAIL_REBOOT_AFTER_MS (20UL * 60UL * 1000UL)
+#define SUPABASE_UPLOAD_FAIL_REBOOT_AFTER_MS (15UL * 60UL * 1000UL)
 #endif
 
 #ifndef SUPABASE_CAPTURE_FAIL_REBOOT_AFTER_COUNT
@@ -40,7 +40,7 @@ static unsigned long uploadFailSince = 0;
 #endif
 
 #ifndef SUPABASE_CAPTURE_FAIL_REBOOT_AFTER_MS
-#define SUPABASE_CAPTURE_FAIL_REBOOT_AFTER_MS (10UL * 60UL * 1000UL)
+#define SUPABASE_CAPTURE_FAIL_REBOOT_AFTER_MS (15UL * 60UL * 1000UL)
 #endif
 
 static void markCaptureFailureAndMaybeReboot() {
