@@ -44,6 +44,7 @@
 // keypair in NVS. Logs the device pubkey (b64) and, if CONFIG_DEVICE_PUBKEY_B64
 // is set, whether it matches. Safe to call once from setup().
 void setupCryptoAuth();
+bool cryptoAuthReady();
 
 // Register /pubkey (GET), /nonce (GET), and /login (POST) handlers on the given
 // server. Call after httpd_start(). All three are intentionally UNAUTHENTICATED.

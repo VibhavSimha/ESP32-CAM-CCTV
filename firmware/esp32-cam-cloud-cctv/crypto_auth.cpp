@@ -30,6 +30,7 @@ static bool    s_ready = false;
 
 static mbedtls_ctr_drbg_context s_drbg;
 static mbedtls_entropy_context  s_entropy;
+static bool s_rngInitialized = false;
 
 // -----------------------------------------------------------------------------
 // Concurrency: the ESP-IDF httpd services requests from multiple sockets, so the
@@ -53,7 +54,7 @@ static inline void UNLOCK() { if (s_lock) xSemaphoreGiveRecursive(s_lock); }
 // mbedtls_ecdh_compute_shared + related MPI/ECP ops allocate ~8-12 KB of
 // short-lived heap. With two active tunnel proxy tasks (each holding ~8 KB of
 // socket buffers), the heap can drop to ~28 KB and those allocations fail,
-// producing a cryptic 500 "ecdh" error. 40 KB provides a comfortable margin
+// producing a cryptic "ecdh" auth failure. 40 KB provides a comfortable margin
 // above the peak ECDH working-set on a heap with typical fragmentation.
 #define MIN_HEAP_FOR_ECDH 40000
 
@@ -125,6 +126,11 @@ static bool ctEqual(const char *a, const char *b) {
 // RNG
 // -----------------------------------------------------------------------------
 static bool rngInit() {
+  if (s_rngInitialized) {
+    mbedtls_ctr_drbg_free(&s_drbg);
+    mbedtls_entropy_free(&s_entropy);
+    s_rngInitialized = false;
+  }
   mbedtls_entropy_init(&s_entropy);
   mbedtls_ctr_drbg_init(&s_drbg);
   const char *pers = "esp32cam-crypto";
@@ -134,6 +140,7 @@ static bool rngInit() {
     Serial.printf("[Crypto] ctr_drbg_seed failed: -0x%04x\n", -rc);
     return false;
   }
+  s_rngInitialized = true;
   return true;
 }
 
@@ -165,6 +172,7 @@ static bool genKeypair() {
 }
 
 void setupCryptoAuth() {
+  s_ready = false;
   memset(s_sessions, 0, sizeof(s_sessions));
   memset(s_nonces, 0, sizeof(s_nonces));
 
@@ -221,6 +229,10 @@ void setupCryptoAuth() {
 #endif
   Serial.printf("[Crypto] setup took %lums, heap %u -> %u (delta %d)\n",
                 millis() - t0, h0, ESP.getFreeHeap(), (int)ESP.getFreeHeap() - (int)h0);
+}
+
+bool cryptoAuthReady() {
+  return s_ready;
 }
 
 // -----------------------------------------------------------------------------
@@ -430,11 +442,18 @@ bool cryptoAuthRequire(httpd_req_t *req) {
   return false;
 }
 
+static esp_err_t sendCryptoNotReady(httpd_req_t *req) {
+  httpd_resp_set_status(req, "503 Service Unavailable");
+  httpd_resp_set_hdr(req, "Retry-After", "5");
+  httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+  return httpd_resp_send(req, "crypto-not-ready", HTTPD_RESP_USE_STRLEN);
+}
+
 // -----------------------------------------------------------------------------
 // HTTP handlers
 // -----------------------------------------------------------------------------
 static esp_err_t pubkey_handler(httpd_req_t *req) {
-  if (!s_ready) { httpd_resp_send_500(req); return ESP_FAIL; }
+  if (!s_ready) { sendCryptoNotReady(req); return ESP_FAIL; }
   char pubb64[64];
   b64enc(s_pub, 32, pubb64, sizeof(pubb64));
 
@@ -452,7 +471,7 @@ static esp_err_t pubkey_handler(httpd_req_t *req) {
 
 // GET /nonce (issue #12): single-use, short-lived replay nonce. Unauthenticated.
 static esp_err_t nonce_handler(httpd_req_t *req) {
-  if (!s_ready) { httpd_resp_send_500(req); return ESP_FAIL; }
+  if (!s_ready) { sendCryptoNotReady(req); return ESP_FAIL; }
   char nb64[25];
   LOCK();
   issueNonce(nb64, sizeof(nb64));
@@ -483,7 +502,7 @@ static esp_err_t nonce_handler(httpd_req_t *req) {
 // FAILED attempt. A valid login is never rate-limited, and a flood of bogus
 // requests cannot starve a legitimate one.
 static esp_err_t login_handler(httpd_req_t *req) {
-  if (!s_ready) { httpd_resp_send_500(req); return ESP_FAIL; }
+  if (!s_ready) { sendCryptoNotReady(req); return ESP_FAIL; }
 
   uint32_t h0 = ESP.getFreeHeap();
   unsigned long t0 = millis();
@@ -517,7 +536,10 @@ static esp_err_t login_handler(httpd_req_t *req) {
   if (!body || !ctbuf || !ptbuf || !in) {
     Serial.println("[Crypto] login rejected: OOM allocating scratch");
     free(body); free(ctbuf); free(ptbuf); delete in;
-    httpd_resp_send_500(req);
+    httpd_resp_set_status(req, "503 Service Unavailable");
+    httpd_resp_set_hdr(req, "Retry-After", "5");
+    httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+    httpd_resp_send(req, "oom", HTTPD_RESP_USE_STRLEN);
     return ESP_FAIL;
   }
 
@@ -572,7 +594,9 @@ static esp_err_t login_handler(httpd_req_t *req) {
     if (!derived) {
       mbedtls_platform_zeroize(shared, sizeof(shared));
       mbedtls_platform_zeroize(aesKey, sizeof(aesKey));
-      failReason = "ecdh"; httpStatusFail = 500; break;
+      // Treat ECDH derive failures as transient/resource failures so the browser
+      // can auto-retry (same path as low-heap 503) instead of forcing manual retry.
+      failReason = "ecdh"; httpStatusFail = 503; break;
     }
 
     int ptlen = aesGcmDecrypt(aesKey, iv, ivlen, ctbuf, ctlen, tag, taglen, ptbuf);

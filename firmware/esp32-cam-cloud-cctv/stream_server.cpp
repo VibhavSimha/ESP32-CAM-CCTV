@@ -21,6 +21,14 @@ static const char* _STREAM_PART = "Content-Type: image/jpeg\r\nContent-Length: %
 #define STORAGE_UPLOAD_MIN_GAP_MS 250
 #endif
 
+#ifndef CAMERA_SERVER_RETRY_DELAY_MS
+#define CAMERA_SERVER_RETRY_DELAY_MS 2000UL
+#endif
+
+#ifndef CAMERA_SERVER_REBOOT_AFTER_MS
+#define CAMERA_SERVER_REBOOT_AFTER_MS (10UL * 60UL * 1000UL)
+#endif
+
 // Issue #12: the pinned device pubkey may be undefined on older config.h files.
 // Default to empty so the /view page falls back to /pubkey (with a warning).
 #ifndef CONFIG_DEVICE_PUBKEY_B64
@@ -405,10 +413,22 @@ static esp_err_t view_handler(httpd_req_t *req) {
         "const info=new TextEncoder().encode('esp32cam-ecdh-aes256gcm');"
         "return nobleHashes.hkdf(nobleHashes.sha256,shared,new Uint8Array(0),info,32);"
         "}"
+        "async function fetchJsonRetry(u,maxTry,delayMs){"
+        "let lastErr=null;"
+        "for(let i=0;i<maxTry;i++){"
+        "try{"
+        "const r=await fetch(u);"
+        "if((r.status===429||r.status===503)&&i<maxTry-1){const ra=parseInt(r.headers.get('Retry-After')||'1',10);await new Promise(s=>setTimeout(s,((isNaN(ra)?0:ra)*1000)||delayMs));continue;}"
+        "if(!r.ok)throw new Error('HTTP '+r.status+' '+(await r.text()));"
+        "return await r.json();"
+        "}catch(e){lastErr=e;if(i<maxTry-1)await new Promise(s=>setTimeout(s,delayMs));}"
+        "}"
+        "throw lastErr||new Error('request failed');"
+        "}"
         // Resolve the device public key: pinned if set, else /pubkey (+ warn).
         "async function deviceKey(){"
         "if(PIN&&PIN.length){return ub64(PIN);}"
-        "const pk=await (await fetch('/pubkey')).json();"
+        "const pk=await fetchJsonRetry('/pubkey',3,500);"
         "const w=document.getElementById('pinWarn');"
         "w.style.display='block';"
         "w.innerHTML='\\u26A0 Device key NOT pinned \\u2014 login is NOT protected against MITM. Set CONFIG_DEVICE_PUBKEY_B64 in config.h to the value below and re-flash (see docs/CONFIG_SETUP.md).<br>Device key: '+pk.pubkey;"
@@ -426,17 +446,17 @@ static esp_err_t view_handler(httpd_req_t *req) {
         "const aesKey=deriveAes(shared);"
         "const iv=crypto.getRandomValues(new Uint8Array(12));"
         // Fetch single-use replay nonce (issue #12) and include it in the plaintext.
-        "const nonce=(await (await fetch('/nonce')).json()).nonce;"
+        "const nonce=(await fetchJsonRetry('/nonce',3,500)).nonce;"
         "const enc=new TextEncoder();"
         "const pt=enc.encode(JSON.stringify({user:document.getElementById('u').value,pass:document.getElementById('p').value,nonce:nonce}));"
         // AES-256-GCM via @noble/ciphers (subtle-free). Output = ct||tag(16).
         "const sealed=nobleCiphers.gcm(aesKey,iv).encrypt(pt);"
         "const tag=sealed.slice(sealed.length-16);const ct=sealed.slice(0,sealed.length-16);"
         "const r=await fetch('/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({epk:b64(ephPk),iv:b64(iv),ct:b64(ct),tag:b64(tag)})});"
-        // Issue #23: 503 = device busy (tunnel proxy consuming heap). Auto-retry
+        // Issue #23: 503/429 = device busy or temporary backoff. Auto-retry
         // after the Retry-After delay so the user doesn't see a spurious error.
         // Parse the Retry-After header so the delay stays in sync with the server.
-        "if(r.status===503){le.textContent='Device busy \u2014 retrying...';const ra=parseInt(r.headers.get('Retry-After')||'5',10);setTimeout(doLogin,(isNaN(ra)?5:ra)*1000);return;}"
+        "if(r.status===503||r.status===429){le.textContent='Device busy \u2014 retrying...';const ra=parseInt(r.headers.get('Retry-After')||'5',10);setTimeout(doLogin,(isNaN(ra)?5:ra)*1000);return;}"
         "if(!r.ok){le.textContent='Login failed ('+r.status+' '+(await r.text())+')';return;}"
         "SID=(await r.json()).token;"
         // Issue #25: persist token so the next page load restores the session.
@@ -711,34 +731,76 @@ static esp_err_t view_handler(httpd_req_t *req) {
 }
 
 void startCameraServer() {
-    httpd_config_t config = HTTPD_DEFAULT_CONFIG();
-    config.server_port = 80;
-    // 5 camera + 3 crypto-auth + 3 captive-portal = 11 handlers (12 for headroom).
-    config.max_uri_handlers = 12;
-    config.max_open_sockets = 7;
-    config.recv_wait_timeout = 15;
-    config.send_wait_timeout = 10;
-    config.lru_purge_enable = true;
+    unsigned long firstFailureAt = 0;
+    uint32_t attempt = 0;
+    while (true) {
+        if (camera_httpd != NULL) return; // already running
 
-    httpd_uri_t stream_uri  = { .uri = "/stream",  .method = HTTP_GET, .handler = stream_handler,  .user_ctx = NULL };
-    httpd_uri_t capture_uri = { .uri = "/capture", .method = HTTP_GET, .handler = capture_handler, .user_ctx = NULL };
-    httpd_uri_t view_uri    = { .uri = "/view",    .method = HTTP_GET, .handler = view_handler,    .user_ctx = NULL };
-    httpd_uri_t health_uri  = { .uri = "/health",  .method = HTTP_GET, .handler = health_handler,  .user_ctx = NULL };
-    httpd_uri_t flash_uri   = { .uri = "/flash",   .method = HTTP_GET, .handler = flash_handler,   .user_ctx = NULL };
+        httpd_config_t config = HTTPD_DEFAULT_CONFIG();
+        config.server_port = 80;
+        // 5 camera + 3 crypto-auth + 5 captive-portal = 13 handlers (16 for headroom).
+        config.max_uri_handlers = 16;
+        config.max_open_sockets = 7;
+        config.recv_wait_timeout = 15;
+        config.send_wait_timeout = 10;
+        config.lru_purge_enable = true;
 
-    Serial.printf("Starting web server on port: '%d'\n", config.server_port);
-    Serial.printf("[/stream] HTTPD timeouts: recv=%ds send=%ds, max_open_sockets=%d, lru_purge=%d\n",
-        config.recv_wait_timeout, config.send_wait_timeout, config.max_open_sockets, config.lru_purge_enable);
-    if (httpd_start(&camera_httpd, &config) == ESP_OK) {
-        httpd_register_uri_handler(camera_httpd, &stream_uri);
-        httpd_register_uri_handler(camera_httpd, &capture_uri);
-        httpd_register_uri_handler(camera_httpd, &view_uri);
-        httpd_register_uri_handler(camera_httpd, &health_uri);
-        httpd_register_uri_handler(camera_httpd, &flash_uri);
-        // Register the unauthenticated /pubkey (GET), /nonce (GET), /login (POST).
-        registerCryptoAuthHandlers(camera_httpd);
-        // Register the post-connect captive-portal helper endpoints (issue #33):
-        // /portal (GET), /portal/status (GET), /portal/login (POST).
-        registerCaptivePortalHandlers(camera_httpd);
+        httpd_uri_t stream_uri  = { .uri = "/stream",  .method = HTTP_GET, .handler = stream_handler,  .user_ctx = NULL };
+        httpd_uri_t capture_uri = { .uri = "/capture", .method = HTTP_GET, .handler = capture_handler, .user_ctx = NULL };
+        httpd_uri_t view_uri    = { .uri = "/view",    .method = HTTP_GET, .handler = view_handler,    .user_ctx = NULL };
+        httpd_uri_t health_uri  = { .uri = "/health",  .method = HTTP_GET, .handler = health_handler,  .user_ctx = NULL };
+        httpd_uri_t flash_uri   = { .uri = "/flash",   .method = HTTP_GET, .handler = flash_handler,   .user_ctx = NULL };
+
+        attempt++;
+        Serial.printf("Starting web server on port: '%d' (attempt #%lu)\n",
+                      config.server_port, (unsigned long)attempt);
+        Serial.printf("[/stream] HTTPD timeouts: recv=%ds send=%ds, max_open_sockets=%d, lru_purge=%d\n",
+            config.recv_wait_timeout, config.send_wait_timeout, config.max_open_sockets, config.lru_purge_enable);
+
+        esp_err_t err = httpd_start(&camera_httpd, &config);
+        if (err == ESP_OK) {
+            bool regOk = true;
+            if (httpd_register_uri_handler(camera_httpd, &stream_uri) != ESP_OK) regOk = false;
+            if (httpd_register_uri_handler(camera_httpd, &capture_uri) != ESP_OK) regOk = false;
+            if (httpd_register_uri_handler(camera_httpd, &view_uri) != ESP_OK) regOk = false;
+            if (httpd_register_uri_handler(camera_httpd, &health_uri) != ESP_OK) regOk = false;
+            if (httpd_register_uri_handler(camera_httpd, &flash_uri) != ESP_OK) regOk = false;
+            if (!regOk) {
+                if (firstFailureAt == 0) firstFailureAt = millis();
+                unsigned long downFor = millis() - firstFailureAt;
+                Serial.printf("[/stream] ERROR: URI handler registration failed. Retrying in %lums (failed for %lums)\n",
+                              (unsigned long)CAMERA_SERVER_RETRY_DELAY_MS, downFor);
+                httpd_stop(camera_httpd);
+                camera_httpd = NULL;
+                if (downFor >= CAMERA_SERVER_REBOOT_AFTER_MS) {
+                    Serial.printf("[/stream] HTTP handler registration unavailable for %lums. Rebooting for recovery.\n", downFor);
+                    delay(1000);
+                    ESP.restart();
+                }
+                delay(CAMERA_SERVER_RETRY_DELAY_MS);
+                continue;
+            }
+            // Register the unauthenticated /pubkey (GET), /nonce (GET), /login (POST).
+            registerCryptoAuthHandlers(camera_httpd);
+            // Register the post-connect captive-portal helper endpoints (issue #33):
+            // /portal (GET), /portal/status (GET), /portal/login (POST).
+            registerCaptivePortalHandlers(camera_httpd);
+            return;
+        }
+
+        if (firstFailureAt == 0) firstFailureAt = millis();
+        unsigned long downFor = millis() - firstFailureAt;
+        Serial.printf("[/stream] ERROR: httpd_start failed (%d). Retrying in %lums (failed for %lums)\n",
+                      (int)err,
+                      (unsigned long)CAMERA_SERVER_RETRY_DELAY_MS,
+                      downFor);
+
+        if (downFor >= CAMERA_SERVER_REBOOT_AFTER_MS) {
+            Serial.printf("[/stream] HTTP server unavailable for %lums. Rebooting for recovery.\n", downFor);
+            delay(1000);
+            ESP.restart();
+        }
+
+        delay(CAMERA_SERVER_RETRY_DELAY_MS);
     }
 }
