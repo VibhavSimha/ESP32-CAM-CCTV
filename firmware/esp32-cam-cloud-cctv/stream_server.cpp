@@ -391,7 +391,6 @@ static esp_err_t view_handler(httpd_req_t *req) {
         // where XSS is not the primary threat vector, but operators should ensure the
         // /view page is not served alongside untrusted third-party content.
         "let SID=localStorage.getItem('esp32_sid');"
-        "const FLASH_PREF_KEY='esp32_flash_pref';"
         // Module-level Supabase client — needed both for the frame uploader (initUpload)
         // and the reconnect URL check (reconnectWithUrlCheck), so it is created once
         // here rather than inside initUpload().
@@ -592,12 +591,9 @@ static esp_err_t view_handler(httpd_req_t *req) {
         "async function initFlash(){"
         "const btn=document.getElementById('flashBtn');"
         "const cam=document.getElementById('cam');"
-        "async function sync(state){btn.className=state?'on':'off';btn.textContent=(state?'\\u26A1 Flash: ON':'\\u26A1 Flash: OFF');btn.dataset.s=state?1:0;localStorage.setItem(FLASH_PREF_KEY,state?'1':'0');}"
-        // Keep the user's last choice sticky in the UI, then fetch the firmware's
-        // authoritative global state with retries so transient tunnel hiccups on
-        // load do not silently reset the button visual to OFF.
-        "const cachedFlash=localStorage.getItem(FLASH_PREF_KEY);"
-        "if(cachedFlash==='1'||cachedFlash==='0')sync(cachedFlash==='1');"
+        "async function sync(state){btn.className=state?'on':'off';btn.textContent=(state?'\\u26A1 Flash: ON':'\\u26A1 Flash: OFF');btn.dataset.s=state?1:0;}"
+        // Sticky flash state is firmware-owned (NVS). Read from /flash with retry
+        // so transient tunnel hiccups on load do not incorrectly show OFF.
         "for(let fr=0;fr<3;fr++){"
         "try{const j=await (await auth('/flash')).json();sync(!!j.flash);break;}"
         "catch(e){if(fr<2)await new Promise(r=>setTimeout(r,300));}"
