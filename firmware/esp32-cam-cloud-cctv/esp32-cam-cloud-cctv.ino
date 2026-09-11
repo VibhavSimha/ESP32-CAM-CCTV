@@ -14,6 +14,70 @@
 #define IDLE_UPLOAD_MAX_TUNNEL_BUSY_MS 15000UL
 #endif
 
+#ifndef CAMERA_INIT_RETRY_DELAY_MS
+#define CAMERA_INIT_RETRY_DELAY_MS 2000UL
+#endif
+
+#ifndef CAMERA_INIT_REBOOT_AFTER_MS
+#define CAMERA_INIT_REBOOT_AFTER_MS (15UL * 60UL * 1000UL)
+#endif
+
+#ifndef CRYPTO_AUTH_RETRY_DELAY_MS
+#define CRYPTO_AUTH_RETRY_DELAY_MS 3000UL
+#endif
+
+#ifndef CRYPTO_AUTH_REBOOT_AFTER_MS
+#define CRYPTO_AUTH_REBOOT_AFTER_MS (15UL * 60UL * 1000UL)
+#endif
+
+static void rebootForPersistentFailure(const char* component, unsigned long downForMs) {
+    Serial.printf("[%s] Persistent failure for %lums. Rebooting for full recovery.\n",
+                  component, downForMs);
+    delay(1000);
+    ESP.restart();
+}
+
+static void initCameraWithRetries() {
+    unsigned long firstFailureAt = 0;
+    uint32_t attempt = 0;
+    while (true) {
+        attempt++;
+        esp_err_t err = initCamera();
+        if (err == ESP_OK) return;
+
+        if (firstFailureAt == 0) firstFailureAt = millis();
+        unsigned long downFor = millis() - firstFailureAt;
+        Serial.printf("[Camera] Init attempt #%lu failed (0x%x). Retrying in %lums\n",
+                      (unsigned long)attempt,
+                      (unsigned)err,
+                      (unsigned long)CAMERA_INIT_RETRY_DELAY_MS);
+        if (downFor >= CAMERA_INIT_REBOOT_AFTER_MS) {
+            rebootForPersistentFailure("Camera", downFor);
+        }
+        delay(CAMERA_INIT_RETRY_DELAY_MS);
+    }
+}
+
+static void setupCryptoAuthWithRetries() {
+    unsigned long firstFailureAt = 0;
+    uint32_t attempt = 0;
+    while (true) {
+        attempt++;
+        setupCryptoAuth();
+        if (cryptoAuthReady()) return;
+
+        if (firstFailureAt == 0) firstFailureAt = millis();
+        unsigned long downFor = millis() - firstFailureAt;
+        Serial.printf("[Crypto] setup attempt #%lu not ready. Retrying in %lums\n",
+                      (unsigned long)attempt,
+                      (unsigned long)CRYPTO_AUTH_RETRY_DELAY_MS);
+        if (downFor >= CRYPTO_AUTH_REBOOT_AFTER_MS) {
+            rebootForPersistentFailure("Crypto", downFor);
+        }
+        delay(CRYPTO_AUTH_RETRY_DELAY_MS);
+    }
+}
+
 // Print one aligned "[Config] <label> <status>" line (helper for logConfigStatus).
 static void logConfigLine(const char* label, bool ok, const char* okText, const char* badText) {
     Serial.printf("[Config] %-24s %s\n", label, ok ? okText : badText);
@@ -81,12 +145,8 @@ void setup() {
     // misconfiguration can be ruled out up-front (issue #44).
     logConfigStatus();
 
-    // 1. Initialize Camera
-    if (initCamera() != ESP_OK) {
-        Serial.println("Camera initialization failed");
-        delay(1000);
-        ESP.restart();
-    }
+    // 1. Initialize Camera with resilient retries.
+    initCameraWithRetries();
 
     // 2. Restore persisted global flash (LED) state and apply to GPIO.
     setupFlashState();
@@ -116,7 +176,8 @@ void setup() {
     setupCloudStorage();
 
     // 5. Initialize crypto auth (X25519 keypair from NVS or first-boot gen)
-    setupCryptoAuth();
+    //    with resilient retries + reboot escalation.
+    setupCryptoAuthWithRetries();
 
     // 6. Start Local Stream Server
     startCameraServer();

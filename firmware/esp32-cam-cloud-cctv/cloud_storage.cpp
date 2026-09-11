@@ -14,6 +14,82 @@ static uint32_t upload_seq = 0;   // monotonic counter to disambiguate same-ms u
 static String pendingTunnelUrl;
 static unsigned long nextTunnelPublishAttempt = 0;
 static uint8_t tunnelPublishFailures = 0;
+static uint16_t captureFailStreak = 0;
+static unsigned long captureFailSince = 0;
+static uint16_t uploadFailStreak = 0;
+static unsigned long uploadFailSince = 0;
+
+#ifndef SUPABASE_UPLOAD_MAX_RETRIES
+#define SUPABASE_UPLOAD_MAX_RETRIES 2
+#endif
+
+#ifndef SUPABASE_UPLOAD_RETRY_DELAY_MS
+#define SUPABASE_UPLOAD_RETRY_DELAY_MS 400UL
+#endif
+
+#ifndef SUPABASE_UPLOAD_FAIL_REBOOT_AFTER_COUNT
+#define SUPABASE_UPLOAD_FAIL_REBOOT_AFTER_COUNT 120
+#endif
+
+#ifndef SUPABASE_UPLOAD_FAIL_REBOOT_AFTER_MS
+#define SUPABASE_UPLOAD_FAIL_REBOOT_AFTER_MS (15UL * 60UL * 1000UL)
+#endif
+
+#ifndef SUPABASE_CAPTURE_FAIL_REBOOT_AFTER_COUNT
+#define SUPABASE_CAPTURE_FAIL_REBOOT_AFTER_COUNT 200
+#endif
+
+#ifndef SUPABASE_CAPTURE_FAIL_REBOOT_AFTER_MS
+#define SUPABASE_CAPTURE_FAIL_REBOOT_AFTER_MS (15UL * 60UL * 1000UL)
+#endif
+
+static void markCaptureFailureAndMaybeReboot() {
+  captureFailStreak++;
+  if (captureFailSince == 0) captureFailSince = millis();
+  unsigned long downFor = millis() - captureFailSince;
+  Serial.printf("[Supabase] Capture failure streak=%u (for %lums)\n",
+                (unsigned)captureFailStreak, downFor);
+  if (captureFailStreak >= SUPABASE_CAPTURE_FAIL_REBOOT_AFTER_COUNT &&
+      downFor >= SUPABASE_CAPTURE_FAIL_REBOOT_AFTER_MS) {
+    Serial.printf("[Supabase] Camera capture failed for %lums (%u times). Rebooting for recovery.\n",
+                  downFor, (unsigned)captureFailStreak);
+    delay(1000);
+    ESP.restart();
+  }
+}
+
+static void resetCaptureFailureState() {
+  if (captureFailStreak > 0) {
+    Serial.printf("[Supabase] Camera capture recovered after %u failure(s).\n",
+                  (unsigned)captureFailStreak);
+  }
+  captureFailStreak = 0;
+  captureFailSince = 0;
+}
+
+static void markUploadFailureAndMaybeReboot(int code) {
+  uploadFailStreak++;
+  if (uploadFailSince == 0) uploadFailSince = millis();
+  unsigned long downFor = millis() - uploadFailSince;
+  Serial.printf("[Supabase] Upload failure streak=%u (HTTP %d, for %lums)\n",
+                (unsigned)uploadFailStreak, code, downFor);
+  if (uploadFailStreak >= SUPABASE_UPLOAD_FAIL_REBOOT_AFTER_COUNT &&
+      downFor >= SUPABASE_UPLOAD_FAIL_REBOOT_AFTER_MS) {
+    Serial.printf("[Supabase] Upload path unhealthy for %lums (%u failures). Rebooting for recovery.\n",
+                  downFor, (unsigned)uploadFailStreak);
+    delay(1000);
+    ESP.restart();
+  }
+}
+
+static void resetUploadFailureState() {
+  if (uploadFailStreak > 0) {
+    Serial.printf("[Supabase] Upload path recovered after %u failure(s).\n",
+                  (unsigned)uploadFailStreak);
+  }
+  uploadFailStreak = 0;
+  uploadFailSince = 0;
+}
 
 static bool publishTunnelUrlNow(const String &url) {
   if (WiFi.status() != WL_CONNECTED) {
@@ -86,15 +162,36 @@ void uploadFrameToCloud() {
   camera_fb_t *fb = esp_camera_fb_get();
   if (!fb) {
     Serial.println("[Supabase] ERROR: Camera capture failed for cloud upload");
+    markCaptureFailureAndMaybeReboot();
     return;
   }
+  resetCaptureFailureState();
 
   String filename = buildFrameName();
   Serial.printf("[Supabase] Uploading %s (%u bytes)...\n", filename.c_str(), fb->len);
 
-  unsigned long t0 = millis();
-  int code = supabase.upload(SUPABASE_BUCKET, filename, "image/jpeg", fb->buf, fb->len);
-  unsigned long elapsed = millis() - t0;
+  int code = -1;
+  unsigned long elapsed = 0;
+  bool uploaded = false;
+  uint8_t attemptsUsed = 0;
+  for (uint8_t attempt = 0; attempt <= SUPABASE_UPLOAD_MAX_RETRIES; attempt++) {
+    attemptsUsed = (uint8_t)(attempt + 1);
+    unsigned long t0 = millis();
+    code = supabase.upload(SUPABASE_BUCKET, filename, "image/jpeg", fb->buf, fb->len);
+    elapsed = millis() - t0;
+    if (code == 200 || code == 201 || code == 409) {
+      uploaded = true;
+      break;
+    }
+    if (attempt < SUPABASE_UPLOAD_MAX_RETRIES) {
+      Serial.printf("[Supabase] Upload attempt %u/%u failed (HTTP %d). Retrying in %lums\n",
+                    (unsigned)attemptsUsed,
+                    (unsigned)(SUPABASE_UPLOAD_MAX_RETRIES + 1),
+                    code,
+                    (unsigned long)SUPABASE_UPLOAD_RETRY_DELAY_MS);
+      delay(SUPABASE_UPLOAD_RETRY_DELAY_MS);
+    }
+  }
 
   // ALWAYS rotate so a single failure (or an unexpected 409) can never pin the
   // uploader on one name. The unique timestamp already prevents collisions; the
@@ -103,16 +200,20 @@ void uploadFrameToCloud() {
   frame_index = (frame_index + 1) % STORAGE_FRAME_LIMIT;
   preferences.putInt("frame_index", frame_index);
 
-  if (code == 200 || code == 201) {
-    Serial.printf("[Supabase] Upload OK in %lums. seq=%lu index=%d\n",
-                  elapsed, (unsigned long)upload_seq, frame_index);
-  } else if (code == 409) {
+  if (uploaded && (code == 200 || code == 201)) {
+    resetUploadFailureState();
+    Serial.printf("[Supabase] Upload OK in %lums (attempt %u). seq=%lu index=%d\n",
+                  elapsed, (unsigned)attemptsUsed, (unsigned long)upload_seq, frame_index);
+  } else if (uploaded && code == 409) {
+    resetUploadFailureState();
     // Should no longer happen with unique names, but treat as benign if it does.
-    Serial.printf("[Supabase] Upload skipped: resource already exists (409) in %lums. seq=%lu\n",
-                  elapsed, (unsigned long)upload_seq);
+    Serial.printf("[Supabase] Upload skipped: resource already exists (409) in %lums (attempt %u). seq=%lu\n",
+                  elapsed, (unsigned)attemptsUsed, (unsigned long)upload_seq);
   } else {
-    Serial.printf("[Supabase] Upload FAILED. HTTP code: %d (took %lums). seq=%lu\n",
-                  code, elapsed, (unsigned long)upload_seq);
+    Serial.printf("[Supabase] Upload FAILED after %u attempt(s). HTTP code: %d (last took %lums). "
+                  "Dropping frame and continuing with newer frames. seq=%lu\n",
+                  (unsigned)attemptsUsed, code, elapsed, (unsigned long)upload_seq);
+    markUploadFailureAndMaybeReboot(code);
   }
 
   esp_camera_fb_return(fb);

@@ -214,6 +214,9 @@
 // portal that re-appears (e.g. an expiring ISP session) is caught and cloud
 // uploads are paused again (issue #40).
 #define CAPTIVE_PERIODIC_REPROBE_MS  30000UL
+// If offline/captive state persists for this long despite periodic re-probes,
+// escalate to a full device reboot as the final recovery step.
+#define CAPTIVE_OFFLINE_REBOOT_AFTER_MS (15UL * 60UL * 1000UL)
 #define CAPTIVE_ONLINE_HEARTBEAT_MS  60000UL
 // While ONLINE, tolerate this many consecutive failed probes as transient before
 // flipping to OFFLINE. Each failure is retried after CAPTIVE_ONLINE_RETRY_MS.
@@ -251,3 +254,59 @@
 // instead. At boot (when the portal is first probed) heap is ~140 KB, well above
 // this. Lower it only if you know your build has less headroom.
 #define CAPTIVE_MIN_HEAP_FOR_TLS     60000UL
+
+// -----------------------------------------------------------------------------
+// RESILIENCE ESCALATION (issue #76): retry always, then reboot only after
+// sustained failure windows. These defaults are intentionally conservative.
+// -----------------------------------------------------------------------------
+
+// Camera hardware bring-up in setup():
+// initCamera() retries every CAMERA_INIT_RETRY_DELAY_MS until success.
+// If it stays down for CAMERA_INIT_REBOOT_AFTER_MS, reboot the device.
+#define CAMERA_INIT_RETRY_DELAY_MS          2000UL
+#define CAMERA_INIT_REBOOT_AFTER_MS         (15UL * 60UL * 1000UL)
+
+// WiFi onboarding / reconnect in setupWiFiManager():
+// autoConnect() is bounded by WIFI_MANAGER_PORTAL_TIMEOUT_S so it can retry.
+// After long sustained failure (WIFI_MANAGER_REBOOT_AFTER_MS), reboot.
+#define WIFI_MANAGER_PORTAL_TIMEOUT_S       180
+#define WIFI_MANAGER_RETRY_DELAY_MS         5000UL
+#define WIFI_MANAGER_REBOOT_AFTER_MS        (15UL * 60UL * 1000UL)
+
+// Local HTTP camera server startup (/view, /stream, /flash, /login, /portal):
+// httpd_start() retries; after CAMERA_SERVER_REBOOT_AFTER_MS of continuous
+// failure, reboot.
+#define CAMERA_SERVER_RETRY_DELAY_MS        2000UL
+#define CAMERA_SERVER_REBOOT_AFTER_MS       (15UL * 60UL * 1000UL)
+
+// Crypto auth setup in boot:
+// setupCryptoAuth() retries until ready; if unavailable too long, reboot.
+#define CRYPTO_AUTH_RETRY_DELAY_MS          3000UL
+#define CRYPTO_AUTH_REBOOT_AFTER_MS         (15UL * 60UL * 1000UL)
+
+// Tunnel runtime resilience:
+// - If tunnel is not ready for TUNNEL_NOT_READY_RECOVERY_MS, do a soft
+//   tunnel restart (cooldown TUNNEL_SOFT_RESTART_COOLDOWN_MS).
+// - If soft restarts keep failing (TUNNEL_MAX_SOFT_RECOVERY_ATTEMPTS) OR the
+//   not-ready window reaches TUNNEL_NOT_READY_REBOOT_AFTER_MS, reboot.
+// - If WiFi link remains lost despite reconnect attempts for
+//   TUNNEL_WIFI_LOST_REBOOT_AFTER_MS, reboot.
+#define TUNNEL_NOT_READY_RECOVERY_MS        45000UL
+#define TUNNEL_SOFT_RESTART_COOLDOWN_MS     30000UL
+#define TUNNEL_MAX_SOFT_RECOVERY_ATTEMPTS   12
+#define TUNNEL_NOT_READY_REBOOT_AFTER_MS    (15UL * 60UL * 1000UL)
+#define TUNNEL_WIFI_LOST_REBOOT_AFTER_MS    (15UL * 60UL * 1000UL)
+
+// Cloud upload runtime resilience:
+// - Retry each frame upload SUPABASE_UPLOAD_MAX_RETRIES times.
+// - If still failing, DROP that frame and continue newer frames.
+// - If failures persist for a long streak/window, reboot.
+#define SUPABASE_UPLOAD_MAX_RETRIES         2
+#define SUPABASE_UPLOAD_RETRY_DELAY_MS      400UL
+#define SUPABASE_UPLOAD_FAIL_REBOOT_AFTER_COUNT 120
+#define SUPABASE_UPLOAD_FAIL_REBOOT_AFTER_MS    (15UL * 60UL * 1000UL)
+
+// Camera capture failures during cloud upload (esp_camera_fb_get==NULL):
+// Keep retrying; reboot only after a long persistent streak/window.
+#define SUPABASE_CAPTURE_FAIL_REBOOT_AFTER_COUNT 200
+#define SUPABASE_CAPTURE_FAIL_REBOOT_AFTER_MS    (15UL * 60UL * 1000UL)

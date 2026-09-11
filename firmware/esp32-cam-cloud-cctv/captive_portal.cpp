@@ -126,6 +126,12 @@ static String      s_pendingPass;
 #define CAPTIVE_PERIODIC_REPROBE_MS 30000UL
 #endif
 static unsigned long s_periodicReprobeAt = 0;
+// When offline (still captive / internet unreachable), keep re-probing forever
+// but escalate to a full reboot after a very long sustained outage window.
+#ifndef CAPTIVE_OFFLINE_REBOOT_AFTER_MS
+#define CAPTIVE_OFFLINE_REBOOT_AFTER_MS (15UL * 60UL * 1000UL)
+#endif
+static unsigned long s_offlineSince = 0;
 // Heartbeat interval while the internet IS confirmed reachable. We keep probing
 // (more gently than the offline re-probe) so a captive portal that re-appears
 // mid-operation — e.g. a time-limited ISP session that expires — is detected and
@@ -1807,8 +1813,9 @@ void captivePortalLoop() {
     // reachable (any captive / failed / login-pending state). This lets the
     // device automatically detect when the user has cleared the portal — via the
     // /portal helper OR a manual browser login on any device — and resume cloud
-    // uploads without a reboot. Cloud uploads stay paused via captivePortalIsOnline()
-    // until this heartbeat confirms connectivity (issue #40).
+    // uploads. Cloud uploads stay paused via captivePortalIsOnline() until this
+    // heartbeat confirms connectivity (issue #40). If this state persists for a
+    // very long window, we escalate to a full reboot.
     bool online = captivePortalIsOnline();
     if (online != s_prevOnline) {
         // Connectivity flipped: start the newly-active mode's heartbeat fresh so
@@ -1819,6 +1826,14 @@ void captivePortalLoop() {
         s_prevOnline = online;
     }
     if (!online && WiFi.status() == WL_CONNECTED) {
+        if (s_offlineSince == 0) s_offlineSince = millis();
+        unsigned long offlineFor = millis() - s_offlineSince;
+        if (offlineFor >= CAPTIVE_OFFLINE_REBOOT_AFTER_MS) {
+            Serial.printf("[CaptivePortal] Offline for %lums despite re-probes. Rebooting for recovery.\n",
+                          offlineFor);
+            delay(1000);
+            ESP.restart();
+        }
         if (s_periodicReprobeAt == 0) {
             s_periodicReprobeAt = millis() + CAPTIVE_PERIODIC_REPROBE_MS;
         }
@@ -1835,6 +1850,7 @@ void captivePortalLoop() {
             }
         }
     } else if (online && WiFi.status() == WL_CONNECTED) {
+        s_offlineSince = 0;
         // Online: keep a gentle heartbeat so a captive portal that re-appears
         // mid-operation is caught and uploads are paused again (issue #40).
         if (s_onlineHeartbeatAt == 0) {
@@ -1844,6 +1860,9 @@ void captivePortalLoop() {
             s_onlineHeartbeatAt = millis() + CAPTIVE_ONLINE_HEARTBEAT_MS;
             onlineHeartbeat();
         }
+    } else {
+        // Wi-Fi itself is down; tunnel/wifi recovery logic owns this condition.
+        s_offlineSince = 0;
     }
 #endif
 }

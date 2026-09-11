@@ -29,6 +29,26 @@
 #define CONFIG_SELFHOST_TUNNEL_ID "esp32-cam"
 #endif
 
+#ifndef TUNNEL_NOT_READY_RECOVERY_MS
+#define TUNNEL_NOT_READY_RECOVERY_MS 45000UL
+#endif
+
+#ifndef TUNNEL_SOFT_RESTART_COOLDOWN_MS
+#define TUNNEL_SOFT_RESTART_COOLDOWN_MS 30000UL
+#endif
+
+#ifndef TUNNEL_MAX_SOFT_RECOVERY_ATTEMPTS
+#define TUNNEL_MAX_SOFT_RECOVERY_ATTEMPTS 12
+#endif
+
+#ifndef TUNNEL_NOT_READY_REBOOT_AFTER_MS
+#define TUNNEL_NOT_READY_REBOOT_AFTER_MS (15UL * 60UL * 1000UL)
+#endif
+
+#ifndef TUNNEL_WIFI_LOST_REBOOT_AFTER_MS
+#define TUNNEL_WIFI_LOST_REBOOT_AFTER_MS (15UL * 60UL * 1000UL)
+#endif
+
 void tunnelBegin() {
   Serial.println();
   Serial.println("================ Tunnel Initialization ================");
@@ -128,6 +148,9 @@ void handleTunnel() {
   static bool tunnelStoppedForWifi = false;
   static unsigned long wifiConnectedSince = 0;
   static unsigned long wifiLostSince = 0;
+  static unsigned long tunnelNotReadySince = 0;
+  static unsigned long lastTunnelSoftRestart = 0;
+  static uint16_t tunnelSoftRestartCount = 0;
 
   if (!watchdogLogged) {
     watchdogLogged = true;
@@ -140,6 +163,9 @@ void handleTunnel() {
     unsigned long now = millis();
     wifiConnectedSince = 0;
     if (wifiLostSince == 0) wifiLostSince = now;      // start debounce timer
+    tunnelNotReadySince = 0;
+    lastTunnelSoftRestart = 0;
+    tunnelSoftRestartCount = 0;
 
     // Only act after WiFi has been down continuously for >5s. A transient
     // status=6 blip caused by socket churn must NOT restart the tunnel.
@@ -156,6 +182,13 @@ void handleTunnel() {
         Serial.printf("[WiFi] Link down. status=%d ip=%s heap=%u. Calling WiFi.reconnect().\n",
             wifiStatus, WiFi.localIP().toString().c_str(), ESP.getFreeHeap());
         WiFi.reconnect();
+      }
+      unsigned long wifiDownFor = now - wifiLostSince;
+      if (wifiDownFor >= TUNNEL_WIFI_LOST_REBOOT_AFTER_MS) {
+        Serial.printf("[WiFi] Link down for %lums despite reconnect attempts. Rebooting for recovery.\n",
+                      wifiDownFor);
+        delay(1000);
+        ESP.restart();
       }
     }
   } else if (tunnelStoppedForWifi) {
@@ -178,6 +211,9 @@ void handleTunnel() {
   bool ready = tunnelReady();
 
   if (ready) {
+    tunnelNotReadySince = 0;
+    lastTunnelSoftRestart = 0;
+    tunnelSoftRestartCount = 0;
     if (!wasReady) {
       Serial.println();
       Serial.println("============= TUNNEL CONNECTED =============");
@@ -191,14 +227,52 @@ void handleTunnel() {
     }
   } else {
     wasReady = false;
+    unsigned long now = millis();
+    bool canRecoverTunnel = (wifiStatus == WL_CONNECTED) && !tunnelStoppedForWifi;
+    if (!canRecoverTunnel) {
+      tunnelNotReadySince = 0;
+      lastTunnelSoftRestart = 0;
+      tunnelSoftRestartCount = 0;
+    } else {
+      if (tunnelNotReadySince == 0) tunnelNotReadySince = now;
+      unsigned long downFor = now - tunnelNotReadySince;
+
+      if (downFor >= TUNNEL_NOT_READY_RECOVERY_MS &&
+          (lastTunnelSoftRestart == 0 ||
+           now - lastTunnelSoftRestart >= TUNNEL_SOFT_RESTART_COOLDOWN_MS) &&
+          !isTunnelSlotBusy()) {
+        tunnelSoftRestartCount++;
+        lastTunnelSoftRestart = now;
+        Serial.printf("[Tunnel] Not ready for %lums. Soft recovery %u/%u: restarting tunnel client.\n",
+                      downFor,
+                      (unsigned)tunnelSoftRestartCount,
+                      (unsigned)TUNNEL_MAX_SOFT_RECOVERY_ATTEMPTS);
+        tunnelStop();
+        delay(150);
+        tunnelBegin();
+      }
+
+      if (downFor >= TUNNEL_NOT_READY_REBOOT_AFTER_MS ||
+          tunnelSoftRestartCount >= TUNNEL_MAX_SOFT_RECOVERY_ATTEMPTS) {
+        Serial.printf("[Tunnel] Tunnel unavailable for %lums after %u soft recoveries. Rebooting for recovery.\n",
+                      downFor,
+                      (unsigned)tunnelSoftRestartCount);
+        delay(1000);
+        ESP.restart();
+      }
+    }
+
     if (millis() - lastStatusLog > 5000) {
       lastStatusLog = millis();
+      unsigned long downFor = (tunnelNotReadySince == 0) ? 0 : (millis() - tunnelNotReadySince);
 
       Serial.println();
       Serial.println("------------- Tunnel Status -------------");
       Serial.println("[Tunnel] tunnelReady(): FALSE");
       Serial.printf("[Tunnel] Uptime: %lu ms\n", millis());
       Serial.printf("[Tunnel] Heap: %u bytes\n", ESP.getFreeHeap());
+      Serial.printf("[Tunnel] Not-ready duration: %lu ms | soft recoveries: %u\n",
+                    downFor, (unsigned)tunnelSoftRestartCount);
 
       Serial.print("[Tunnel] WiFi Status: ");
       Serial.println(WiFi.status());
