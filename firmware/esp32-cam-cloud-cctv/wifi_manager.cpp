@@ -3,17 +3,11 @@
 #include <WiFi.h>
 #include <WiFiManager.h>
 
-#ifndef WIFI_MANAGER_PORTAL_TIMEOUT_S
-#define WIFI_MANAGER_PORTAL_TIMEOUT_S 180
-#endif
-
-#ifndef WIFI_MANAGER_RETRY_DELAY_MS
-#define WIFI_MANAGER_RETRY_DELAY_MS 5000UL
-#endif
-
-#ifndef WIFI_MANAGER_RUNTIME_DISCONNECT_DEBOUNCE_MS
-#define WIFI_MANAGER_RUNTIME_DISCONNECT_DEBOUNCE_MS 12000UL
-#endif
+namespace {
+constexpr uint16_t kWiFiPortalTimeoutS = 180;
+constexpr unsigned long kWiFiRetryDelayMs = 5000UL;
+constexpr unsigned long kWiFiRuntimeDisconnectDebounceMs = 12000UL;
+}
 
 void setupWiFiManager() {
     WiFiManager wm;
@@ -28,7 +22,7 @@ void setupWiFiManager() {
     wm.setClass("invert");
 
     // Force autoConnect() to return periodically so we can keep retrying forever.
-    wm.setConfigPortalTimeout(WIFI_MANAGER_PORTAL_TIMEOUT_S);
+    wm.setConfigPortalTimeout(kWiFiPortalTimeoutS);
 
     unsigned long firstFailureAt = 0;
     uint32_t attempt = 0;
@@ -36,7 +30,7 @@ void setupWiFiManager() {
         attempt++;
         Serial.printf("[WiFi] autoConnect attempt #%lu (portal timeout=%us, AP=%s)\n",
                       (unsigned long)attempt,
-                      (unsigned)WIFI_MANAGER_PORTAL_TIMEOUT_S,
+                      (unsigned)kWiFiPortalTimeoutS,
                       WIFI_AP_NAME);
 
         bool res = wm.autoConnect(WIFI_AP_NAME);
@@ -50,10 +44,10 @@ void setupWiFiManager() {
         if (firstFailureAt == 0) firstFailureAt = millis();
         unsigned long downFor = millis() - firstFailureAt;
         Serial.printf("[WiFi] autoConnect failed. Retrying in %lums (offline for %lums)\n",
-                      (unsigned long)WIFI_MANAGER_RETRY_DELAY_MS,
+                      (unsigned long)kWiFiRetryDelayMs,
                       downFor);
 
-        delay(WIFI_MANAGER_RETRY_DELAY_MS);
+        delay(kWiFiRetryDelayMs);
     }
 }
 
@@ -81,8 +75,8 @@ void loopWiFiManager() {
     }
 
     unsigned long wifiDownFor = now - wifiLostSince;
-    if (wifiDownFor >= WIFI_MANAGER_RUNTIME_DISCONNECT_DEBOUNCE_MS &&
-        (lastReconnectAttempt == 0 || now - lastReconnectAttempt >= WIFI_MANAGER_RETRY_DELAY_MS)) {
+    if (wifiDownFor >= kWiFiRuntimeDisconnectDebounceMs &&
+        (lastReconnectAttempt == 0 || now - lastReconnectAttempt >= kWiFiRetryDelayMs)) {
         lastReconnectAttempt = now;
         Serial.printf("[WiFi] Link down for %lums. Retrying saved Wi-Fi credentials.\n", wifiDownFor);
         WiFi.reconnect();
