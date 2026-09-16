@@ -205,6 +205,10 @@ void loop() {
         Serial.printf("[Heartbeat] Uptime: %lu ms. Free Heap: %u\n", millis(), ESP.getFreeHeap());
     }
 
+    // Keep retrying saved Wi-Fi credentials in the background so link drops
+    // recover automatically even when tunnel logic is paused.
+    loopWiFiManager();
+
     // Keep tunnel alive only when internet connectivity is confirmed. Otherwise
     // keep it paused so captive-portal logins are not disrupted by tunnel retries.
     if (captivePortalIsOnline()) {

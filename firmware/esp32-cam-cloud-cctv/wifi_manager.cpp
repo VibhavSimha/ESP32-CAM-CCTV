@@ -3,17 +3,12 @@
 #include <WiFi.h>
 #include <WiFiManager.h>
 
-#ifndef WIFI_MANAGER_PORTAL_TIMEOUT_S
-#define WIFI_MANAGER_PORTAL_TIMEOUT_S 180
-#endif
-
-#ifndef WIFI_MANAGER_RETRY_DELAY_MS
-#define WIFI_MANAGER_RETRY_DELAY_MS 5000UL
-#endif
-
-#ifndef WIFI_MANAGER_REBOOT_AFTER_MS
-#define WIFI_MANAGER_REBOOT_AFTER_MS (15UL * 60UL * 1000UL)
-#endif
+namespace {
+constexpr uint16_t kWiFiPortalTimeoutS = 180;
+constexpr unsigned long kWiFiRetryDelayMs = 5000UL;
+constexpr unsigned long kWiFiRuntimeDisconnectDebounceMs = 12000UL;
+constexpr unsigned long kWiFiRuntimePortalRecoveryMs = 30000UL;
+}
 
 void setupWiFiManager() {
     WiFiManager wm;
@@ -27,9 +22,8 @@ void setupWiFiManager() {
     // set dark theme
     wm.setClass("invert");
 
-    // Force autoConnect() to return periodically so we can keep retrying forever
-    // and escalate to a full reboot only after a very long outage window.
-    wm.setConfigPortalTimeout(WIFI_MANAGER_PORTAL_TIMEOUT_S);
+    // Force autoConnect() to return periodically so we can keep retrying forever.
+    wm.setConfigPortalTimeout(kWiFiPortalTimeoutS);
 
     unsigned long firstFailureAt = 0;
     uint32_t attempt = 0;
@@ -37,7 +31,7 @@ void setupWiFiManager() {
         attempt++;
         Serial.printf("[WiFi] autoConnect attempt #%lu (portal timeout=%us, AP=%s)\n",
                       (unsigned long)attempt,
-                      (unsigned)WIFI_MANAGER_PORTAL_TIMEOUT_S,
+                      (unsigned)kWiFiPortalTimeoutS,
                       WIFI_AP_NAME);
 
         bool res = wm.autoConnect(WIFI_AP_NAME);
@@ -51,15 +45,54 @@ void setupWiFiManager() {
         if (firstFailureAt == 0) firstFailureAt = millis();
         unsigned long downFor = millis() - firstFailureAt;
         Serial.printf("[WiFi] autoConnect failed. Retrying in %lums (offline for %lums)\n",
-                      (unsigned long)WIFI_MANAGER_RETRY_DELAY_MS,
+                      (unsigned long)kWiFiRetryDelayMs,
                       downFor);
 
-        if (downFor >= WIFI_MANAGER_REBOOT_AFTER_MS) {
-            Serial.printf("[WiFi] Offline for %lums despite retries. Rebooting for recovery.\n", downFor);
-            delay(1000);
-            ESP.restart();
-        }
+        delay(kWiFiRetryDelayMs);
+    }
+}
 
-        delay(WIFI_MANAGER_RETRY_DELAY_MS);
+void loopWiFiManager() {
+    static unsigned long wifiLostSince = 0;
+    static unsigned long lastReconnectAttempt = 0;
+    static bool runtimePortalRecoveryStarted = false;
+
+    wl_status_t wifiStatus = WiFi.status();
+    if (wifiStatus == WL_CONNECTED) {
+        if (wifiLostSince != 0) {
+            unsigned long recoveredAfter = millis() - wifiLostSince;
+            Serial.printf("[WiFi] Link recovered after %lums. ip=%s\n",
+                          recoveredAfter,
+                          WiFi.localIP().toString().c_str());
+        }
+        wifiLostSince = 0;
+        lastReconnectAttempt = 0;
+        runtimePortalRecoveryStarted = false;
+        return;
+    }
+
+    unsigned long now = millis();
+    if (wifiLostSince == 0) {
+        wifiLostSince = now;
+        Serial.printf("[WiFi] Link lost. status=%d. Starting reconnect watchdog.\n", wifiStatus);
+    }
+
+    unsigned long wifiDownFor = now - wifiLostSince;
+    if (wifiDownFor >= kWiFiRuntimeDisconnectDebounceMs &&
+        (lastReconnectAttempt == 0 || now - lastReconnectAttempt >= kWiFiRetryDelayMs)) {
+        lastReconnectAttempt = now;
+        Serial.printf("[WiFi] Link down for %lums. Retrying saved Wi-Fi credentials.\n", wifiDownFor);
+        WiFi.reconnect();
+    }
+
+    if (!runtimePortalRecoveryStarted && wifiDownFor >= kWiFiRuntimePortalRecoveryMs) {
+        runtimePortalRecoveryStarted = true;
+        Serial.printf("[WiFi] Link down for %lums. Opening %s portal so Wi-Fi can be changed.\n",
+                      wifiDownFor, WIFI_AP_NAME);
+        setupWiFiManager();
+        wifiLostSince = 0;
+        lastReconnectAttempt = 0;
+        runtimePortalRecoveryStarted = false;
+        return;
     }
 }

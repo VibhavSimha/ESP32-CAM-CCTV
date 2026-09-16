@@ -256,8 +256,8 @@
 #define CAPTIVE_MIN_HEAP_FOR_TLS     60000UL
 
 // -----------------------------------------------------------------------------
-// RESILIENCE ESCALATION (issue #76): retry always, then reboot only after
-// sustained failure windows. These defaults are intentionally conservative.
+// RESILIENCE ESCALATION (issue #76): retry always, with reboot after sustained
+// failure windows where applicable. These defaults are intentionally conservative.
 // -----------------------------------------------------------------------------
 
 // Camera hardware bring-up in setup():
@@ -266,12 +266,13 @@
 #define CAMERA_INIT_RETRY_DELAY_MS          2000UL
 #define CAMERA_INIT_REBOOT_AFTER_MS         (15UL * 60UL * 1000UL)
 
-// WiFi onboarding / reconnect in setupWiFiManager():
-// autoConnect() is bounded by WIFI_MANAGER_PORTAL_TIMEOUT_S so it can retry.
-// After long sustained failure (WIFI_MANAGER_REBOOT_AFTER_MS), reboot.
-#define WIFI_MANAGER_PORTAL_TIMEOUT_S       180
-#define WIFI_MANAGER_RETRY_DELAY_MS         5000UL
-#define WIFI_MANAGER_REBOOT_AFTER_MS        (15UL * 60UL * 1000UL)
+// WiFi onboarding in setupWiFiManager() + runtime link recovery in
+// loopWiFiManager():
+// this is always-on default behavior and is not controlled via config.h:
+// - boot connect keeps retrying indefinitely while exposing the setup AP
+// - runtime disconnects keep retrying saved credentials indefinitely
+// - after sustained runtime disconnect, the device re-enters the setup AP
+//   portal automatically so you can switch to a different Wi-Fi network
 
 // Local HTTP camera server startup (/view, /stream, /flash, /login, /portal):
 // httpd_start() retries; after CAMERA_SERVER_REBOOT_AFTER_MS of continuous
