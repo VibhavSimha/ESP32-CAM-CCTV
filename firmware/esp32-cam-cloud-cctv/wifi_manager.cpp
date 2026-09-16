@@ -15,6 +15,10 @@
 #define WIFI_MANAGER_REBOOT_AFTER_MS (15UL * 60UL * 1000UL)
 #endif
 
+#ifndef WIFI_MANAGER_RUNTIME_DISCONNECT_DEBOUNCE_MS
+#define WIFI_MANAGER_RUNTIME_DISCONNECT_DEBOUNCE_MS 12000UL
+#endif
+
 void setupWiFiManager() {
     WiFiManager wm;
     WiFi.persistent(true);
@@ -61,5 +65,43 @@ void setupWiFiManager() {
         }
 
         delay(WIFI_MANAGER_RETRY_DELAY_MS);
+    }
+}
+
+void loopWiFiManager() {
+    static unsigned long wifiLostSince = 0;
+    static unsigned long lastReconnectAttempt = 0;
+
+    wl_status_t wifiStatus = WiFi.status();
+    if (wifiStatus == WL_CONNECTED) {
+        if (wifiLostSince != 0) {
+            unsigned long recoveredAfter = millis() - wifiLostSince;
+            Serial.printf("[WiFi] Link recovered after %lums. ip=%s\n",
+                          recoveredAfter,
+                          WiFi.localIP().toString().c_str());
+        }
+        wifiLostSince = 0;
+        lastReconnectAttempt = 0;
+        return;
+    }
+
+    unsigned long now = millis();
+    if (wifiLostSince == 0) {
+        wifiLostSince = now;
+        Serial.printf("[WiFi] Link lost. status=%d. Starting reconnect watchdog.\n", wifiStatus);
+    }
+
+    unsigned long wifiDownFor = now - wifiLostSince;
+    if (wifiDownFor >= WIFI_MANAGER_RUNTIME_DISCONNECT_DEBOUNCE_MS &&
+        (lastReconnectAttempt == 0 || now - lastReconnectAttempt >= WIFI_MANAGER_RETRY_DELAY_MS)) {
+        lastReconnectAttempt = now;
+        Serial.printf("[WiFi] Link down for %lums. Retrying saved Wi-Fi credentials.\n", wifiDownFor);
+        WiFi.reconnect();
+    }
+
+    if (wifiDownFor >= WIFI_MANAGER_REBOOT_AFTER_MS) {
+        Serial.printf("[WiFi] Link down for %lums despite retries. Rebooting for recovery.\n", wifiDownFor);
+        delay(1000);
+        ESP.restart();
     }
 }

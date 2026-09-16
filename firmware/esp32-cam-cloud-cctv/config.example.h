@@ -266,10 +266,15 @@
 #define CAMERA_INIT_RETRY_DELAY_MS          2000UL
 #define CAMERA_INIT_REBOOT_AFTER_MS         (15UL * 60UL * 1000UL)
 
-// WiFi onboarding / reconnect in setupWiFiManager():
+// WiFi onboarding in setupWiFiManager() + runtime link recovery in
+// loopWiFiManager():
 // autoConnect() is bounded by WIFI_MANAGER_PORTAL_TIMEOUT_S so it can retry.
+// During runtime, a brief drop is debounced for
+// WIFI_MANAGER_RUNTIME_DISCONNECT_DEBOUNCE_MS, then saved credentials are
+// retried every WIFI_MANAGER_RETRY_DELAY_MS.
 // After long sustained failure (WIFI_MANAGER_REBOOT_AFTER_MS), reboot.
 #define WIFI_MANAGER_PORTAL_TIMEOUT_S       180
+#define WIFI_MANAGER_RUNTIME_DISCONNECT_DEBOUNCE_MS 12000UL
 #define WIFI_MANAGER_RETRY_DELAY_MS         5000UL
 #define WIFI_MANAGER_REBOOT_AFTER_MS        (15UL * 60UL * 1000UL)
 
