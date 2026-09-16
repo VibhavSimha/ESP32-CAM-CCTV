@@ -7,6 +7,7 @@ namespace {
 constexpr uint16_t kWiFiPortalTimeoutS = 180;
 constexpr unsigned long kWiFiRetryDelayMs = 5000UL;
 constexpr unsigned long kWiFiRuntimeDisconnectDebounceMs = 12000UL;
+constexpr unsigned long kWiFiRuntimePortalRecoveryMs = 30000UL;
 }
 
 void setupWiFiManager() {
@@ -54,6 +55,7 @@ void setupWiFiManager() {
 void loopWiFiManager() {
     static unsigned long wifiLostSince = 0;
     static unsigned long lastReconnectAttempt = 0;
+    static bool runtimePortalRecoveryStarted = false;
 
     wl_status_t wifiStatus = WiFi.status();
     if (wifiStatus == WL_CONNECTED) {
@@ -65,6 +67,7 @@ void loopWiFiManager() {
         }
         wifiLostSince = 0;
         lastReconnectAttempt = 0;
+        runtimePortalRecoveryStarted = false;
         return;
     }
 
@@ -82,4 +85,14 @@ void loopWiFiManager() {
         WiFi.reconnect();
     }
 
+    if (!runtimePortalRecoveryStarted && wifiDownFor >= kWiFiRuntimePortalRecoveryMs) {
+        runtimePortalRecoveryStarted = true;
+        Serial.printf("[WiFi] Link down for %lums. Opening %s portal so Wi-Fi can be changed.\n",
+                      wifiDownFor, WIFI_AP_NAME);
+        setupWiFiManager();
+        wifiLostSince = 0;
+        lastReconnectAttempt = 0;
+        runtimePortalRecoveryStarted = false;
+        return;
+    }
 }

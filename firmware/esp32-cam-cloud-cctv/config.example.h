@@ -271,6 +271,8 @@
 // this is always-on default behavior and is not controlled via config.h:
 // - boot connect keeps retrying indefinitely while exposing the setup AP
 // - runtime disconnects keep retrying saved credentials indefinitely
+// - after sustained runtime disconnect, the device re-enters the setup AP
+//   portal automatically so you can switch to a different Wi-Fi network
 
 // Local HTTP camera server startup (/view, /stream, /flash, /login, /portal):
 // httpd_start() retries; after CAMERA_SERVER_REBOOT_AFTER_MS of continuous
