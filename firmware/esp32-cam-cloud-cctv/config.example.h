@@ -268,15 +268,14 @@
 
 // WiFi onboarding in setupWiFiManager() + runtime link recovery in
 // loopWiFiManager():
-// autoConnect() is bounded by WIFI_MANAGER_PORTAL_TIMEOUT_S so it can retry.
+// autoConnect() is bounded by WIFI_MANAGER_PORTAL_TIMEOUT_S so it can keep
+// retrying indefinitely while exposing the setup AP.
 // During runtime, a brief drop is debounced for
 // WIFI_MANAGER_RUNTIME_DISCONNECT_DEBOUNCE_MS, then saved credentials are
-// retried every WIFI_MANAGER_RETRY_DELAY_MS.
-// After long sustained failure (WIFI_MANAGER_REBOOT_AFTER_MS), reboot.
+// retried every WIFI_MANAGER_RETRY_DELAY_MS indefinitely.
 #define WIFI_MANAGER_PORTAL_TIMEOUT_S       180
 #define WIFI_MANAGER_RUNTIME_DISCONNECT_DEBOUNCE_MS 12000UL
 #define WIFI_MANAGER_RETRY_DELAY_MS         5000UL
-#define WIFI_MANAGER_REBOOT_AFTER_MS        (15UL * 60UL * 1000UL)
 
 // Local HTTP camera server startup (/view, /stream, /flash, /login, /portal):
 // httpd_start() retries; after CAMERA_SERVER_REBOOT_AFTER_MS of continuous

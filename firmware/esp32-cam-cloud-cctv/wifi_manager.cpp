@@ -11,10 +11,6 @@
 #define WIFI_MANAGER_RETRY_DELAY_MS 5000UL
 #endif
 
-#ifndef WIFI_MANAGER_REBOOT_AFTER_MS
-#define WIFI_MANAGER_REBOOT_AFTER_MS (15UL * 60UL * 1000UL)
-#endif
-
 #ifndef WIFI_MANAGER_RUNTIME_DISCONNECT_DEBOUNCE_MS
 #define WIFI_MANAGER_RUNTIME_DISCONNECT_DEBOUNCE_MS 12000UL
 #endif
@@ -31,8 +27,7 @@ void setupWiFiManager() {
     // set dark theme
     wm.setClass("invert");
 
-    // Force autoConnect() to return periodically so we can keep retrying forever
-    // and escalate to a full reboot only after a very long outage window.
+    // Force autoConnect() to return periodically so we can keep retrying forever.
     wm.setConfigPortalTimeout(WIFI_MANAGER_PORTAL_TIMEOUT_S);
 
     unsigned long firstFailureAt = 0;
@@ -57,12 +52,6 @@ void setupWiFiManager() {
         Serial.printf("[WiFi] autoConnect failed. Retrying in %lums (offline for %lums)\n",
                       (unsigned long)WIFI_MANAGER_RETRY_DELAY_MS,
                       downFor);
-
-        if (downFor >= WIFI_MANAGER_REBOOT_AFTER_MS) {
-            Serial.printf("[WiFi] Offline for %lums despite retries. Rebooting for recovery.\n", downFor);
-            delay(1000);
-            ESP.restart();
-        }
 
         delay(WIFI_MANAGER_RETRY_DELAY_MS);
     }
@@ -99,9 +88,4 @@ void loopWiFiManager() {
         WiFi.reconnect();
     }
 
-    if (wifiDownFor >= WIFI_MANAGER_REBOOT_AFTER_MS) {
-        Serial.printf("[WiFi] Link down for %lums despite retries. Rebooting for recovery.\n", wifiDownFor);
-        delay(1000);
-        ESP.restart();
-    }
 }
