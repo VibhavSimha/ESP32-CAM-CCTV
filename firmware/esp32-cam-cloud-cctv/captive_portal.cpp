@@ -24,6 +24,12 @@
 // empty body; a captive portal intercepts it with a redirect or login page.
 #define CAPTIVE_PROBE_URL "http://connectivitycheck.gstatic.com/generate_204"
 #endif
+#ifndef CAPTIVE_PROBE_URL_FALLBACK_1
+#define CAPTIVE_PROBE_URL_FALLBACK_1 "http://www.google.com/generate_204"
+#endif
+#ifndef CAPTIVE_PROBE_URL_FALLBACK_2
+#define CAPTIVE_PROBE_URL_FALLBACK_2 "http://clients3.google.com/generate_204"
+#endif
 
 #ifndef CAPTIVE_PROBE_TIMEOUT_MS
 #define CAPTIVE_PROBE_TIMEOUT_MS 6000
@@ -145,16 +151,24 @@ static unsigned long s_onlineHeartbeatAt = 0;
 // serving for a few short retries before flipping to OFFLINE and pausing cloud
 // uploads / stopping the tunnel.
 #ifndef CAPTIVE_ONLINE_RETRY_ATTEMPTS
-#define CAPTIVE_ONLINE_RETRY_ATTEMPTS 2
+#define CAPTIVE_ONLINE_RETRY_ATTEMPTS 4
 #endif
 #ifndef CAPTIVE_ONLINE_RETRY_MS
-#define CAPTIVE_ONLINE_RETRY_MS 5000UL
+#define CAPTIVE_ONLINE_RETRY_MS 7000UL
+#endif
+#ifndef CAPTIVE_RESUME_SUCCESS_STREAK
+#define CAPTIVE_RESUME_SUCCESS_STREAK 2
+#endif
+#ifndef CAPTIVE_RESUME_SUCCESS_RETRY_MS
+#define CAPTIVE_RESUME_SUCCESS_RETRY_MS 2000UL
 #endif
 static uint8_t s_onlineFailStreak = 0;
+static uint8_t s_reprobeSuccessStreak = 0;
 // Tracks the previous connectivity state so captivePortalLoop() can reset the
 // heartbeat timers exactly once on an offline<->online transition, rather than
 // on every loop tick (issue #40).
 static bool s_prevOnline = false;
+static String s_lastProbeUrl = String(CAPTIVE_PROBE_URL);
 
 PortalState captivePortalGetState() { return s_state; }
 
@@ -594,16 +608,17 @@ static bool isHttpRedirectCode(int code) {
     return code == 301 || code == 302 || code == 303 || code == 307 || code == 308;
 }
 
-// Perform the connectivity probe. Returns the HTTP status code (or a negative
-// HTTPClient error), fills `body` and, on a redirect, `location`.
-static int probeInternet(String& body, String& location) {
+// Perform one connectivity probe against `probeUrl`. Returns HTTP status code
+// (or a negative HTTPClient error), fills `body` and redirect `location`.
+static int probeInternetOnce(const String& probeUrl, const char* label,
+                             String& body, String& location) {
     body = "";
     location = "";
-    const String probeUrl = String(CAPTIVE_PROBE_URL);
+    s_lastProbeUrl = probeUrl;
     // Keep probe latency bounded by CAPTIVE_PROBE_TIMEOUT_MS. DNS trace lookups
     // can block for many seconds on some networks, so skip that diagnostic on the
     // hot-path probe itself.
-    logHttpRequestStart("Probe", "GET", probeUrl, CAPTIVE_PROBE_TIMEOUT_MS, false, false);
+    logHttpRequestStart(label, "GET", probeUrl, CAPTIVE_PROBE_TIMEOUT_MS, false, false);
     // Declare the WiFiClient BEFORE the HTTPClient. Locals are destroyed in
     // reverse order, so this guarantees the HTTPClient (which holds a pointer to
     // the client via http.begin()) is torn down first, while the client is still
@@ -616,7 +631,7 @@ static int probeInternet(String& body, String& location) {
     http.setTimeout(CAPTIVE_PROBE_TIMEOUT_MS);
     http.setFollowRedirects(HTTPC_DISABLE_FOLLOW_REDIRECTS);
     if (!http.begin(client, probeUrl)) {
-        logHttpResultDetail("Probe", -1000, millis() - t0, 0, String(), String(), String());
+        logHttpResultDetail(label, -1000, millis() - t0, 0, String(), String(), String());
         return -1000;
     }
     const char* headerKeys[] = {"Location", "Set-Cookie", "Content-Type"};
@@ -634,11 +649,42 @@ static int probeInternet(String& body, String& location) {
             }
         }
     }
-    logHttpResultDetail("Probe", code, millis() - t0, body.length(), location, setCookie, contentType);
+    logHttpResultDetail(label, code, millis() - t0, body.length(), location, setCookie, contentType);
     if (code > 0 && code != 204 && body.length()) {
-        logBodyPreview("Probe", body);
+        logBodyPreview(label, body);
     }
     http.end();
+    return code;
+}
+
+// Perform the connectivity probe with transport-failure fallbacks. Redirect-like
+// responses still win immediately (they indicate a captive portal), while pure
+// transport failures (<= 0) can retry alternate 204 endpoints before deciding
+// the network is offline/unreachable.
+static int probeInternet(String& body, String& location) {
+    int code = probeInternetOnce(String(CAPTIVE_PROBE_URL), "Probe", body, location);
+    if (code > 0) return code;
+
+    const char* fallbackUrls[] = {
+        CAPTIVE_PROBE_URL_FALLBACK_1,
+        CAPTIVE_PROBE_URL_FALLBACK_2
+    };
+    for (const char* fallback : fallbackUrls) {
+        if (!fallback || !fallback[0]) continue;
+        String fallbackUrl = String(fallback);
+        if (fallbackUrl == String(CAPTIVE_PROBE_URL)) continue;
+
+        Serial.printf("[CaptivePortal] Probe transport failure (HTTP %d). Trying fallback: %s\n",
+                      code, fallbackUrl.c_str());
+        String fbBody, fbLocation;
+        int fbCode = probeInternetOnce(fallbackUrl, "Probe fallback", fbBody, fbLocation);
+        if (fbCode > 0) {
+            body = fbBody;
+            location = fbLocation;
+            return fbCode;
+        }
+        code = fbCode;
+    }
     return code;
 }
 
@@ -1071,9 +1117,10 @@ void captivePortalBegin() {
     String body, location;
     int code = probeInternet(body, location);
     if (code < 0) {
-        Serial.printf("[CaptivePortal] Probe %s -> HTTP %d (%s)\n", CAPTIVE_PROBE_URL, code, httpErrorName(code));
+        Serial.printf("[CaptivePortal] Probe %s -> HTTP %d (%s)\n",
+                      s_lastProbeUrl.c_str(), code, httpErrorName(code));
     } else {
-        Serial.printf("[CaptivePortal] Probe %s -> HTTP %d%s\n", CAPTIVE_PROBE_URL, code,
+        Serial.printf("[CaptivePortal] Probe %s -> HTTP %d%s\n", s_lastProbeUrl.c_str(), code,
                       code >= 300 && code < 400 ? " (redirected — captive portal)" : "");
     }
 
@@ -1345,12 +1392,17 @@ static void buildPortalDiagnostics(String& d) {
     d += "uptime_ms       : "; d += (unsigned long)millis(); d += "\n";
     d += "-- config (captive portal) --\n";
     d += "probeUrl        : "; d += CAPTIVE_PROBE_URL; d += "\n";
+    d += "probeFallback1  : "; d += CAPTIVE_PROBE_URL_FALLBACK_1; d += "\n";
+    d += "probeFallback2  : "; d += CAPTIVE_PROBE_URL_FALLBACK_2; d += "\n";
+    d += "probeLastUsed   : "; d += (s_lastProbeUrl.length() ? s_lastProbeUrl : String("(none)")); d += "\n";
     d += "probeTimeout_ms : "; d += (int)CAPTIVE_PROBE_TIMEOUT_MS; d += "\n";
     d += "portalTimeout_ms: "; d += (int)CAPTIVE_PORTAL_HTTP_TIMEOUT_MS; d += "\n";
     d += "maxLoginAttempts: "; d += (int)CAPTIVE_MAX_LOGIN_ATTEMPTS; d += "\n";
     d += "maxRedirectHops : "; d += (int)CAPTIVE_MAX_REDIRECT_HOPS; d += "\n";
     d += "onlineRetryTrys : "; d += (int)CAPTIVE_ONLINE_RETRY_ATTEMPTS; d += "\n";
     d += "onlineRetry_ms  : "; d += (unsigned long)CAPTIVE_ONLINE_RETRY_MS; d += "\n";
+    d += "resumeSuccesses : "; d += (int)CAPTIVE_RESUME_SUCCESS_STREAK; d += "\n";
+    d += "resumeRetry_ms  : "; d += (unsigned long)CAPTIVE_RESUME_SUCCESS_RETRY_MS; d += "\n";
     d += "logPortalPage   : "; d += (int)CAPTIVE_LOG_PORTAL_PAGE; d += "\n";
     d += "logHttpTrace    : "; d += (int)CAPTIVE_LOG_HTTP_TRACE; d += "\n";
 }
@@ -1386,18 +1438,33 @@ static void doReprobe() {
     int code = probeInternet(body, location);
     if (code < 0) {
         Serial.printf("[CaptivePortal] Heartbeat re-probe %s -> HTTP %d (%s)\n",
-                      CAPTIVE_PROBE_URL, code, httpErrorName(code));
+                      s_lastProbeUrl.c_str(), code, httpErrorName(code));
     } else {
-        Serial.printf("[CaptivePortal] Heartbeat re-probe %s -> HTTP %d\n", CAPTIVE_PROBE_URL, code);
+        Serial.printf("[CaptivePortal] Heartbeat re-probe %s -> HTTP %d\n",
+                      s_lastProbeUrl.c_str(), code);
     }
     std::string b(body.c_str(), body.length());
     if (code > 0 && !looksLikeCaptivePortal(code, b)) {
-        setStatus(PORTAL_STATE_SUCCESS, "Portal login succeeded — you are online.");
-        persistSeen(WiFi.SSID());
-        Serial.println("[CaptivePortal] Internet reachable — portal cleared. Cloud uploads resume.");
+        s_reprobeSuccessStreak++;
+        if (s_reprobeSuccessStreak >= CAPTIVE_RESUME_SUCCESS_STREAK) {
+            s_reprobeSuccessStreak = 0;
+            setStatus(PORTAL_STATE_SUCCESS, "Portal login succeeded — you are online.");
+            persistSeen(WiFi.SSID());
+            Serial.println("[CaptivePortal] Internet reachable — portal cleared. Cloud uploads resume.");
+        } else {
+            setStatus(s_state, "Connectivity check passed once — confirming stability…");
+            Serial.printf("[CaptivePortal] Connectivity verification %u/%u successful; "
+                          "waiting for one more clean probe before resuming uploads.\n",
+                          (unsigned)s_reprobeSuccessStreak,
+                          (unsigned)CAPTIVE_RESUME_SUCCESS_STREAK);
+            s_periodicReprobeAt = millis() + CAPTIVE_RESUME_SUCCESS_RETRY_MS;
+            return;
+        }
     } else if (code <= 0) {
+        s_reprobeSuccessStreak = 0;
         setStatus(s_state, "Could not reach the internet. If you have logged in via your browser, try again in a moment.");
     } else {
+        s_reprobeSuccessStreak = 0;
         // The probe can flap between "transport error" and "portal redirect" on
         // some hotspots. If we have no usable portal context yet (FAILED/UNKNOWN)
         // or only a stale unsupported snapshot, refresh portal detection now so
@@ -1475,9 +1542,10 @@ static void doRedetectAndSubmit() {
     int code = probeInternet(body, location);
     if (code < 0) {
         Serial.printf("[CaptivePortal] Manual submit: re-probe %s -> HTTP %d (%s)\n",
-                      CAPTIVE_PROBE_URL, code, httpErrorName(code));
+                      s_lastProbeUrl.c_str(), code, httpErrorName(code));
     } else {
-        Serial.printf("[CaptivePortal] Manual submit: re-probe %s -> HTTP %d\n", CAPTIVE_PROBE_URL, code);
+        Serial.printf("[CaptivePortal] Manual submit: re-probe %s -> HTTP %d\n",
+                      s_lastProbeUrl.c_str(), code);
     }
     std::string b(body.c_str(), body.length());
 
@@ -1550,6 +1618,7 @@ static void onlineHeartbeat() {
     int code = probeInternet(body, location);
     std::string b(body.c_str(), body.length());
     if (code > 0 && !looksLikeCaptivePortal(code, b)) {
+        s_reprobeSuccessStreak = 0;
         if (s_onlineFailStreak > 0) {
             Serial.printf("[CaptivePortal] Online heartbeat recovered after %u transient failure(s).\n",
                           (unsigned)s_onlineFailStreak);
@@ -1559,6 +1628,7 @@ static void onlineHeartbeat() {
     }
 
     s_onlineFailStreak++;
+    s_reprobeSuccessStreak = 0;
     if (s_onlineFailStreak <= CAPTIVE_ONLINE_RETRY_ATTEMPTS) {
         s_onlineHeartbeatAt = millis() + CAPTIVE_ONLINE_RETRY_MS;
         Serial.printf("[CaptivePortal] Online heartbeat transient failure (HTTP %d). "
@@ -1823,6 +1893,7 @@ void captivePortalLoop() {
         s_periodicReprobeAt = 0;
         s_onlineHeartbeatAt = 0;
         s_onlineFailStreak = 0;
+        s_reprobeSuccessStreak = 0;
         s_prevOnline = online;
     }
     if (!online && WiFi.status() == WL_CONNECTED) {

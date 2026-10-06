@@ -195,6 +195,11 @@
 // captive portal intercepts it with a redirect or a login page, which is how we
 // detect the portal. Keep it HTTP (not HTTPS) so interception is observable.
 #define CAPTIVE_PROBE_URL           "http://connectivitycheck.gstatic.com/generate_204"
+// Fallback probe endpoints used only when the primary probe fails with a
+// transport error (HTTP <= 0). Captive redirects (HTTP 30x/login page) still
+// win immediately and are not retried here.
+#define CAPTIVE_PROBE_URL_FALLBACK_1 "http://www.google.com/generate_204"
+#define CAPTIVE_PROBE_URL_FALLBACK_2 "http://clients3.google.com/generate_204"
 
 // Timeout (ms) for the plain internet connectivity probe. Keep this modest so
 // offline checks fail fast and the main loop stays responsive.
@@ -221,8 +226,12 @@
 // While ONLINE, tolerate this many consecutive failed probes as transient before
 // flipping to OFFLINE. Each failure is retried after CAPTIVE_ONLINE_RETRY_MS.
 // This avoids "fail hard" behavior on brief Wi-Fi/power jitter.
-#define CAPTIVE_ONLINE_RETRY_ATTEMPTS 2
-#define CAPTIVE_ONLINE_RETRY_MS       5000UL
+#define CAPTIVE_ONLINE_RETRY_ATTEMPTS 4
+#define CAPTIVE_ONLINE_RETRY_MS       7000UL
+// While OFFLINE, require this many consecutive successful probes before
+// declaring the internet back and resuming cloud uploads/tunnel.
+#define CAPTIVE_RESUME_SUCCESS_STREAK 2
+#define CAPTIVE_RESUME_SUCCESS_RETRY_MS 2000UL
 
 // Diagnostic: dump the FULL fetched captive-portal login page to the serial
 // console when a portal is detected. This is the fastest way to see the exact
@@ -302,8 +311,14 @@
 // - Retry each frame upload SUPABASE_UPLOAD_MAX_RETRIES times.
 // - If still failing, DROP that frame and continue newer frames.
 // - If failures persist for a long streak/window, reboot.
+// - If connectivity is not confirmed reachable (Wi-Fi down or captive/offline),
+//   defer uploads for SUPABASE_UPLOAD_CONNECTIVITY_RETRY_MS (no failure streak).
+// - For transport failures (HTTP <= 0), apply exponential backoff.
 #define SUPABASE_UPLOAD_MAX_RETRIES         2
 #define SUPABASE_UPLOAD_RETRY_DELAY_MS      400UL
+#define SUPABASE_UPLOAD_CONNECTIVITY_RETRY_MS    5000UL
+#define SUPABASE_UPLOAD_TRANSPORT_BACKOFF_BASE_MS 2000UL
+#define SUPABASE_UPLOAD_TRANSPORT_BACKOFF_MAX_MS  60000UL
 #define SUPABASE_UPLOAD_FAIL_REBOOT_AFTER_COUNT 120
 #define SUPABASE_UPLOAD_FAIL_REBOOT_AFTER_MS    (15UL * 60UL * 1000UL)
 
