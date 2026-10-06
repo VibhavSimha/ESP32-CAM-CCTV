@@ -1,5 +1,6 @@
 #include "cloud_storage.h"
 #include "config.h"
+#include "captive_portal.h"
 #include <ESPSupabase.h>
 #include <Preferences.h>
 #include <WiFi.h>
@@ -43,6 +44,28 @@ static unsigned long uploadFailSince = 0;
 #define SUPABASE_CAPTURE_FAIL_REBOOT_AFTER_MS (15UL * 60UL * 1000UL)
 #endif
 
+// Intentionally hardcoded here (not config-overridable): these values are part
+// of the uploader's transport-stability behavior.
+#ifdef SUPABASE_UPLOAD_CONNECTIVITY_RETRY_MS
+#undef SUPABASE_UPLOAD_CONNECTIVITY_RETRY_MS
+#endif
+#define SUPABASE_UPLOAD_CONNECTIVITY_RETRY_MS 5000UL
+
+#ifdef SUPABASE_UPLOAD_TRANSPORT_BACKOFF_BASE_MS
+#undef SUPABASE_UPLOAD_TRANSPORT_BACKOFF_BASE_MS
+#endif
+#define SUPABASE_UPLOAD_TRANSPORT_BACKOFF_BASE_MS 2000UL
+
+#ifdef SUPABASE_UPLOAD_TRANSPORT_BACKOFF_MAX_MS
+#undef SUPABASE_UPLOAD_TRANSPORT_BACKOFF_MAX_MS
+#endif
+#define SUPABASE_UPLOAD_TRANSPORT_BACKOFF_MAX_MS 60000UL
+
+#ifdef SUPABASE_UPLOAD_TRANSPORT_BACKOFF_MAX_SHIFT
+#undef SUPABASE_UPLOAD_TRANSPORT_BACKOFF_MAX_SHIFT
+#endif
+#define SUPABASE_UPLOAD_TRANSPORT_BACKOFF_MAX_SHIFT 5U
+
 // ---------------------------------------------------------------------------
 // MARK: Background network task (issue #81)
 //
@@ -62,11 +85,9 @@ static unsigned long uploadFailSince = 0;
 // _tunTaskFn). loop() now only ever hands off a job and returns immediately;
 // it can never block inside Supabase code again. upload() and insert() share
 // ONE non-thread-safe Supabase instance, so jobs are processed one at a time
-// through a single-slot mailbox -- safe because there is exactly one
-// producer (the Arduino loop() task, via uploadFrameToCloud()/
-// loopCloudStorage()) and one consumer (this task), the same
-// single-producer/single-consumer flag handoff already used for the
-// _slotBusy[] flags in esp32tunnel_bore.h.
+// in the worker task. To avoid frame-upload starvation behind URL publish
+// traffic, upload and publish have separate one-slot pending mailboxes and
+// uploads are serviced first.
 //
 // loopCloudStorage() -- still polled every tick from the now never-blocked
 // loop() -- doubles as the wedge-watchdog: if the background task has been
@@ -127,22 +148,20 @@ enum CloudJobType { CLOUD_JOB_NONE = 0, CLOUD_JOB_UPLOAD_FRAME, CLOUD_JOB_PUBLIS
 
 static TaskHandle_t cloudTaskHandle = nullptr;
 
-// Single-slot job mailbox. cloudJobType/cloudJobFb/cloudJobFilename/
-// cloudJobUrl are written by loop() (producer) BEFORE raising
-// cloudJobPending, and are only read by the background task (consumer)
-// after it observes cloudJobPending==true; the consumer clears
-// cloudJobPending only once it is fully done, so the producer never
-// touches them again until then. Plain volatiles (no mutex) are sufficient
-// for this single-producer/single-consumer handoff, consistent with the
-// rest of this codebase's cross-task signalling style.
-static volatile CloudJobType cloudJobType = CLOUD_JOB_NONE;
-static volatile bool cloudJobPending = false;    // slot occupied: queued and/or running
-static volatile bool cloudJobBusy = false;       // consumer is actively inside the Supabase call
+// Dual one-slot mailboxes (upload + publish), consumed by one worker.
+// Producer writes payload fields BEFORE raising the corresponding pending flag.
+static volatile bool cloudUploadJobPending = false;
+static volatile bool cloudPublishJobPending = false;
+static volatile bool cloudJobBusy = false;
+static volatile CloudJobType cloudJobBusyType = CLOUD_JOB_NONE;
 static volatile unsigned long cloudJobBusySince = 0;
-static camera_fb_t *cloudJobFb = nullptr;        // valid for CLOUD_JOB_UPLOAD_FRAME
-static String cloudJobFilename;                  // valid for CLOUD_JOB_UPLOAD_FRAME
-static String cloudJobUrl;                       // valid for CLOUD_JOB_PUBLISH_URL
-static volatile bool cloudJobPublishSucceeded = false;  // result of the last PUBLISH_URL job
+static camera_fb_t *cloudUploadJobFb = nullptr;  // valid when cloudUploadJobPending
+static String cloudUploadJobFilename;            // valid when cloudUploadJobPending
+static String cloudPublishJobUrl;                // valid when cloudPublishJobPending
+static volatile bool cloudJobPublishSucceeded = false;  // result of last publish job
+
+static uint8_t uploadTransportFailStreak = 0;
+static unsigned long nextUploadAttemptAt = 0;
 
 static void markCaptureFailureAndMaybeReboot() {
   captureFailStreak++;
@@ -192,10 +211,56 @@ static void resetUploadFailureState() {
   uploadFailSince = 0;
 }
 
+static bool cloudUploadConnectivityHealthy() {
+  return WiFi.status() == WL_CONNECTED && captivePortalIsOnline();
+}
+
+static unsigned long computeUploadTransportBackoffMs(uint8_t streak) {
+  if (streak == 0) return SUPABASE_UPLOAD_TRANSPORT_BACKOFF_BASE_MS;
+  uint8_t shift = (uint8_t)(streak - 1);
+  if (shift > SUPABASE_UPLOAD_TRANSPORT_BACKOFF_MAX_SHIFT) {
+    shift = SUPABASE_UPLOAD_TRANSPORT_BACKOFF_MAX_SHIFT;
+  }
+  unsigned long delayMs = SUPABASE_UPLOAD_TRANSPORT_BACKOFF_BASE_MS << shift;
+  if (delayMs > SUPABASE_UPLOAD_TRANSPORT_BACKOFF_MAX_MS) {
+    delayMs = SUPABASE_UPLOAD_TRANSPORT_BACKOFF_MAX_MS;
+  }
+  return delayMs;
+}
+
+static void resetUploadTransportBackoffState() {
+  uploadTransportFailStreak = 0;
+  nextUploadAttemptAt = 0;
+}
+
+static void deferUploadForConnectivity(const char *reason) {
+  unsigned long now = millis();
+  unsigned long retryAt = now + SUPABASE_UPLOAD_CONNECTIVITY_RETRY_MS;
+  if (nextUploadAttemptAt == 0 || (long)(retryAt - nextUploadAttemptAt) > 0) {
+    nextUploadAttemptAt = retryAt;
+  }
+  Serial.printf("[Supabase] Upload deferred: %s. Retry in %lums\n",
+                reason, (unsigned long)SUPABASE_UPLOAD_CONNECTIVITY_RETRY_MS);
+}
+
+static void deferUploadForTransportFailure(int code, uint8_t attemptsUsed) {
+  uploadTransportFailStreak++;
+  unsigned long backoff = computeUploadTransportBackoffMs(uploadTransportFailStreak);
+  nextUploadAttemptAt = millis() + backoff;
+  Serial.printf("[Supabase] Upload transport failure (HTTP %d). Backing off for %lums "
+                "(streak=%u, attempts=%u)\n",
+                code, backoff, (unsigned)uploadTransportFailStreak,
+                (unsigned)attemptsUsed);
+}
+
 static bool publishTunnelUrlNow(const String &url) {
   if (WiFi.status() != WL_CONNECTED) {
     Serial.printf("[Supabase] Tunnel URL publish deferred: WiFi status=%d ip=%s\n",
                   WiFi.status(), WiFi.localIP().toString().c_str());
+    return false;
+  }
+  if (!captivePortalIsOnline()) {
+    Serial.println("[Supabase] Tunnel URL publish deferred: internet not confirmed reachable");
     return false;
   }
 
@@ -218,36 +283,41 @@ static bool publishTunnelUrlNow(const String &url) {
 // supabase.upload() call plus all of the pre-existing retry/bookkeeping
 // logic. Always consumes (returns) fb exactly once.
 static void performFrameUploadJob(camera_fb_t *fb, const String &filename) {
+  if (!cloudUploadConnectivityHealthy()) {
+    Serial.printf("[Supabase] Upload deferred before send: wifi=%d online=%s\n",
+                  WiFi.status(), captivePortalIsOnline() ? "yes" : "no");
+    deferUploadForConnectivity("connectivity unavailable");
+    resetUploadFailureState();
+    esp_camera_fb_return(fb);
+    return;
+  }
+
   Serial.printf("[Supabase] Uploading %s (%u bytes)...\n", filename.c_str(), fb->len);
 
   int code = -1;
   unsigned long elapsed = 0;
   bool uploaded = false;
+  bool deferredForConnectivity = false;
+  bool attemptedNetworkUpload = false;
   uint8_t attemptsUsed = 0;
   for (uint8_t attempt = 0; attempt <= SUPABASE_UPLOAD_MAX_RETRIES; attempt++) {
     attemptsUsed = (uint8_t)(attempt + 1);
-
-    // Issue #81 regression guard: don't open a brand-new Supabase socket
-    // while Wi-Fi itself is down/mid-reconnect. supabase.upload() has no
-    // such check (unlike publishTunnelUrlNow() above), so a retry landing
-    // exactly in a Wi-Fi link flap would start a fresh DNS lookup/TLS
-    // connect while the network interface is being torn down and rebuilt
-    // underneath it -- observed in the field as an lwIP "assert failed:
-    // udp_remove ... Required to lock TCPIP core functionality!" abort.
-    // Skip straight to the normal retry/backoff path instead of touching
-    // the socket layer.
-    if (WiFi.status() != WL_CONNECTED) {
+    if (!cloudUploadConnectivityHealthy()) {
+      deferredForConnectivity = true;
       code = -1;
       elapsed = 0;
-      Serial.printf("[Supabase] Upload attempt %u/%u skipped: WiFi not connected (status=%d)\n",
+      Serial.printf("[Supabase] Upload attempt %u/%u deferred mid-retry: wifi=%d online=%s\n",
                     (unsigned)attemptsUsed,
                     (unsigned)(SUPABASE_UPLOAD_MAX_RETRIES + 1),
-                    WiFi.status());
-    } else {
-      unsigned long t0 = millis();
-      code = supabase.upload(SUPABASE_BUCKET, filename, "image/jpeg", fb->buf, fb->len);
-      elapsed = millis() - t0;
+                    WiFi.status(),
+                    captivePortalIsOnline() ? "yes" : "no");
+      break;
     }
+
+    unsigned long t0 = millis();
+    code = supabase.upload(SUPABASE_BUCKET, filename, "image/jpeg", fb->buf, fb->len);
+    elapsed = millis() - t0;
+    attemptedNetworkUpload = true;
     if (code == 200 || code == 201 || code == 409) {
       uploaded = true;
       break;
@@ -262,22 +332,31 @@ static void performFrameUploadJob(camera_fb_t *fb, const String &filename) {
     }
   }
 
-  // ALWAYS rotate so a single failure (or an unexpected 409) can never pin the
-  // uploader on one name. The unique timestamp already prevents collisions; the
-  // rotating index is kept for compatibility/telemetry.
-  upload_seq++;
-  frame_index = (frame_index + 1) % STORAGE_FRAME_LIMIT;
-  preferences.putInt("frame_index", frame_index);
+  // Rotate whenever a network upload was attempted so an uncertain transport
+  // outcome can never pin us on one object key.
+  if (attemptedNetworkUpload) {
+    upload_seq++;
+    frame_index = (frame_index + 1) % STORAGE_FRAME_LIMIT;
+    preferences.putInt("frame_index", frame_index);
+  }
 
   if (uploaded && (code == 200 || code == 201)) {
     resetUploadFailureState();
+    resetUploadTransportBackoffState();
     Serial.printf("[Supabase] Upload OK in %lums (attempt %u). seq=%lu index=%d\n",
                   elapsed, (unsigned)attemptsUsed, (unsigned long)upload_seq, frame_index);
   } else if (uploaded && code == 409) {
     resetUploadFailureState();
+    resetUploadTransportBackoffState();
     // Should no longer happen with unique names, but treat as benign if it does.
     Serial.printf("[Supabase] Upload skipped: resource already exists (409) in %lums (attempt %u). seq=%lu\n",
                   elapsed, (unsigned)attemptsUsed, (unsigned long)upload_seq);
+  } else if (deferredForConnectivity) {
+    deferUploadForConnectivity("connectivity lost during upload retry");
+    resetUploadFailureState();
+  } else if (code <= 0) {
+    deferUploadForTransportFailure(code, attemptsUsed);
+    resetUploadFailureState();
   } else {
     Serial.printf("[Supabase] Upload FAILED after %u attempt(s). HTTP code: %d (last took %lums). "
                   "Dropping frame and continuing with newer frames. seq=%lu\n",
@@ -290,30 +369,43 @@ static void performFrameUploadJob(camera_fb_t *fb, const String &filename) {
 
 // Runs on the background task: the actual supabase.insert() call for a
 // tunnel-URL publish. Result is picked up by loopCloudStorage() once the job
-// finishes (cloudJobPending clears).
+// finishes (no publish job in-flight).
 static void performTunnelPublishJob(const String &url) {
   cloudJobPublishSucceeded = publishTunnelUrlNow(url);
 }
 
 static void cloudStorageTaskFn(void *) {
   for (;;) {
-    if (cloudJobPending) {
+    if (cloudUploadJobPending) {
       cloudJobBusy = true;
+      cloudJobBusyType = CLOUD_JOB_UPLOAD_FRAME;
       cloudJobBusySince = millis();
 
-      if (cloudJobType == CLOUD_JOB_UPLOAD_FRAME) {
-        camera_fb_t *fb = cloudJobFb;
-        String filename = cloudJobFilename;
-        cloudJobFb = nullptr;
-        performFrameUploadJob(fb, filename);
-      } else if (cloudJobType == CLOUD_JOB_PUBLISH_URL) {
-        performTunnelPublishJob(cloudJobUrl);
-      }
+      camera_fb_t *fb = cloudUploadJobFb;
+      String filename = cloudUploadJobFilename;
+      cloudUploadJobFb = nullptr;
+      cloudUploadJobPending = false;
+      performFrameUploadJob(fb, filename);
 
       cloudJobBusy = false;
+      cloudJobBusyType = CLOUD_JOB_NONE;
       cloudJobBusySince = 0;
-      cloudJobType = CLOUD_JOB_NONE;
-      cloudJobPending = false;  // release the mailbox LAST: done, slot free again
+      continue;
+    }
+
+    if (cloudPublishJobPending) {
+      cloudJobBusy = true;
+      cloudJobBusyType = CLOUD_JOB_PUBLISH_URL;
+      cloudJobBusySince = millis();
+
+      String url = cloudPublishJobUrl;
+      cloudPublishJobPending = false;
+      performTunnelPublishJob(url);
+
+      cloudJobBusy = false;
+      cloudJobBusyType = CLOUD_JOB_NONE;
+      cloudJobBusySince = 0;
+      continue;
     }
     vTaskDelay(pdMS_TO_TICKS(20));
   }
@@ -385,13 +477,25 @@ void uploadFrameToCloud() {
     return;
   }
 
-  // Issue #81: the background task serializes every Supabase call through
-  // one non-thread-safe instance. If the slot is occupied -- including by a
-  // prior upload stuck inside ESPSupabase's unbounded read loop -- drop this
-  // frame instead of queuing/blocking; loopCloudStorage()'s watchdog reboots
-  // if the task is ever truly wedged.
-  if (!cloudTaskHandle || cloudJobPending) {
-    Serial.println("[Supabase] Upload skipped: background cloud task busy or unavailable");
+  if (!cloudTaskHandle) {
+    Serial.println("[Supabase] Upload skipped: background cloud task unavailable");
+    return;
+  }
+
+  if (cloudUploadJobPending ||
+      (cloudJobBusy && cloudJobBusyType == CLOUD_JOB_UPLOAD_FRAME)) {
+    Serial.println("[Supabase] Upload skipped: background upload slot busy");
+    return;
+  }
+
+  if (nextUploadAttemptAt != 0 && (long)(millis() - nextUploadAttemptAt) < 0) {
+    unsigned long waitMs = nextUploadAttemptAt - millis();
+    Serial.printf("[Supabase] Upload deferred: backoff active (%lums remaining)\n", waitMs);
+    return;
+  }
+
+  if (!cloudUploadConnectivityHealthy()) {
+    deferUploadForConnectivity("internet not confirmed reachable");
     return;
   }
 
@@ -406,10 +510,9 @@ void uploadFrameToCloud() {
 
   // Hand off to the background task and return immediately -- loop() must
   // never block inside the (potentially hanging) network call.
-  cloudJobFb = fb;
-  cloudJobFilename = buildFrameName();
-  cloudJobType = CLOUD_JOB_UPLOAD_FRAME;
-  cloudJobPending = true;
+  cloudUploadJobFb = fb;
+  cloudUploadJobFilename = buildFrameName();
+  cloudUploadJobPending = true;
 }
 
 void publishTunnelUrl(String url) {
@@ -434,7 +537,7 @@ void loopCloudStorage() {
     unsigned long busyFor = millis() - cloudJobBusySince;
     if (busyFor >= SUPABASE_UPLOAD_FAIL_REBOOT_AFTER_MS) {
       Serial.printf("[Supabase] Background task wedged for %lums (job type %d). Rebooting for recovery.\n",
-                    busyFor, (int)cloudJobType);
+                    busyFor, (int)cloudJobBusyType);
       delay(1000);
       ESP.restart();
     }
@@ -442,9 +545,12 @@ void loopCloudStorage() {
 
   static bool awaitingPublishResult = false;
   static String awaitingPublishUrl;
+  bool publishInFlight =
+      cloudPublishJobPending ||
+      (cloudJobBusy && cloudJobBusyType == CLOUD_JOB_PUBLISH_URL);
 
   if (awaitingPublishResult) {
-    if (cloudJobPending) return;  // previously-submitted publish job still running
+    if (publishInFlight) return;  // previously-submitted publish job still running
     awaitingPublishResult = false;
 
     if (awaitingPublishUrl == pendingTunnelUrl) {
@@ -464,15 +570,12 @@ void loopCloudStorage() {
     // pendingTunnelUrl changed while that job was in flight (superseded by a
     // newer publishTunnelUrl() call) -- fall through to submit it below.
   }
-
   if (!pendingTunnelUrl.length()) return;
   unsigned long now = millis();
   if (nextTunnelPublishAttempt != 0 && now < nextTunnelPublishAttempt) return;
-  if (!cloudTaskHandle || cloudJobPending) return;  // slot busy/unavailable; retry next tick
-
+  if (!cloudTaskHandle || publishInFlight) return;  // publish slot busy/unavailable; retry next tick
   awaitingPublishUrl = pendingTunnelUrl;
-  cloudJobUrl = pendingTunnelUrl;
-  cloudJobType = CLOUD_JOB_PUBLISH_URL;
-  cloudJobPending = true;
+  cloudPublishJobUrl = pendingTunnelUrl;
+  cloudPublishJobPending = true;
   awaitingPublishResult = true;
 }

@@ -218,11 +218,8 @@
 // escalate to a full device reboot as the final recovery step.
 #define CAPTIVE_OFFLINE_REBOOT_AFTER_MS (15UL * 60UL * 1000UL)
 #define CAPTIVE_ONLINE_HEARTBEAT_MS  60000UL
-// While ONLINE, tolerate this many consecutive failed probes as transient before
-// flipping to OFFLINE. Each failure is retried after CAPTIVE_ONLINE_RETRY_MS.
-// This avoids "fail hard" behavior on brief Wi-Fi/power jitter.
-#define CAPTIVE_ONLINE_RETRY_ATTEMPTS 2
-#define CAPTIVE_ONLINE_RETRY_MS       5000UL
+// ONLINE retry tolerance, offline->online resume hysteresis and transport-failure
+// probe fallback URLs are intentionally hardcoded in captive_portal.cpp.
 
 // Diagnostic: dump the FULL fetched captive-portal login page to the serial
 // console when a portal is detected. This is the fastest way to see the exact
@@ -302,6 +299,8 @@
 // - Retry each frame upload SUPABASE_UPLOAD_MAX_RETRIES times.
 // - If still failing, DROP that frame and continue newer frames.
 // - If failures persist for a long streak/window, reboot.
+// - Connectivity-defer and transport-backoff timings are intentionally hardcoded
+//   in cloud_storage.cpp.
 #define SUPABASE_UPLOAD_MAX_RETRIES         2
 #define SUPABASE_UPLOAD_RETRY_DELAY_MS      400UL
 #define SUPABASE_UPLOAD_FAIL_REBOOT_AFTER_COUNT 120
