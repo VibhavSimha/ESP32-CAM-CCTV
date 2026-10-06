@@ -43,6 +43,27 @@
 #define BORE_WATCHDOG_GRACE_MS 6000UL
 #endif
 
+// Issue #81 (whole-system audit): _boreProxyConn() is intentionally pinned to
+// CPU core 0 (see the spawn site below) so that core 1 -- where the tunnel
+// control task, the cloud_storage background task and the Arduino loop() task
+// all live -- is never blocked by this task's data copying. But core 0's
+// IDLE0 task IS monitored by the default Arduino task watchdog (unlike
+// IDLE1), and the proxy loop only yields to it via the `_DELAY(...)` calls
+// gated behind "no data was available this iteration" / "the peer socket's
+// send buffer is full". A sustained, uninterrupted transfer in BOTH
+// directions (e.g. a long-running live /stream view, or a large upload,
+// proxied through the tunnel while the WAN link keeps pace) can keep
+// `activity` true on every iteration for many seconds without ever hitting
+// one of those delays -- starving IDLE0 long enough to trip the watchdog and
+// hard-panic/reboot the MCU ("CPU 0: bore_proxy ... Aborting"), exactly the
+// same failure class already fixed for cloud_storage.cpp, just triggered by
+// heavy tunnel traffic instead of a wedged socket. BORE_PROXY_FORCE_YIELD_MS
+// bounds the worst case: regardless of how busy the loop is, it is forced to
+// yield at least this often so IDLE0 always gets scheduled.
+#ifndef BORE_PROXY_FORCE_YIELD_MS
+#define BORE_PROXY_FORCE_YIELD_MS 50UL
+#endif
+
 // ---------------------------------------------------------------------------
 // MARK: State
 // ---------------------------------------------------------------------------
@@ -147,6 +168,7 @@ static void _boreProxyConn(WiFiClient &remote, WiFiClient &local, int slot) {
   size_t lastTxSnapshot = 0;
   unsigned long lastTxProgress = millis();
   unsigned long lastHeartbeat = millis();
+  unsigned long lastForcedYield = millis();
   bool streamingActive = false;
 
   // Arm the watchdog with a real timestamp BEFORE anything can block.
@@ -287,8 +309,21 @@ static void _boreProxyConn(WiFiClient &remote, WiFiClient &local, int slot) {
       }
     }
 
-    if (activity) idle = millis();
-    else _DELAY(1);
+    if (activity) {
+      idle = millis();
+      // Issue #81: force a bounded yield even while continuously busy, so
+      // this core-0-pinned task can never starve IDLE0 for longer than
+      // BORE_PROXY_FORCE_YIELD_MS (see comment at the constant's definition).
+      // Deliberately does NOT touch `idle`/backpressure bookkeeping above --
+      // this is purely a scheduler yield, not an activity/stall signal.
+      if (millis() - lastForcedYield >= BORE_PROXY_FORCE_YIELD_MS) {
+        lastForcedYield = millis();
+        _DELAY(1);
+      }
+    } else {
+      _DELAY(1);
+      lastForcedYield = millis();
+    }
   }
 
   // Determine why the loop ended (for the log).
@@ -454,6 +489,9 @@ static void _boreAccept(const String &uuid, int slot) {
   Serial.printf("[Tunnel] Slot %d: Both sockets connected. Spawning proxy task on Core 0.\n", slot);
 
   // Spawn proxy on Core 0 so Core 1 (tunnel task) stays free to run the Watchdog!
+  // See the BORE_PROXY_FORCE_YIELD_MS comment near the top of this file for
+  // why _boreProxyConn() must periodically force a yield even while busy —
+  // required specifically because this task lives on core 0.
   //
   // Stack sizing (heap-pressure / "FAILED to spawn proxy task" churn):
   // A FreeRTOS task stack must be a single CONTIGUOUS internal-DRAM block, so

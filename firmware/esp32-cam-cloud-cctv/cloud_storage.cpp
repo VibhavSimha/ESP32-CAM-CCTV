@@ -100,18 +100,22 @@ enum CloudJobType { CLOUD_JOB_NONE = 0, CLOUD_JOB_UPLOAD_FRAME, CLOUD_JOB_PUBLIS
 // occasional slow socket call panicking the whole MCU.
 //
 // This task used to be pinned to core 0, on the mistaken belief that "the
-// bore proxy tasks" ran there too -- only the already-blocked-on-socket-I/O
-// data-forwarding connection (_boreProxyConn, spawned with a literal `0` in
-// esp32tunnel_bore.h) does; every long-lived task, including the ones above,
-// is on core 1. Pinning this task to core 0 put the exact hang the header
-// comment above warns about (ESPSupabase's hand-rolled, not-guaranteed-to-
-// yield response read loop) on the one core whose idle task IS watchdog-
-// monitored: instead of being caught by the graceful
-// SUPABASE_UPLOAD_FAIL_REBOOT_AFTER_MS wedge-watchdog below, a merely slow
-// (but otherwise healthy) multi-second upload starved IDLE0 and made
-// esp_task_wdt hard-panic the MCU well before that budget was ever reached
-// -- the "task_wdt ... CPU 0: cloud_storage / Aborting" crash loop seen in
-// the field (issue #81 regression, see issue #81 comment timestamped
+// bore proxy tasks" ran there too -- only the data-forwarding connection
+// (_boreProxyConn, spawned with a literal `0` in esp32tunnel_bore.h) does;
+// every long-lived task, including the ones above, is on core 1.
+// _boreProxyConn() spends most of its time blocked on socket I/O, but a
+// sustained transfer (e.g. a long live /stream view) could in principle keep
+// it continuously busy -- so it now also carries its own explicit, bounded
+// forced-yield guard (BORE_PROXY_FORCE_YIELD_MS in esp32tunnel_bore.h) rather
+// than relying on that alone. Pinning this (cloud_storage) task to core 0 put
+// the exact hang the header comment above warns about (ESPSupabase's
+// hand-rolled, not-guaranteed-to-yield response read loop) on the one core
+// whose idle task IS watchdog-monitored: instead of being caught by the
+// graceful SUPABASE_UPLOAD_FAIL_REBOOT_AFTER_MS wedge-watchdog below, a
+// merely slow (but otherwise healthy) multi-second upload starved IDLE0 and
+// made esp_task_wdt hard-panic the MCU well before that budget was ever
+// reached -- the "task_wdt ... CPU 0: cloud_storage / Aborting" crash loop
+// seen in the field (issue #81 regression, see issue #81 comment timestamped
 // 2026-10-06). Running Supabase's socket/DNS I/O in true cross-core
 // parallel with this project's own Wi-Fi reconnect handling also raced with
 // the network stack during a Wi-Fi relink and triggered a separate
