@@ -24,12 +24,16 @@
 // empty body; a captive portal intercepts it with a redirect or login page.
 #define CAPTIVE_PROBE_URL "http://connectivitycheck.gstatic.com/generate_204"
 #endif
-#ifndef CAPTIVE_PROBE_URL_FALLBACK_1
+// Intentionally hardcoded here (not config-overridable): probe fallback URLs
+// used only for transport failures on the primary probe endpoint.
+#ifdef CAPTIVE_PROBE_URL_FALLBACK_1
+#undef CAPTIVE_PROBE_URL_FALLBACK_1
+#endif
 #define CAPTIVE_PROBE_URL_FALLBACK_1 "http://www.google.com/generate_204"
+#ifdef CAPTIVE_PROBE_URL_FALLBACK_2
+#undef CAPTIVE_PROBE_URL_FALLBACK_2
 #endif
-#ifndef CAPTIVE_PROBE_URL_FALLBACK_2
 #define CAPTIVE_PROBE_URL_FALLBACK_2 "http://clients3.google.com/generate_204"
-#endif
 
 #ifndef CAPTIVE_PROBE_TIMEOUT_MS
 #define CAPTIVE_PROBE_TIMEOUT_MS 6000
@@ -150,18 +154,24 @@ static unsigned long s_onlineHeartbeatAt = 0;
 // (or probe-endpoint hiccup), especially under brief Wi-Fi/power jitter. Keep
 // serving for a few short retries before flipping to OFFLINE and pausing cloud
 // uploads / stopping the tunnel.
-#ifndef CAPTIVE_ONLINE_RETRY_ATTEMPTS
+// Intentionally hardcoded here (not config-overridable): online/offline
+// hysteresis and retry behavior for weak/flaky networks.
+#ifdef CAPTIVE_ONLINE_RETRY_ATTEMPTS
+#undef CAPTIVE_ONLINE_RETRY_ATTEMPTS
+#endif
 #define CAPTIVE_ONLINE_RETRY_ATTEMPTS 4
+#ifdef CAPTIVE_ONLINE_RETRY_MS
+#undef CAPTIVE_ONLINE_RETRY_MS
 #endif
-#ifndef CAPTIVE_ONLINE_RETRY_MS
 #define CAPTIVE_ONLINE_RETRY_MS 7000UL
+#ifdef CAPTIVE_RESUME_SUCCESS_STREAK
+#undef CAPTIVE_RESUME_SUCCESS_STREAK
 #endif
-#ifndef CAPTIVE_RESUME_SUCCESS_STREAK
 #define CAPTIVE_RESUME_SUCCESS_STREAK 2
+#ifdef CAPTIVE_RESUME_SUCCESS_RETRY_MS
+#undef CAPTIVE_RESUME_SUCCESS_RETRY_MS
 #endif
-#ifndef CAPTIVE_RESUME_SUCCESS_RETRY_MS
 #define CAPTIVE_RESUME_SUCCESS_RETRY_MS 2000UL
-#endif
 static uint8_t s_onlineFailStreak = 0;
 static uint8_t s_reprobeSuccessStreak = 0;
 // Tracks the previous connectivity state so captivePortalLoop() can reset the
