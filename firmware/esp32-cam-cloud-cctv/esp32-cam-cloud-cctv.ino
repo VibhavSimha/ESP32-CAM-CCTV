@@ -243,9 +243,14 @@ void loop() {
     // takes ~20 KB of heap for the TLS connection; running it concurrently
     // with a tunnel proxy (which holds its own socket buffers + 2 KB copy
     // buffer + task stack) can collapse free heap to ~34 KB, causing crypto
-    // login rejections and tunnel write stalls. The tunnel-busy defer is
-    // bounded (IDLE_UPLOAD_MAX_TUNNEL_BUSY_MS) so a stale busy slot cannot
-    // starve autonomous uploads forever.
+    // login rejections and tunnel write stalls.
+    //
+    // Issue #81 regression guard: also defer while the tunnel is still in its
+    // own connect handshake (started but not yet ready). Starting a Supabase
+    // TLS upload during that startup window has proven flaky in field logs
+    // (repeated HTTP 0 with no response). Both defers are bounded by
+    // IDLE_UPLOAD_MAX_TUNNEL_BUSY_MS so tunnel-side state can never starve
+    // autonomous uploads forever.
     //
     // Issue #40: only attempt Supabase once the internet-connectivity heartbeat
     // has CONFIRMED reachability (captivePortalIsOnline()). Behind an ISP captive
@@ -255,23 +260,38 @@ void loop() {
     // resume automatically once the captive-portal heartbeat clears.
     static unsigned long lastIdleUpload = 0;
     static unsigned long tunnelBusySince = 0;
+    static unsigned long tunnelNotReadySince = 0;
     bool tunnelBusy = isTunnelSlotBusy();
+    bool tunnelReady = !g_tunnelStarted || isTunnelReady();
     if (tunnelBusy) {
         if (tunnelBusySince == 0) tunnelBusySince = millis();
     } else {
         tunnelBusySince = 0;
     }
+    if (!tunnelReady && g_tunnelStarted) {
+        if (tunnelNotReadySince == 0) tunnelNotReadySince = millis();
+    } else {
+        tunnelNotReadySince = 0;
+    }
     bool tunnelBusyDeferExceeded =
         tunnelBusy && (millis() - tunnelBusySince >= IDLE_UPLOAD_MAX_TUNNEL_BUSY_MS);
+    bool tunnelReadyDeferExceeded =
+        g_tunnelStarted && !tunnelReady &&
+        (millis() - tunnelNotReadySince >= IDLE_UPLOAD_MAX_TUNNEL_BUSY_MS);
     if (active_stream_clients == 0 &&
         millis() - lastIdleUpload > 3000 &&
         ESP.getFreeHeap() >= MIN_HEAP_FOR_UPLOAD &&
         (!tunnelBusy || tunnelBusyDeferExceeded) &&
+        (tunnelReady || tunnelReadyDeferExceeded) &&
         captivePortalIsOnline()) {
         lastIdleUpload = millis();
         if (tunnelBusy && tunnelBusyDeferExceeded) {
             Serial.printf("[Idle] Tunnel busy for %lums. Forcing guarded upload.\n",
                           millis() - tunnelBusySince);
+        }
+        if (!tunnelReady && tunnelReadyDeferExceeded) {
+            Serial.printf("[Idle] Tunnel not ready for %lums. Forcing guarded upload.\n",
+                          millis() - tunnelNotReadySince);
         }
         Serial.println("[Idle] No clients streaming. Performing autonomous background upload.");
         uploadFrameToCloud();
