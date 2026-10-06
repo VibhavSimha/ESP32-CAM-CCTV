@@ -88,10 +88,37 @@ enum CloudJobType { CLOUD_JOB_NONE = 0, CLOUD_JOB_UPLOAD_FRAME, CLOUD_JOB_PUBLIS
 #define CLOUD_STORAGE_TASK_PRIO 1
 #endif
 #ifndef CLOUD_STORAGE_TASK_CORE
-// Core 0, like the bore proxy tasks in esp32tunnel_bore.h, so core 1 (the
-// Arduino loop() task + tunnel control task) always stays free to run the
-// watchdog in loopCloudStorage().
-#define CLOUD_STORAGE_TASK_CORE 0
+// MUST stay 1 -- do not move this back to core 0.
+//
+// Core 1 is where the Arduino loop() task, the tunnel control task
+// (_tunTaskFn / TUN_TASK_CORE in src/esp32tunnel.h) and the bore "accept"
+// tasks (same TUN_TASK_CORE in src/esp32tunnel_bore.h) already run every
+// long/blocking network call this project makes. That is not an accident:
+// ESP-IDF's Task Watchdog Timer only monitors the core 0 idle task (IDLE0)
+// by default -- core 1's idle task (IDLE1) is NOT watchdog-monitored, which
+// is exactly why none of that existing code has to worry about an
+// occasional slow socket call panicking the whole MCU.
+//
+// This task used to be pinned to core 0, on the mistaken belief that "the
+// bore proxy tasks" ran there too -- only the already-blocked-on-socket-I/O
+// data-forwarding connection (_boreProxyConn, spawned with a literal `0` in
+// esp32tunnel_bore.h) does; every long-lived task, including the ones above,
+// is on core 1. Pinning this task to core 0 put the exact hang the header
+// comment above warns about (ESPSupabase's hand-rolled, not-guaranteed-to-
+// yield response read loop) on the one core whose idle task IS watchdog-
+// monitored: instead of being caught by the graceful
+// SUPABASE_UPLOAD_FAIL_REBOOT_AFTER_MS wedge-watchdog below, a merely slow
+// (but otherwise healthy) multi-second upload starved IDLE0 and made
+// esp_task_wdt hard-panic the MCU well before that budget was ever reached
+// -- the "task_wdt ... CPU 0: cloud_storage / Aborting" crash loop seen in
+// the field (issue #81 regression, see issue #81 comment timestamped
+// 2026-10-06). Running Supabase's socket/DNS I/O in true cross-core
+// parallel with this project's own Wi-Fi reconnect handling also raced with
+// the network stack during a Wi-Fi relink and triggered a separate
+// "assert failed: udp_remove ... Required to lock TCPIP core
+// functionality!" crash in that same log. Keeping this task on core 1 fixes
+// both.
+#define CLOUD_STORAGE_TASK_CORE 1
 #endif
 
 static TaskHandle_t cloudTaskHandle = nullptr;
@@ -195,9 +222,28 @@ static void performFrameUploadJob(camera_fb_t *fb, const String &filename) {
   uint8_t attemptsUsed = 0;
   for (uint8_t attempt = 0; attempt <= SUPABASE_UPLOAD_MAX_RETRIES; attempt++) {
     attemptsUsed = (uint8_t)(attempt + 1);
-    unsigned long t0 = millis();
-    code = supabase.upload(SUPABASE_BUCKET, filename, "image/jpeg", fb->buf, fb->len);
-    elapsed = millis() - t0;
+
+    // Issue #81 regression guard: don't open a brand-new Supabase socket
+    // while Wi-Fi itself is down/mid-reconnect. supabase.upload() has no
+    // such check (unlike publishTunnelUrlNow() above), so a retry landing
+    // exactly in a Wi-Fi link flap would start a fresh DNS lookup/TLS
+    // connect while the network interface is being torn down and rebuilt
+    // underneath it -- observed in the field as an lwIP "assert failed:
+    // udp_remove ... Required to lock TCPIP core functionality!" abort.
+    // Skip straight to the normal retry/backoff path instead of touching
+    // the socket layer.
+    if (WiFi.status() != WL_CONNECTED) {
+      code = -1;
+      elapsed = 0;
+      Serial.printf("[Supabase] Upload attempt %u/%u skipped: WiFi not connected (status=%d)\n",
+                    (unsigned)attemptsUsed,
+                    (unsigned)(SUPABASE_UPLOAD_MAX_RETRIES + 1),
+                    WiFi.status());
+    } else {
+      unsigned long t0 = millis();
+      code = supabase.upload(SUPABASE_BUCKET, filename, "image/jpeg", fb->buf, fb->len);
+      elapsed = millis() - t0;
+    }
     if (code == 200 || code == 201 || code == 409) {
       uploaded = true;
       break;
