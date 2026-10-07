@@ -154,12 +154,22 @@ void setup() {
     // 3. Initialize WiFi via WiFiManager
     setupWiFiManager();
 
-    // 3b. Post-connect captive-portal probe/login (issue #33). Runs ONLY after
-    //     Wi-Fi is already joined; a no-op on open networks. The local helper
-    //     page is served by the camera web server started in step 6.
+    // 4. Initialize Cloud Storage (Supabase)
+    setupCloudStorage();
+
+    // 5. Initialize crypto auth (X25519 keypair from NVS or first-boot gen)
+    //    with resilient retries + reboot escalation.
+    setupCryptoAuthWithRetries();
+
+    // 6. Start Local Stream Server (including /portal helper routes) before the
+    //    blocking captive-portal probe so the helper UI is reachable immediately.
+    startCameraServer();
+
+    // 6b. Post-connect captive-portal probe/login (issue #33). Runs ONLY after
+    //     Wi-Fi is already joined; a no-op on open networks.
     captivePortalBegin();
 
-    // 3c. Re-print the configuration status and dump a full captive-portal /
+    // 6c. Re-print the configuration status and dump a full captive-portal /
     //     network / heap diagnostics block now that Wi-Fi is up. The very first
     //     configuration banner (logged from the top of setup()) is frequently
     //     lost or corrupted in a serial capture that only attaches during the
@@ -171,16 +181,6 @@ void setup() {
     Serial.println("[Boot] Re-printing configuration + diagnostics after Wi-Fi connect:");
     logConfigStatus();
     captivePortalPrintDiagnostics();
-
-    // 4. Initialize Cloud Storage (Supabase)
-    setupCloudStorage();
-
-    // 5. Initialize crypto auth (X25519 keypair from NVS or first-boot gen)
-    //    with resilient retries + reboot escalation.
-    setupCryptoAuthWithRetries();
-
-    // 6. Start Local Stream Server
-    startCameraServer();
 
     // 7. Initialize the remote tunnel only when internet reachability is
     // confirmed. Behind a captive portal this is deferred until login succeeds.
