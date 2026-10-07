@@ -272,6 +272,7 @@ void loop() {
         millis() - lastIdleUpload > 3000 &&
         ESP.getFreeHeap() >= MIN_HEAP_FOR_UPLOAD &&
         (!tunnelBusy || tunnelBusyDeferExceeded) &&
+        !isCloudUploadSlotBusy() &&
         tunnelReady &&
         captivePortalIsOnline()) {
         lastIdleUpload = millis();

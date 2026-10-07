@@ -163,6 +163,11 @@ static volatile bool cloudJobPublishSucceeded = false;  // result of last publis
 static uint8_t uploadTransportFailStreak = 0;
 static unsigned long nextUploadAttemptAt = 0;
 
+bool isCloudUploadSlotBusy() {
+  return cloudUploadJobPending ||
+         (cloudJobBusy && cloudJobBusyType == CLOUD_JOB_UPLOAD_FRAME);
+}
+
 static void markCaptureFailureAndMaybeReboot() {
   captureFailStreak++;
   if (captureFailSince == 0) captureFailSince = millis();
@@ -482,8 +487,7 @@ void uploadFrameToCloud() {
     return;
   }
 
-  if (cloudUploadJobPending ||
-      (cloudJobBusy && cloudJobBusyType == CLOUD_JOB_UPLOAD_FRAME)) {
+  if (isCloudUploadSlotBusy()) {
     Serial.println("[Supabase] Upload skipped: background upload slot busy");
     return;
   }
