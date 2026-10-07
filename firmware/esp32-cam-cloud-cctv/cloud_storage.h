@@ -13,5 +13,6 @@
 
 void setupCloudStorage();
 void uploadFrameToCloud();
+bool isCloudUploadSlotBusy();
 void publishTunnelUrl(String url);
 void loopCloudStorage();

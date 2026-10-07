@@ -142,10 +142,11 @@ static unsigned long s_periodicReprobeAt = 0;
 #define CAPTIVE_OFFLINE_REBOOT_AFTER_MS (15UL * 60UL * 1000UL)
 #endif
 static unsigned long s_offlineSince = 0;
-// Heartbeat interval while the internet IS confirmed reachable. We keep probing
-// (more gently than the offline re-probe) so a captive portal that re-appears
-// mid-operation — e.g. a time-limited ISP session that expires — is detected and
-// cloud uploads are paused again instead of silently failing (issue #40).
+// Heartbeat interval while the internet IS confirmed reachable *after a recovered
+// captive/offline session* (state SUCCESS). Open-from-boot networks stay quiet
+// (issue #88), while recovered portal sessions still get monitored so a portal
+// that re-appears mid-operation is detected and uploads are paused again (issue
+// #40).
 #ifndef CAPTIVE_ONLINE_HEARTBEAT_MS
 #define CAPTIVE_ONLINE_HEARTBEAT_MS 60000UL
 #endif
@@ -1932,8 +1933,18 @@ void captivePortalLoop() {
         }
     } else if (online && WiFi.status() == WL_CONNECTED) {
         s_offlineSince = 0;
-        // Online: keep a gentle heartbeat so a captive portal that re-appears
-        // mid-operation is caught and uploads are paused again (issue #40).
+        // On a network that was open from boot (state OPEN), no portal login was
+        // needed; keep that path quiet and avoid repeated background probe traffic
+        // (issue #88). We only keep the online heartbeat for SUCCESS, i.e. after
+        // a captive/offline state was actually seen and then cleared.
+        if (s_state != PORTAL_STATE_SUCCESS) {
+            s_onlineHeartbeatAt = 0;
+            s_onlineFailStreak = 0;
+            return;
+        }
+        // After a recovered captive/offline state, keep a gentle heartbeat so a
+        // portal that re-appears mid-operation is caught and uploads are paused
+        // again (issue #40).
         if (s_onlineHeartbeatAt == 0) {
             s_onlineHeartbeatAt = millis() + CAPTIVE_ONLINE_HEARTBEAT_MS;
         }

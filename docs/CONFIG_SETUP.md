@@ -147,6 +147,9 @@ is reachable:
   it detects the portal has been cleared — via the `/portal` helper **or** a
   manual browser login on any device — it logs `Cloud uploads resume` and the
   autonomous uploader starts again automatically, no reboot required.
+- On networks that are already open from boot (`state: open`), the firmware does
+  not run periodic **online** captive probes; online heartbeat probes are kept
+  only after a recovered captive/offline session (`state: success`).
 
 ### Configuration knobs (`config.h`)
 | Macro | Default | Purpose |
@@ -157,7 +160,7 @@ is reachable:
 | `CAPTIVE_PORTAL_HTTP_TIMEOUT_MS` | `12000` | Timeout for captive-portal landing-page fetches and login submits (often slower, especially HTTPS external portals). |
 | `CAPTIVE_MAX_LOGIN_ATTEMPTS` | `3` | Attempts before steering the user to the manual browser fallback. |
 | `CAPTIVE_PERIODIC_REPROBE_MS` | `30000` | Heartbeat cadence while **offline** (waiting for the portal login). |
-| `CAPTIVE_ONLINE_HEARTBEAT_MS` | `60000` | Heartbeat cadence while **online** (to catch a portal that re-appears). |
+| `CAPTIVE_ONLINE_HEARTBEAT_MS` | `60000` | Heartbeat cadence while **online after a recovered captive session** (to catch a portal that re-appears). |
 | `CAPTIVE_LOG_PORTAL_PAGE` | `1` | Dump the full fetched portal login page to the serial console when a portal is detected (diagnostic — see the exact HTML/fields to parse). Set to `0` to silence. |
 | `CAPTIVE_LOG_HTTP_TRACE` | `1` | Emit per-request HTTP trace diagnostics (DNS result/latency, timeout used, response metadata, elapsed time, short response preview). |
 | `CAPTIVE_MAX_REDIRECT_HOPS` | `3` | How many landing-page redirects (`<meta refresh>` / JS `location` / "continue" link / auto-submitted `<form name="redirect">`, GET or POST) the firmware will follow to reach the real login form (issues #44, #46). |

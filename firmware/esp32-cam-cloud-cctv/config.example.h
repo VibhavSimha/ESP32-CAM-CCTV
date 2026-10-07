@@ -210,9 +210,10 @@
 
 // Connectivity-heartbeat cadence (ms). While OFFLINE (behind a portal) the
 // firmware re-probes every CAPTIVE_PERIODIC_REPROBE_MS so it notices as soon as
-// you log in. While ONLINE it re-probes every CAPTIVE_ONLINE_HEARTBEAT_MS so a
-// portal that re-appears (e.g. an expiring ISP session) is caught and cloud
-// uploads are paused again (issue #40).
+// you log in. While ONLINE, CAPTIVE_ONLINE_HEARTBEAT_MS probes are only kept for
+// recovered portal sessions (state SUCCESS), so networks that were open from boot
+// stay quiet (issue #88) while recovered captive sessions are still monitored
+// (issue #40).
 #define CAPTIVE_PERIODIC_REPROBE_MS  30000UL
 // If offline/captive state persists for this long despite periodic re-probes,
 // escalate to a full device reboot as the final recovery step.
