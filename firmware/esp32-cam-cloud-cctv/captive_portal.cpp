@@ -39,6 +39,16 @@
 #define CAPTIVE_PROBE_TIMEOUT_MS 6000
 #endif
 
+// Total wall-clock budget (ms) for ONE connectivity-probe cycle (primary probe
+// plus any same-cycle fallback URLs). `HTTPClient`/`WiFiClient` timeouts bound
+// socket phases, but DNS lookup inside connect(host, ...) is not bounded by that
+// timeout. On some networks DNS stalls can therefore outlive
+// CAPTIVE_PROBE_TIMEOUT_MS; without this cap, each fallback host can add another
+// long stall and one probe cycle can block for ~60s (issue #88 logs).
+#ifndef CAPTIVE_PROBE_CHAIN_BUDGET_MS
+#define CAPTIVE_PROBE_CHAIN_BUDGET_MS (CAPTIVE_PROBE_TIMEOUT_MS + 1500UL)
+#endif
+
 // Connectivity probes should fail fast so the main loop stays responsive.
 // Portal landing/login fetches (especially HTTPS external pages) are often
 // slower, so they use a separate timeout budget.
@@ -672,7 +682,12 @@ static int probeInternetOnce(const String& probeUrl, const char* label,
 // responses still win immediately (they indicate a captive portal), while pure
 // transport failures (<= 0) can retry alternate 204 endpoints before deciding
 // the network is offline/unreachable.
+//
+// DNS lookup time is outside CAPTIVE_PROBE_TIMEOUT_MS (see
+// CAPTIVE_PROBE_CHAIN_BUDGET_MS above), so enforce a wall-clock cap across the
+// whole chain to avoid serially stalling on multiple fallback hostnames.
 static int probeInternet(String& body, String& location) {
+    unsigned long chainStart = millis();
     int code = probeInternetOnce(String(CAPTIVE_PROBE_URL), "Probe", body, location);
     if (code > 0) return code;
 
@@ -681,6 +696,13 @@ static int probeInternet(String& body, String& location) {
         CAPTIVE_PROBE_URL_FALLBACK_2
     };
     for (const char* fallback : fallbackUrls) {
+        unsigned long chainElapsed = millis() - chainStart;
+        if (chainElapsed >= CAPTIVE_PROBE_CHAIN_BUDGET_MS) {
+            Serial.printf("[CaptivePortal] Probe chain spent %lums (budget %lums). "
+                          "Deferring remaining fallback probes.\n",
+                          chainElapsed, (unsigned long)CAPTIVE_PROBE_CHAIN_BUDGET_MS);
+            break;
+        }
         if (!fallback || !fallback[0]) continue;
         String fallbackUrl = String(fallback);
         if (fallbackUrl == String(CAPTIVE_PROBE_URL)) continue;
