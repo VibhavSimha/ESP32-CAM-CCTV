@@ -318,14 +318,14 @@ static void performFrameUploadJob(camera_fb_t *fb, const String &filename) {
     Serial.printf("[Supabase] Upload deferred before send: wifi=%d online=%s\n",
                   WiFi.status(), captivePortalIsOnline() ? "yes" : "no");
     deferUploadForConnectivity("connectivity unavailable");
-    markUploadFailureAndMaybeReboot(-1, "connectivity_unhealthy");
+    Serial.println("[Supabase] Deferred upload is by design; this does not count as a failure streak.");
     esp_camera_fb_return(fb);
     return;
   }
 
   if (liveStreamIsActive()) {
     deferUploadForConnectivity("live stream active");
-    markUploadFailureAndMaybeReboot(-1, "stream_active");
+    Serial.println("[Supabase] Live-stream defer is temporary; it is not counted as an upload failure.");
     esp_camera_fb_return(fb);
     return;
   }
