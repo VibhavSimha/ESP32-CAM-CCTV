@@ -7,7 +7,6 @@
 #include <time.h>
 #include "esp_camera.h"
 
-Supabase supabase;
 Preferences preferences;
 
 static int frame_index = 0;
@@ -272,8 +271,15 @@ static bool publishTunnelUrlNow(const String &url) {
   Serial.printf("[Supabase] Publishing tunnel URL: %s | heap: %u\n", url.c_str(), ESP.getFreeHeap());
   unsigned long t0 = millis();
 
+  // Recreate the client for each request so a stale TLS/TCP socket cannot be
+  // reused across retries. The previous global Supabase instance was retaining
+  // a connection state between requests and could hold a dead socket long enough
+  // to produce the observed HTTP -1 / HTTP 0 failures after the first upload.
+  Supabase client;
+  client.begin(SUPABASE_URL, SUPABASE_ANON_KEY);
+
   String insertJson = "{\"url\":\"" + url + "\"}";
-  int code = supabase.insert("camera_status", insertJson, false);
+  int code = client.insert("camera_status", insertJson, false);
   unsigned long elapsed = millis() - t0;
   if (code == 201 || code == 200 || code == 204) {
     Serial.printf("[Supabase] Tunnel URL published OK (HTTP %d) in %lums\n", code, elapsed);
@@ -320,7 +326,9 @@ static void performFrameUploadJob(camera_fb_t *fb, const String &filename) {
     }
 
     unsigned long t0 = millis();
-    code = supabase.upload(SUPABASE_BUCKET, filename, "image/jpeg", fb->buf, fb->len);
+    Supabase client;
+    client.begin(SUPABASE_URL, SUPABASE_ANON_KEY);
+    code = client.upload(SUPABASE_BUCKET, filename, "image/jpeg", fb->buf, fb->len);
     elapsed = millis() - t0;
     attemptedNetworkUpload = true;
     if (code == 200 || code == 201 || code == 409) {
@@ -435,7 +443,6 @@ static void startCloudStorageTaskIfNeeded() {
 void setupCloudStorage() {
   preferences.begin("cctv", false);
   frame_index = preferences.getInt("frame_index", 0);
-  supabase.begin(SUPABASE_URL, SUPABASE_ANON_KEY);
   Serial.printf("[Supabase] Configured. URL: %s | Circular frame index: %d\n", SUPABASE_URL, frame_index);
   startCloudStorageTaskIfNeeded();
 }
