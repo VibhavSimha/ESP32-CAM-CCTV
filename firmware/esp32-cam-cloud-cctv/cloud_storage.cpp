@@ -237,6 +237,14 @@ static void resetUploadTransportBackoffState() {
   nextUploadAttemptAt = 0;
 }
 
+static void setupAnonSupabaseClient(Supabase &client, const char *operation, const String &objectName) {
+  client.begin(SUPABASE_URL, SUPABASE_ANON_KEY);
+  client.useAuth = false;
+  client.USER_TOKEN = "";
+  Serial.printf("[Supabase] %s: bucket=%s object=%s auth=disabled\n",
+                operation, SUPABASE_BUCKET, objectName.c_str());
+}
+
 static void deferUploadForConnectivity(const char *reason) {
   unsigned long now = millis();
   unsigned long retryAt = now + SUPABASE_UPLOAD_CONNECTIVITY_RETRY_MS;
@@ -268,15 +276,17 @@ static bool publishTunnelUrlNow(const String &url) {
     return false;
   }
 
-  Serial.printf("[Supabase] Publishing tunnel URL: %s | heap: %u\n", url.c_str(), ESP.getFreeHeap());
+  Serial.printf("[Supabase] Publishing tunnel URL (auth disabled) | heap: %u\n", ESP.getFreeHeap());
   unsigned long t0 = millis();
 
   // Recreate the client for each request so a stale TLS/TCP socket cannot be
   // reused across retries. The previous global Supabase instance was retaining
   // a connection state between requests and could hold a dead socket long enough
   // to produce the observed HTTP -1 / HTTP 0 failures after the first upload.
+  // This project intentionally uses the public anon key for a public bucket and
+  // does not send any RLS token for storage uploads.
   Supabase client;
-  client.begin(SUPABASE_URL, SUPABASE_ANON_KEY);
+  setupAnonSupabaseClient(client, "publish camera_status", "camera_status");
 
   String insertJson = "{\"url\":\"" + url + "\"}";
   int code = client.insert("camera_status", insertJson, false);
@@ -303,7 +313,8 @@ static void performFrameUploadJob(camera_fb_t *fb, const String &filename) {
     return;
   }
 
-  Serial.printf("[Supabase] Uploading %s (%u bytes)...\n", filename.c_str(), fb->len);
+  Serial.printf("[Supabase] Uploading object=%s (%u bytes) bucket=%s auth=disabled\n",
+                filename.c_str(), fb->len, SUPABASE_BUCKET);
 
   int code = -1;
   unsigned long elapsed = 0;
@@ -327,7 +338,7 @@ static void performFrameUploadJob(camera_fb_t *fb, const String &filename) {
 
     unsigned long t0 = millis();
     Supabase client;
-    client.begin(SUPABASE_URL, SUPABASE_ANON_KEY);
+    setupAnonSupabaseClient(client, "upload frame", filename);
     code = client.upload(SUPABASE_BUCKET, filename, "image/jpeg", fb->buf, fb->len);
     elapsed = millis() - t0;
     attemptedNetworkUpload = true;
@@ -443,7 +454,8 @@ static void startCloudStorageTaskIfNeeded() {
 void setupCloudStorage() {
   preferences.begin("cctv", false);
   frame_index = preferences.getInt("frame_index", 0);
-  Serial.printf("[Supabase] Configured. URL: %s | Circular frame index: %d\n", SUPABASE_URL, frame_index);
+  Serial.printf("[Supabase] Storage configured: bucket=%s frame_index=%d auth=disabled\n",
+                SUPABASE_BUCKET, frame_index);
   startCloudStorageTaskIfNeeded();
 }
 
