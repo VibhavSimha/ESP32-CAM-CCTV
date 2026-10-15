@@ -1,6 +1,7 @@
 #include "cloud_storage.h"
 #include "config.h"
 #include "captive_portal.h"
+#include "stream_server.h"
 #include <ESPSupabase.h>
 #include <Preferences.h>
 #include <WiFi.h>
@@ -191,16 +192,16 @@ static void resetCaptureFailureState() {
   captureFailSince = 0;
 }
 
-static void markUploadFailureAndMaybeReboot(int code) {
+static void markUploadFailureAndMaybeReboot(int code, const char *stage) {
   uploadFailStreak++;
   if (uploadFailSince == 0) uploadFailSince = millis();
   unsigned long downFor = millis() - uploadFailSince;
-  Serial.printf("[Supabase] Upload failure streak=%u (HTTP %d, for %lums)\n",
-                (unsigned)uploadFailStreak, code, downFor);
+  Serial.printf("[Supabase] Upload failure streak=%u (%s, HTTP %d, for %lums)\n",
+                (unsigned)uploadFailStreak, stage, code, downFor);
   if (uploadFailStreak >= SUPABASE_UPLOAD_FAIL_REBOOT_AFTER_COUNT &&
       downFor >= SUPABASE_UPLOAD_FAIL_REBOOT_AFTER_MS) {
-    Serial.printf("[Supabase] Upload path unhealthy for %lums (%u failures). Rebooting for recovery.\n",
-                  downFor, (unsigned)uploadFailStreak);
+    Serial.printf("[Supabase] Upload path unhealthy for %lums (%u failures, stage=%s). Rebooting for recovery.\n",
+                  downFor, (unsigned)uploadFailStreak, stage);
     delay(1000);
     ESP.restart();
   }
@@ -243,6 +244,15 @@ static void setupAnonSupabaseClient(Supabase &client, const char *operation, con
   client.USER_TOKEN = "";
   Serial.printf("[Supabase] %s: bucket=%s object=%s auth=disabled\n",
                 operation, SUPABASE_BUCKET, objectName.c_str());
+}
+
+static bool liveStreamIsActive() {
+  if (active_stream_clients > 0) {
+    Serial.printf("[Supabase] Upload deferred: live stream active (%d client(s)); bypassing background upload to keep the BORE tunnel stable.\n",
+                  active_stream_clients);
+    return true;
+  }
+  return false;
 }
 
 static void deferUploadForConnectivity(const char *reason) {
@@ -308,7 +318,14 @@ static void performFrameUploadJob(camera_fb_t *fb, const String &filename) {
     Serial.printf("[Supabase] Upload deferred before send: wifi=%d online=%s\n",
                   WiFi.status(), captivePortalIsOnline() ? "yes" : "no");
     deferUploadForConnectivity("connectivity unavailable");
-    resetUploadFailureState();
+    markUploadFailureAndMaybeReboot(-1, "connectivity_unhealthy");
+    esp_camera_fb_return(fb);
+    return;
+  }
+
+  if (liveStreamIsActive()) {
+    deferUploadForConnectivity("live stream active");
+    markUploadFailureAndMaybeReboot(-1, "stream_active");
     esp_camera_fb_return(fb);
     return;
   }
@@ -377,15 +394,15 @@ static void performFrameUploadJob(camera_fb_t *fb, const String &filename) {
                   elapsed, (unsigned)attemptsUsed, (unsigned long)upload_seq);
   } else if (deferredForConnectivity) {
     deferUploadForConnectivity("connectivity lost during upload retry");
-    resetUploadFailureState();
+    markUploadFailureAndMaybeReboot(-1, "connectivity_lost");
   } else if (code <= 0) {
     deferUploadForTransportFailure(code, attemptsUsed);
-    resetUploadFailureState();
+    markUploadFailureAndMaybeReboot(code, "transport_timeout_or_disconnect");
   } else {
     Serial.printf("[Supabase] Upload FAILED after %u attempt(s). HTTP code: %d (last took %lums). "
                   "Dropping frame and continuing with newer frames. seq=%lu\n",
                   (unsigned)attemptsUsed, code, elapsed, (unsigned long)upload_seq);
-    markUploadFailureAndMaybeReboot(code);
+    markUploadFailureAndMaybeReboot(code, "http_error");
   }
 
   esp_camera_fb_return(fb);
@@ -519,6 +536,11 @@ void uploadFrameToCloud() {
 
   if (!cloudUploadConnectivityHealthy()) {
     deferUploadForConnectivity("internet not confirmed reachable");
+    return;
+  }
+
+  if (liveStreamIsActive()) {
+    deferUploadForConnectivity("live stream active");
     return;
   }
 
