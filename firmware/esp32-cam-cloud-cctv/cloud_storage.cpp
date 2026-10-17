@@ -169,7 +169,6 @@ static volatile bool cloudJobPublishSucceeded = false;  // result of last publis
 
 static uint8_t uploadTransportFailStreak = 0;
 static unsigned long nextUploadAttemptAt = 0;
-static bool uploadFailEscalationLogged = false;
 
 bool isCloudUploadSlotBusy() {
   return cloudUploadJobPending ||
@@ -207,12 +206,12 @@ static void markUploadFailureAndMaybeReboot(int code, const char *stage) {
   Serial.printf("[Supabase] Upload failure streak=%u (%s, HTTP %d, for %lums)\n",
                 (unsigned)uploadFailStreak, stage, code, downFor);
   if (uploadFailStreak >= SUPABASE_UPLOAD_FAIL_REBOOT_AFTER_COUNT &&
-      downFor >= SUPABASE_UPLOAD_FAIL_REBOOT_AFTER_MS &&
-      !uploadFailEscalationLogged) {
-    uploadFailEscalationLogged = true;
+      downFor >= SUPABASE_UPLOAD_FAIL_REBOOT_AFTER_MS) {
     Serial.printf("[Supabase] Upload path unhealthy for %lums (%u failures, stage=%s). "
-                  "Continuing in fire-and-forget mode: dropping failed frames and retrying later.\n",
+                  "Rebooting as last-resort recovery.\n",
                   downFor, (unsigned)uploadFailStreak, stage);
+    delay(1000);
+    ESP.restart();
   }
 }
 
@@ -223,7 +222,6 @@ static void resetUploadFailureState() {
   }
   uploadFailStreak = 0;
   uploadFailSince = 0;
-  uploadFailEscalationLogged = false;
 }
 
 static bool cloudUploadConnectivityHealthy() {
