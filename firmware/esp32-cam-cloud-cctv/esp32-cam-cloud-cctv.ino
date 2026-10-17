@@ -231,6 +231,10 @@ void loop() {
     // Retry best-effort cloud status updates without blocking local serving
     loopCloudStorage();
 
+    // Stream server resilience loop: staged recovery for repeated abnormal
+    // stream failures (server restart -> camera re-init -> reboot as last resort).
+    loopStreamServerRecovery();
+
     // Handle PIR motion detection (disabled by default via ENABLE_PIR_MOTION)
     loopPIR();
 

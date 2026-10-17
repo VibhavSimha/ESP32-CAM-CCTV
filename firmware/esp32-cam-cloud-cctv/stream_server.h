@@ -5,6 +5,7 @@
 extern volatile int active_stream_clients;
 
 void startCameraServer();
+void loopStreamServerRecovery();
 
 // Restore + apply the NVS-persisted global flash (LED) state at boot.
 void setupFlashState();

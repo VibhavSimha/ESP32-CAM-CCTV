@@ -5,9 +5,16 @@ set -euo pipefail
 cd "$(dirname "$0")"
 
 CXX="${CXX:-c++}"
-OUT="$(mktemp -d)/captive_portal_parse_test"
+OUT_DIR="$(mktemp -d)"
+CPT_OUT="$OUT_DIR/captive_portal_parse_test"
+RES_OUT="$OUT_DIR/resilience_policy_test"
 
 "$CXX" -std=c++11 -Wall -Wextra -I.. \
-    test_captive_portal_parse.cpp ../captive_portal_parse.cpp -o "$OUT"
+    test_captive_portal_parse.cpp ../captive_portal_parse.cpp -o "$CPT_OUT"
 
-"$OUT"
+"$CPT_OUT"
+
+"$CXX" -std=c++11 -Wall -Wextra -I.. \
+    test_resilience_policy.cpp ../resilience_policy.cpp -o "$RES_OUT"
+
+"$RES_OUT"
