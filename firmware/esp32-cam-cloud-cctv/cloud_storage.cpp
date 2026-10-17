@@ -66,6 +66,12 @@ static unsigned long uploadFailSince = 0;
 #endif
 #define SUPABASE_UPLOAD_TRANSPORT_BACKOFF_MAX_SHIFT 5U
 
+#ifndef CLOUD_STORAGE_WEDGE_RESET_MIN_MS
+// Guardrail: avoid aggressive watchdog budgets that are too short for slow
+// but healthy uploads on unstable links.
+#define CLOUD_STORAGE_WEDGE_RESET_MIN_MS 120000UL
+#endif
+
 // ---------------------------------------------------------------------------
 // MARK: Background network task (issue #81)
 //
@@ -91,9 +97,9 @@ static unsigned long uploadFailSince = 0;
 //
 // loopCloudStorage() -- still polled every tick from the now never-blocked
 // loop() -- doubles as the wedge-watchdog: if the background task has been
-// busy longer than the EXISTING SUPABASE_UPLOAD_FAIL_REBOOT_AFTER_MS budget,
-// it reboots via ESP.restart(). That is what guarantees recovery even when
-// the background task itself is the thing that is permanently stuck.
+// busy longer than the guarded timeout budget, it resets ONLY the cloud worker
+// task and drops that stuck upload frame. The rest of the firmware keeps
+// running (fire-and-forget semantics) instead of rebooting the full device.
 // ---------------------------------------------------------------------------
 
 enum CloudJobType { CLOUD_JOB_NONE = 0, CLOUD_JOB_UPLOAD_FRAME, CLOUD_JOB_PUBLISH_URL };
@@ -156,12 +162,14 @@ static volatile bool cloudJobBusy = false;
 static volatile CloudJobType cloudJobBusyType = CLOUD_JOB_NONE;
 static volatile unsigned long cloudJobBusySince = 0;
 static camera_fb_t *cloudUploadJobFb = nullptr;  // valid when cloudUploadJobPending
+static camera_fb_t *cloudUploadJobInFlightFb = nullptr;  // valid while upload worker is inside performFrameUploadJob()
 static String cloudUploadJobFilename;            // valid when cloudUploadJobPending
 static String cloudPublishJobUrl;                // valid when cloudPublishJobPending
 static volatile bool cloudJobPublishSucceeded = false;  // result of last publish job
 
 static uint8_t uploadTransportFailStreak = 0;
 static unsigned long nextUploadAttemptAt = 0;
+static bool uploadFailEscalationLogged = false;
 
 bool isCloudUploadSlotBusy() {
   return cloudUploadJobPending ||
@@ -199,11 +207,12 @@ static void markUploadFailureAndMaybeReboot(int code, const char *stage) {
   Serial.printf("[Supabase] Upload failure streak=%u (%s, HTTP %d, for %lums)\n",
                 (unsigned)uploadFailStreak, stage, code, downFor);
   if (uploadFailStreak >= SUPABASE_UPLOAD_FAIL_REBOOT_AFTER_COUNT &&
-      downFor >= SUPABASE_UPLOAD_FAIL_REBOOT_AFTER_MS) {
-    Serial.printf("[Supabase] Upload path unhealthy for %lums (%u failures, stage=%s). Rebooting for recovery.\n",
+      downFor >= SUPABASE_UPLOAD_FAIL_REBOOT_AFTER_MS &&
+      !uploadFailEscalationLogged) {
+    uploadFailEscalationLogged = true;
+    Serial.printf("[Supabase] Upload path unhealthy for %lums (%u failures, stage=%s). "
+                  "Continuing in fire-and-forget mode: dropping failed frames and retrying later.\n",
                   downFor, (unsigned)uploadFailStreak, stage);
-    delay(1000);
-    ESP.restart();
   }
 }
 
@@ -214,6 +223,7 @@ static void resetUploadFailureState() {
   }
   uploadFailStreak = 0;
   uploadFailSince = 0;
+  uploadFailEscalationLogged = false;
 }
 
 static bool cloudUploadConnectivityHealthy() {
@@ -314,12 +324,15 @@ static bool publishTunnelUrlNow(const String &url) {
 // supabase.upload() call plus all of the pre-existing retry/bookkeeping
 // logic. Always consumes (returns) fb exactly once.
 static void performFrameUploadJob(camera_fb_t *fb, const String &filename) {
+  cloudUploadJobInFlightFb = fb;
+
   if (!cloudUploadConnectivityHealthy()) {
     Serial.printf("[Supabase] Upload deferred before send: wifi=%d online=%s\n",
                   WiFi.status(), captivePortalIsOnline() ? "yes" : "no");
     deferUploadForConnectivity("connectivity unavailable");
     Serial.println("[Supabase] Deferred upload is by design; this does not count as a failure streak.");
     esp_camera_fb_return(fb);
+    cloudUploadJobInFlightFb = nullptr;
     return;
   }
 
@@ -327,6 +340,7 @@ static void performFrameUploadJob(camera_fb_t *fb, const String &filename) {
     deferUploadForConnectivity("live stream active");
     Serial.println("[Supabase] Live-stream defer is temporary; it is not counted as an upload failure.");
     esp_camera_fb_return(fb);
+    cloudUploadJobInFlightFb = nullptr;
     return;
   }
 
@@ -406,6 +420,7 @@ static void performFrameUploadJob(camera_fb_t *fb, const String &filename) {
   }
 
   esp_camera_fb_return(fb);
+  cloudUploadJobInFlightFb = nullptr;
 }
 
 // Runs on the background task: the actual supabase.insert() call for a
@@ -466,6 +481,55 @@ static void startCloudStorageTaskIfNeeded() {
     Serial.printf("[Supabase] FAILED to spawn background cloud task (heap=%u). Will keep retrying.\n",
                   ESP.getFreeHeap());
   }
+}
+
+static unsigned long cloudStorageWedgeTimeoutMs() {
+  unsigned long budget = SUPABASE_UPLOAD_FAIL_REBOOT_AFTER_MS;
+  if (budget < CLOUD_STORAGE_WEDGE_RESET_MIN_MS) {
+    budget = CLOUD_STORAGE_WEDGE_RESET_MIN_MS;
+  }
+  return budget;
+}
+
+static void resetWedgedCloudTask(unsigned long busyFor) {
+  TaskHandle_t stuckTask = cloudTaskHandle;
+  CloudJobType stuckType = cloudJobBusyType;
+
+  Serial.printf("[Supabase] Background task wedged for %lums (job type %d). "
+                "Resetting cloud worker without reboot.\n",
+                busyFor, (int)stuckType);
+
+  if (stuckTask) {
+    vTaskDelete(stuckTask);
+    cloudTaskHandle = nullptr;
+  }
+
+  camera_fb_t *queuedFb = cloudUploadJobFb;
+  cloudUploadJobFb = nullptr;
+  cloudUploadJobPending = false;
+  cloudUploadJobFilename = "";
+
+  camera_fb_t *inFlightFb = cloudUploadJobInFlightFb;
+  cloudUploadJobInFlightFb = nullptr;
+
+  cloudJobBusy = false;
+  cloudJobBusyType = CLOUD_JOB_NONE;
+  cloudJobBusySince = 0;
+  cloudJobPublishSucceeded = false;
+
+  if (queuedFb) {
+    esp_camera_fb_return(queuedFb);
+  }
+  if (inFlightFb && inFlightFb != queuedFb) {
+    esp_camera_fb_return(inFlightFb);
+  }
+
+  if (stuckType == CLOUD_JOB_UPLOAD_FRAME) {
+    deferUploadForTransportFailure(-1, 0);
+    markUploadFailureAndMaybeReboot(-1, "worker_timeout_reset");
+  }
+
+  startCloudStorageTaskIfNeeded();
 }
 
 void setupCloudStorage() {
@@ -574,17 +638,13 @@ void loopCloudStorage() {
   startCloudStorageTaskIfNeeded();
 
   // Wedge-watchdog: loop() itself can no longer block inside a Supabase call,
-  // but the background task still could, if ESPSupabase ever hangs. Reboot
-  // once a job has been busy past the existing upload-fail budget -- the
-  // only way to recover a truly wedged network call -- instead of waiting
-  // forever.
+  // but the background task still could, if ESPSupabase ever hangs. Recover by
+  // resetting only the cloud worker task (drop the stuck frame, keep firmware
+  // alive) once a job exceeds the guarded timeout budget.
   if (cloudJobBusy) {
     unsigned long busyFor = millis() - cloudJobBusySince;
-    if (busyFor >= SUPABASE_UPLOAD_FAIL_REBOOT_AFTER_MS) {
-      Serial.printf("[Supabase] Background task wedged for %lums (job type %d). Rebooting for recovery.\n",
-                    busyFor, (int)cloudJobBusyType);
-      delay(1000);
-      ESP.restart();
+    if (busyFor >= cloudStorageWedgeTimeoutMs()) {
+      resetWedgedCloudTask(busyFor);
     }
   }
 

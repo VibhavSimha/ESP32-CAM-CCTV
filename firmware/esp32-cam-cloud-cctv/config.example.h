@@ -299,7 +299,9 @@
 // Cloud upload runtime resilience:
 // - Retry each frame upload SUPABASE_UPLOAD_MAX_RETRIES times.
 // - If still failing, DROP that frame and continue newer frames.
-// - If failures persist for a long streak/window, reboot.
+// - If failures persist for a long streak/window, stay in fire-and-forget mode:
+//   keep dropping failed frames and continue later uploads (no full-device reboot).
+// - If one upload call wedges, only the cloud worker task is reset.
 // - Connectivity-defer and transport-backoff timings are intentionally hardcoded
 //   in cloud_storage.cpp.
 #define SUPABASE_UPLOAD_MAX_RETRIES         2
