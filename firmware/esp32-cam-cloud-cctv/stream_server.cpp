@@ -61,6 +61,22 @@ volatile int active_stream_clients = 0;
 // -----------------------------------------------------------------------------
 static volatile bool g_flash_on = false;
 
+// Stream resilience tuning (intentionally code-local; no config-file changes).
+static const uint8_t STREAM_RECOVERY_HTTP_RESTART_ATTEMPTS = 2;
+static const uint8_t STREAM_RECOVERY_CAMERA_REINIT_ATTEMPTS = 2;
+static const unsigned long STREAM_RECOVERY_RETRY_DELAY_MS = 1500UL;
+static const uint16_t STREAM_FAILURE_REBOOT_AFTER_COUNT = 20;
+static const uint32_t STREAM_HEALTHY_FRAMES_TO_RESET_FAILURE_STREAK = 30;
+
+static volatile uint16_t streamFailureStreak = 0;
+static volatile unsigned long streamFailureSince = 0;
+static volatile uint8_t streamRecoveryAttempts = 0;
+static volatile bool streamRecoveryPending = false;
+static volatile unsigned long streamRecoveryNextAttemptAt = 0;
+static volatile int streamLastFailureCode = 0;
+static volatile uint32_t streamLastFailureFrames = 0;
+static volatile uint32_t streamLastFailureBadFrameStreak = 0;
+
 static void flashApply(bool on) {
     pinMode(FLASH_GPIO, OUTPUT);
     digitalWrite(FLASH_GPIO, on ? HIGH : LOW);
@@ -82,6 +98,58 @@ void setupFlashState() {
     p.end();
     flashApply(g_flash_on);
     Serial.printf("[/flash] Restored persisted global flash state: %d\n", g_flash_on);
+}
+
+static bool startCameraServerOnce(const char *context);
+static void stopCameraServerNow(const char *reason);
+
+static bool streamFailureRebootDue(unsigned long now, unsigned long *downForOut) {
+    if (streamFailureSince == 0) {
+        if (downForOut) *downForOut = 0;
+        return false;
+    }
+    unsigned long downFor = (now >= streamFailureSince) ? (now - streamFailureSince) : 0;
+    if (downForOut) *downForOut = downFor;
+    return streamFailureStreak >= STREAM_FAILURE_REBOOT_AFTER_COUNT &&
+           downFor >= CAMERA_SERVER_REBOOT_AFTER_MS;
+}
+
+static void resetStreamFailureState(const char *reason) {
+    if (streamFailureStreak > 0) {
+        unsigned long downFor = (streamFailureSince == 0) ? 0 : (millis() - streamFailureSince);
+        Serial.printf("[/stream] Stream path recovered after %u failure(s) in %lums (%s).\n",
+                      (unsigned)streamFailureStreak, downFor, reason);
+    }
+    streamFailureStreak = 0;
+    streamFailureSince = 0;
+    streamRecoveryAttempts = 0;
+    streamRecoveryPending = false;
+    streamRecoveryNextAttemptAt = 0;
+    streamLastFailureCode = 0;
+    streamLastFailureFrames = 0;
+    streamLastFailureBadFrameStreak = 0;
+}
+
+static void markStreamFailureAndScheduleRecovery(const char *reason,
+                                                 esp_err_t code,
+                                                 uint32_t frames,
+                                                 uint32_t badFrameStreak) {
+    streamFailureStreak++;
+    if (streamFailureSince == 0) streamFailureSince = millis();
+    unsigned long now = millis();
+    unsigned long downFor = now - streamFailureSince;
+    streamLastFailureCode = (int)code;
+    streamLastFailureFrames = frames;
+    streamLastFailureBadFrameStreak = badFrameStreak;
+    streamRecoveryPending = true;
+    streamRecoveryNextAttemptAt = now;
+    Serial.printf("[/stream] Failure streak=%u reason=%s code=%d frames=%lu bad_streak=%lu downFor=%lums. Scheduling staged recovery.\n",
+                  (unsigned)streamFailureStreak,
+                  reason,
+                  (int)code,
+                  (unsigned long)frames,
+                  (unsigned long)badFrameStreak,
+                  downFor);
 }
 
 static esp_err_t capture_handler(httpd_req_t *req) {
@@ -138,12 +206,14 @@ static esp_err_t stream_handler(httpd_req_t *req) {
     char part_buf[64];
     uint32_t frame_num = 0;
     uint32_t bad_frame_streak = 0;
+    const char *hardFailureReason = nullptr;
 
     res = httpd_resp_set_type(req, _STREAM_CONTENT_TYPE);
     if (res != ESP_OK) {
         Serial.printf("[/stream] ERROR: Failed to set content type: %d\n", res);
         active_stream_clients--;
         Serial.printf("[/stream] active_stream_clients=%d (early exit)\n", active_stream_clients);
+        markStreamFailureAndScheduleRecovery("set_content_type_failed", res, frame_num, bad_frame_streak);
         return res;
     }
 
@@ -211,6 +281,7 @@ static esp_err_t stream_handler(httpd_req_t *req) {
             if (bad_frame_streak >= 40) {
                 Serial.printf("[/stream] ERROR: %u consecutive bad frames; ending stream so client can reconnect cleanly.\n", bad_frame_streak);
                 res = ESP_FAIL;
+                hardFailureReason = "camera_bad_frames";
                 break;
             }
             vTaskDelay(30 / portTICK_PERIOD_MS);
@@ -222,8 +293,11 @@ static esp_err_t stream_handler(httpd_req_t *req) {
         if (frame_res != ESP_OK) {
             if (frame_res == HTTPD_SOCK_ERR_TIMEOUT) {
                 Serial.printf("[/stream] Fatal: Network timeout (send_wait_timeout). Connection dropped due to extreme lag!\n");
+                hardFailureReason = "send_timeout";
             } else if (frame_res == HTTPD_SOCK_ERR_FAIL) {
                 Serial.printf("[/stream] Fatal: Socket closed by client or proxy.\n");
+            } else {
+                hardFailureReason = "send_error";
             }
             Serial.printf("[/stream] Stream ended after %u frames. Heap: %u\n", frame_num, ESP.getFreeHeap());
             res = frame_res;
@@ -258,6 +332,11 @@ static esp_err_t stream_handler(httpd_req_t *req) {
 
     active_stream_clients--;
     Serial.printf("[/stream] active_stream_clients=%d (stream ended)\n", active_stream_clients);
+    if (hardFailureReason) {
+        markStreamFailureAndScheduleRecovery(hardFailureReason, res, frame_num, bad_frame_streak);
+    } else if (frame_num >= STREAM_HEALTHY_FRAMES_TO_RESET_FAILURE_STREAK) {
+        resetStreamFailureState("healthy stream session");
+    }
     return res;
 }
 
@@ -266,12 +345,17 @@ static esp_err_t health_handler(httpd_req_t *req) {
     uint32_t uptime = millis() / 1000;
     Serial.printf("[/health] Responding — heap: %u, uptime: %us\n", heap, uptime);
 
-    StaticJsonDocument<128> doc;
+    StaticJsonDocument<256> doc;
     doc["ok"] = true;
     doc["heap"] = heap;
     doc["uptime"] = uptime;
+    doc["stream_clients"] = active_stream_clients;
+    doc["stream_failure_streak"] = streamFailureStreak;
+    doc["stream_recovery_pending"] = streamRecoveryPending;
+    doc["stream_recovery_attempts"] = streamRecoveryAttempts;
+    doc["stream_last_failure_code"] = streamLastFailureCode;
 
-    char buf[128];
+    char buf[256];
     serializeJson(doc, buf);
 
     httpd_resp_set_type(req, "application/json");
@@ -730,73 +814,160 @@ static esp_err_t view_handler(httpd_req_t *req) {
     return httpd_resp_send(req, html, HTTPD_RESP_USE_STRLEN);
 }
 
+static bool startCameraServerOnce(const char *context) {
+    if (camera_httpd != NULL) return true;
+
+    httpd_config_t config = HTTPD_DEFAULT_CONFIG();
+    config.server_port = 80;
+    // 5 camera + 3 crypto-auth + 5 captive-portal = 13 handlers (16 for headroom).
+    config.max_uri_handlers = 16;
+    config.max_open_sockets = 7;
+    config.recv_wait_timeout = 15;
+    config.send_wait_timeout = 10;
+    config.lru_purge_enable = true;
+
+    httpd_uri_t stream_uri  = { .uri = "/stream",  .method = HTTP_GET, .handler = stream_handler,  .user_ctx = NULL };
+    httpd_uri_t capture_uri = { .uri = "/capture", .method = HTTP_GET, .handler = capture_handler, .user_ctx = NULL };
+    httpd_uri_t view_uri    = { .uri = "/view",    .method = HTTP_GET, .handler = view_handler,    .user_ctx = NULL };
+    httpd_uri_t health_uri  = { .uri = "/health",  .method = HTTP_GET, .handler = health_handler,  .user_ctx = NULL };
+    httpd_uri_t flash_uri   = { .uri = "/flash",   .method = HTTP_GET, .handler = flash_handler,   .user_ctx = NULL };
+
+    Serial.printf("[/stream] Starting web server (%s) on port=%d heap=%u\n",
+                  context, config.server_port, ESP.getFreeHeap());
+    Serial.printf("[/stream] HTTPD timeouts: recv=%ds send=%ds, max_open_sockets=%d, lru_purge=%d\n",
+                  config.recv_wait_timeout, config.send_wait_timeout,
+                  config.max_open_sockets, config.lru_purge_enable);
+
+    esp_err_t err = httpd_start(&camera_httpd, &config);
+    if (err != ESP_OK) {
+        camera_httpd = NULL;
+        Serial.printf("[/stream] ERROR: httpd_start failed during %s: %d\n", context, (int)err);
+        return false;
+    }
+
+    bool regOk = true;
+    if (httpd_register_uri_handler(camera_httpd, &stream_uri) != ESP_OK) regOk = false;
+    if (httpd_register_uri_handler(camera_httpd, &capture_uri) != ESP_OK) regOk = false;
+    if (httpd_register_uri_handler(camera_httpd, &view_uri) != ESP_OK) regOk = false;
+    if (httpd_register_uri_handler(camera_httpd, &health_uri) != ESP_OK) regOk = false;
+    if (httpd_register_uri_handler(camera_httpd, &flash_uri) != ESP_OK) regOk = false;
+    if (!regOk) {
+        Serial.printf("[/stream] ERROR: URI handler registration failed during %s\n", context);
+        httpd_stop(camera_httpd);
+        camera_httpd = NULL;
+        return false;
+    }
+
+    // Register the unauthenticated /pubkey (GET), /nonce (GET), /login (POST).
+    registerCryptoAuthHandlers(camera_httpd);
+    // Register the post-connect captive-portal helper endpoints (issue #33):
+    // /portal (GET), /portal/status (GET), /portal/login (POST).
+    registerCaptivePortalHandlers(camera_httpd);
+    Serial.printf("[/stream] HTTP server ready (%s).\n", context);
+    return true;
+}
+
+static void stopCameraServerNow(const char *reason) {
+    if (camera_httpd == NULL) return;
+    Serial.printf("[/stream] Stopping HTTP server (%s)\n", reason);
+    httpd_stop(camera_httpd);
+    camera_httpd = NULL;
+}
+
+static bool recoverStreamByServerRestart() {
+    stopCameraServerNow("stream_recovery_http_restart");
+    return startCameraServerOnce("stream_recovery_http_restart");
+}
+
+static bool recoverStreamByCameraReinit() {
+    stopCameraServerNow("stream_recovery_camera_reinit");
+
+    esp_err_t deinitErr = esp_camera_deinit();
+    if (deinitErr != ESP_OK) {
+        Serial.printf("[/stream] WARN: esp_camera_deinit during recovery returned 0x%x\n", deinitErr);
+    }
+    delay(120);
+
+    esp_err_t initErr = initCamera();
+    if (initErr != ESP_OK) {
+        Serial.printf("[/stream] ERROR: initCamera failed during stream recovery: 0x%x\n", initErr);
+        return false;
+    }
+    setupFlashState();
+    return startCameraServerOnce("stream_recovery_camera_reinit");
+}
+
+void loopStreamServerRecovery() {
+    if (!streamRecoveryPending) return;
+    if (active_stream_clients > 0) return;  // never disrupt an active stream
+
+    unsigned long now = millis();
+    if (streamRecoveryNextAttemptAt != 0 &&
+        (long)(now - streamRecoveryNextAttemptAt) < 0) {
+        return;
+    }
+
+    unsigned long downFor = 0;
+    if (streamFailureRebootDue(now, &downFor)) {
+        Serial.printf("[/stream] Consecutive stream failures persisted for %lums (%u failures). Rebooting as last resort.\n",
+                      downFor, (unsigned)streamFailureStreak);
+        delay(1000);
+        ESP.restart();
+    }
+
+    streamRecoveryAttempts++;
+    uint8_t attempt = streamRecoveryAttempts;
+    bool recovered = false;
+    if (attempt <= STREAM_RECOVERY_HTTP_RESTART_ATTEMPTS) {
+        Serial.printf("[/stream] Recovery attempt %u: HTTP server restart\n", (unsigned)attempt);
+        recovered = recoverStreamByServerRestart();
+    } else {
+        uint8_t camAttempt = (uint8_t)(attempt - STREAM_RECOVERY_HTTP_RESTART_ATTEMPTS);
+        if (camAttempt <= STREAM_RECOVERY_CAMERA_REINIT_ATTEMPTS) {
+            Serial.printf("[/stream] Recovery attempt %u: camera re-init + server restart (%u/%u)\n",
+                          (unsigned)attempt, (unsigned)camAttempt,
+                          (unsigned)STREAM_RECOVERY_CAMERA_REINIT_ATTEMPTS);
+        } else {
+            Serial.printf("[/stream] Recovery attempt %u: repeating camera re-init + server restart until stable\n",
+                          (unsigned)attempt);
+        }
+        recovered = recoverStreamByCameraReinit();
+    }
+
+    if (recovered) {
+        streamRecoveryPending = false;
+        streamRecoveryNextAttemptAt = 0;
+        Serial.printf("[/stream] Recovery attempt %u completed. Monitoring for sustained stability.\n",
+                      (unsigned)attempt);
+        return;
+    }
+
+    streamRecoveryPending = true;
+    streamRecoveryNextAttemptAt = now + STREAM_RECOVERY_RETRY_DELAY_MS;
+    Serial.printf("[/stream] Recovery attempt %u failed. Next retry in %lums\n",
+                  (unsigned)attempt, (unsigned long)STREAM_RECOVERY_RETRY_DELAY_MS);
+}
+
 void startCameraServer() {
     unsigned long firstFailureAt = 0;
     uint32_t attempt = 0;
     while (true) {
         if (camera_httpd != NULL) return; // already running
 
-        httpd_config_t config = HTTPD_DEFAULT_CONFIG();
-        config.server_port = 80;
-        // 5 camera + 3 crypto-auth + 5 captive-portal = 13 handlers (16 for headroom).
-        config.max_uri_handlers = 16;
-        config.max_open_sockets = 7;
-        config.recv_wait_timeout = 15;
-        config.send_wait_timeout = 10;
-        config.lru_purge_enable = true;
-
-        httpd_uri_t stream_uri  = { .uri = "/stream",  .method = HTTP_GET, .handler = stream_handler,  .user_ctx = NULL };
-        httpd_uri_t capture_uri = { .uri = "/capture", .method = HTTP_GET, .handler = capture_handler, .user_ctx = NULL };
-        httpd_uri_t view_uri    = { .uri = "/view",    .method = HTTP_GET, .handler = view_handler,    .user_ctx = NULL };
-        httpd_uri_t health_uri  = { .uri = "/health",  .method = HTTP_GET, .handler = health_handler,  .user_ctx = NULL };
-        httpd_uri_t flash_uri   = { .uri = "/flash",   .method = HTTP_GET, .handler = flash_handler,   .user_ctx = NULL };
-
         attempt++;
-        Serial.printf("Starting web server on port: '%d' (attempt #%lu)\n",
-                      config.server_port, (unsigned long)attempt);
-        Serial.printf("[/stream] HTTPD timeouts: recv=%ds send=%ds, max_open_sockets=%d, lru_purge=%d\n",
-            config.recv_wait_timeout, config.send_wait_timeout, config.max_open_sockets, config.lru_purge_enable);
-
-        esp_err_t err = httpd_start(&camera_httpd, &config);
-        if (err == ESP_OK) {
-            bool regOk = true;
-            if (httpd_register_uri_handler(camera_httpd, &stream_uri) != ESP_OK) regOk = false;
-            if (httpd_register_uri_handler(camera_httpd, &capture_uri) != ESP_OK) regOk = false;
-            if (httpd_register_uri_handler(camera_httpd, &view_uri) != ESP_OK) regOk = false;
-            if (httpd_register_uri_handler(camera_httpd, &health_uri) != ESP_OK) regOk = false;
-            if (httpd_register_uri_handler(camera_httpd, &flash_uri) != ESP_OK) regOk = false;
-            if (!regOk) {
-                if (firstFailureAt == 0) firstFailureAt = millis();
-                unsigned long downFor = millis() - firstFailureAt;
-                Serial.printf("[/stream] ERROR: URI handler registration failed. Retrying in %lums (failed for %lums)\n",
-                              (unsigned long)CAMERA_SERVER_RETRY_DELAY_MS, downFor);
-                httpd_stop(camera_httpd);
-                camera_httpd = NULL;
-                if (downFor >= CAMERA_SERVER_REBOOT_AFTER_MS) {
-                    Serial.printf("[/stream] HTTP handler registration unavailable for %lums. Rebooting for recovery.\n", downFor);
-                    delay(1000);
-                    ESP.restart();
-                }
-                delay(CAMERA_SERVER_RETRY_DELAY_MS);
-                continue;
-            }
-            // Register the unauthenticated /pubkey (GET), /nonce (GET), /login (POST).
-            registerCryptoAuthHandlers(camera_httpd);
-            // Register the post-connect captive-portal helper endpoints (issue #33):
-            // /portal (GET), /portal/status (GET), /portal/login (POST).
-            registerCaptivePortalHandlers(camera_httpd);
+        if (startCameraServerOnce("boot")) {
             return;
         }
 
         if (firstFailureAt == 0) firstFailureAt = millis();
         unsigned long downFor = millis() - firstFailureAt;
-        Serial.printf("[/stream] ERROR: httpd_start failed (%d). Retrying in %lums (failed for %lums)\n",
-                      (int)err,
+        Serial.printf("[/stream] Boot server start attempt #%lu failed. Retrying in %lums (failed for %lums)\n",
+                      (unsigned long)attempt,
                       (unsigned long)CAMERA_SERVER_RETRY_DELAY_MS,
                       downFor);
 
         if (downFor >= CAMERA_SERVER_REBOOT_AFTER_MS) {
-            Serial.printf("[/stream] HTTP server unavailable for %lums. Rebooting for recovery.\n", downFor);
+            Serial.printf("[/stream] HTTP server unavailable for %lums during boot. Rebooting for recovery.\n", downFor);
             delay(1000);
             ESP.restart();
         }
