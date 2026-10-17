@@ -2,6 +2,7 @@
 #include "config.h"
 #include "captive_portal.h"
 #include "stream_server.h"
+#include "resilience_policy.h"
 #include <ESPSupabase.h>
 #include <Preferences.h>
 #include <WiFi.h>
@@ -200,13 +201,26 @@ static void resetCaptureFailureState() {
 }
 
 static void markUploadFailureAndMaybeReboot(int code, const char *stage) {
-  uploadFailStreak++;
-  if (uploadFailSince == 0) uploadFailSince = millis();
-  unsigned long downFor = millis() - uploadFailSince;
+  unsigned long now = millis();
+  FailureState state = {
+      uploadFailStreak,
+      uploadFailSince,
+  };
+  failureStateRecord(&state, now);
+  uploadFailStreak = state.streak;
+  uploadFailSince = state.firstFailureAtMs;
+
+  unsigned long downFor = 0;
+  bool rebootDue = shouldEscalateAfterSustainedFailures(
+      state,
+      now,
+      SUPABASE_UPLOAD_FAIL_REBOOT_AFTER_COUNT,
+      SUPABASE_UPLOAD_FAIL_REBOOT_AFTER_MS,
+      &downFor);
+
   Serial.printf("[Supabase] Upload failure streak=%u (%s, HTTP %d, for %lums)\n",
                 (unsigned)uploadFailStreak, stage, code, downFor);
-  if (uploadFailStreak >= SUPABASE_UPLOAD_FAIL_REBOOT_AFTER_COUNT &&
-      downFor >= SUPABASE_UPLOAD_FAIL_REBOOT_AFTER_MS) {
+  if (rebootDue) {
     Serial.printf("[Supabase] Upload path unhealthy for %lums (%u failures, stage=%s). "
                   "Rebooting as last-resort recovery.\n",
                   downFor, (unsigned)uploadFailStreak, stage);
@@ -220,8 +234,13 @@ static void resetUploadFailureState() {
     Serial.printf("[Supabase] Upload path recovered after %u failure(s).\n",
                   (unsigned)uploadFailStreak);
   }
-  uploadFailStreak = 0;
-  uploadFailSince = 0;
+  FailureState state = {
+      uploadFailStreak,
+      uploadFailSince,
+  };
+  failureStateReset(&state);
+  uploadFailStreak = state.streak;
+  uploadFailSince = state.firstFailureAtMs;
 }
 
 static bool cloudUploadConnectivityHealthy() {

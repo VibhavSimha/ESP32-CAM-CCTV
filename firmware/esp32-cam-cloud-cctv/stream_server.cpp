@@ -5,6 +5,7 @@
 #include "http_auth.h"
 #include "crypto_auth.h"
 #include "captive_portal.h"
+#include "resilience_policy.h"
 #include "config.h"
 #include <Arduino.h>
 #include <ArduinoJson.h>
@@ -103,25 +104,19 @@ void setupFlashState() {
 static bool startCameraServerOnce(const char *context);
 static void stopCameraServerNow(const char *reason);
 
-static bool streamFailureRebootDue(unsigned long now, unsigned long *downForOut) {
-    if (streamFailureSince == 0) {
-        if (downForOut) *downForOut = 0;
-        return false;
-    }
-    unsigned long downFor = (now >= streamFailureSince) ? (now - streamFailureSince) : 0;
-    if (downForOut) *downForOut = downFor;
-    return streamFailureStreak >= STREAM_FAILURE_REBOOT_AFTER_COUNT &&
-           downFor >= CAMERA_SERVER_REBOOT_AFTER_MS;
-}
-
 static void resetStreamFailureState(const char *reason) {
     if (streamFailureStreak > 0) {
         unsigned long downFor = (streamFailureSince == 0) ? 0 : (millis() - streamFailureSince);
         Serial.printf("[/stream] Stream path recovered after %u failure(s) in %lums (%s).\n",
                       (unsigned)streamFailureStreak, downFor, reason);
     }
-    streamFailureStreak = 0;
-    streamFailureSince = 0;
+    FailureState state = {
+        (uint16_t)streamFailureStreak,
+        (unsigned long)streamFailureSince,
+    };
+    failureStateReset(&state);
+    streamFailureStreak = state.streak;
+    streamFailureSince = state.firstFailureAtMs;
     streamRecoveryAttempts = 0;
     streamRecoveryPending = false;
     streamRecoveryNextAttemptAt = 0;
@@ -134,10 +129,23 @@ static void markStreamFailureAndScheduleRecovery(const char *reason,
                                                  esp_err_t code,
                                                  uint32_t frames,
                                                  uint32_t badFrameStreak) {
-    streamFailureStreak++;
-    if (streamFailureSince == 0) streamFailureSince = millis();
     unsigned long now = millis();
-    unsigned long downFor = now - streamFailureSince;
+    FailureState state = {
+        (uint16_t)streamFailureStreak,
+        (unsigned long)streamFailureSince,
+    };
+    failureStateRecord(&state, now);
+    streamFailureStreak = state.streak;
+    streamFailureSince = state.firstFailureAtMs;
+
+    unsigned long downFor = 0;
+    (void)shouldEscalateAfterSustainedFailures(
+        state,
+        now,
+        STREAM_FAILURE_REBOOT_AFTER_COUNT,
+        CAMERA_SERVER_REBOOT_AFTER_MS,
+        &downFor);
+
     streamLastFailureCode = (int)code;
     streamLastFailureFrames = frames;
     streamLastFailureBadFrameStreak = badFrameStreak;
@@ -334,7 +342,7 @@ static esp_err_t stream_handler(httpd_req_t *req) {
     Serial.printf("[/stream] active_stream_clients=%d (stream ended)\n", active_stream_clients);
     if (hardFailureReason) {
         markStreamFailureAndScheduleRecovery(hardFailureReason, res, frame_num, bad_frame_streak);
-    } else if (frame_num >= STREAM_HEALTHY_FRAMES_TO_RESET_FAILURE_STREAK) {
+    } else if (streamSessionLooksHealthy(frame_num, STREAM_HEALTHY_FRAMES_TO_RESET_FAILURE_STREAK)) {
         resetStreamFailureState("healthy stream session");
     }
     return res;
@@ -907,8 +915,26 @@ void loopStreamServerRecovery() {
         return;
     }
 
+    FailureState state = {
+        (uint16_t)streamFailureStreak,
+        (unsigned long)streamFailureSince,
+    };
     unsigned long downFor = 0;
-    if (streamFailureRebootDue(now, &downFor)) {
+    (void)shouldEscalateAfterSustainedFailures(
+        state,
+        now,
+        STREAM_FAILURE_REBOOT_AFTER_COUNT,
+        CAMERA_SERVER_REBOOT_AFTER_MS,
+        &downFor);
+    StreamRecoveryStage stage = selectStreamRecoveryStage(
+        state,
+        now,
+        streamRecoveryAttempts,
+        STREAM_FAILURE_REBOOT_AFTER_COUNT,
+        CAMERA_SERVER_REBOOT_AFTER_MS,
+        STREAM_RECOVERY_HTTP_RESTART_ATTEMPTS);
+
+    if (stage == STREAM_RECOVERY_STAGE_REBOOT) {
         Serial.printf("[/stream] Consecutive stream failures persisted for %lums (%u failures). Rebooting as last resort.\n",
                       downFor, (unsigned)streamFailureStreak);
         delay(1000);
@@ -918,7 +944,7 @@ void loopStreamServerRecovery() {
     streamRecoveryAttempts++;
     uint8_t attempt = streamRecoveryAttempts;
     bool recovered = false;
-    if (attempt <= STREAM_RECOVERY_HTTP_RESTART_ATTEMPTS) {
+    if (stage == STREAM_RECOVERY_STAGE_HTTP_RESTART) {
         Serial.printf("[/stream] Recovery attempt %u: HTTP server restart\n", (unsigned)attempt);
         recovered = recoverStreamByServerRestart();
     } else {
